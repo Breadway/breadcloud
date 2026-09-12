@@ -10,11 +10,13 @@ use http_body_util::BodyExt;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-fn test_app() -> (TempDir, axum::Router) {
+fn test_app() -> (TempDir, TempDir, axum::Router) {
     let dir = TempDir::new().unwrap();
+    let uploads_dir = TempDir::new().unwrap();
     let storage = Storage::new(dir.path());
-    let state = AppState::new(storage);
-    (dir, router(state))
+    let uploads = Storage::new(uploads_dir.path());
+    let state = AppState::new(storage, uploads);
+    (dir, uploads_dir, router(state))
 }
 
 async fn body_string(response: axum::response::Response) -> String {
@@ -24,7 +26,7 @@ async fn body_string(response: axum::response::Response) -> String {
 
 #[tokio::test]
 async fn put_then_get_roundtrips_content() {
-    let (_dir, app) = test_app();
+    let (_dir, _uploads_dir, app) = test_app();
 
     let put = Request::builder()
         .method("PUT")
@@ -52,7 +54,7 @@ async fn put_then_get_roundtrips_content() {
 
 #[tokio::test]
 async fn put_overwrite_returns_no_content() {
-    let (_dir, app) = test_app();
+    let (_dir, _uploads_dir, app) = test_app();
 
     let put1 = Request::builder()
         .method("PUT")
@@ -77,7 +79,7 @@ async fn put_overwrite_returns_no_content() {
 
 #[tokio::test]
 async fn put_with_missing_parent_is_conflict() {
-    let (_dir, app) = test_app();
+    let (_dir, _uploads_dir, app) = test_app();
     let put = Request::builder()
         .method("PUT")
         .uri("/missing-dir/a.txt")
@@ -91,7 +93,7 @@ async fn put_with_missing_parent_is_conflict() {
 
 #[tokio::test]
 async fn get_missing_file_is_404() {
-    let (_dir, app) = test_app();
+    let (_dir, _uploads_dir, app) = test_app();
     let get = Request::builder()
         .method("GET")
         .uri("/nope.txt")
@@ -105,7 +107,7 @@ async fn get_missing_file_is_404() {
 
 #[tokio::test]
 async fn mkcol_then_delete() {
-    let (_dir, app) = test_app();
+    let (_dir, _uploads_dir, app) = test_app();
 
     let mkcol = Request::builder()
         .method("MKCOL")
@@ -140,7 +142,7 @@ async fn mkcol_then_delete() {
 
 #[tokio::test]
 async fn propfind_depth_0_returns_only_the_resource_itself() {
-    let (_dir, app) = test_app();
+    let (_dir, _uploads_dir, app) = test_app();
 
     let put = Request::builder()
         .method("PUT")
@@ -165,7 +167,7 @@ async fn propfind_depth_0_returns_only_the_resource_itself() {
 
 #[tokio::test]
 async fn propfind_depth_1_lists_children() {
-    let (_dir, app) = test_app();
+    let (_dir, _uploads_dir, app) = test_app();
 
     for name in ["a.txt", "b.txt"] {
         let put = Request::builder()
@@ -199,7 +201,7 @@ async fn propfind_depth_1_lists_children() {
 
 #[tokio::test]
 async fn move_renames_resource() {
-    let (_dir, app) = test_app();
+    let (_dir, _uploads_dir, app) = test_app();
 
     let put = Request::builder()
         .method("PUT")
@@ -239,7 +241,7 @@ async fn move_renames_resource() {
 
 #[tokio::test]
 async fn move_without_overwrite_onto_existing_is_412() {
-    let (_dir, app) = test_app();
+    let (_dir, _uploads_dir, app) = test_app();
 
     for (name, content) in [("a.txt", "one"), ("b.txt", "two")] {
         let put = Request::builder()
@@ -265,7 +267,7 @@ async fn move_without_overwrite_onto_existing_is_412() {
 
 #[tokio::test]
 async fn copy_duplicates_resource_and_leaves_source_intact() {
-    let (_dir, app) = test_app();
+    let (_dir, _uploads_dir, app) = test_app();
 
     let put = Request::builder()
         .method("PUT")
@@ -308,7 +310,7 @@ async fn copy_duplicates_resource_and_leaves_source_intact() {
 
 #[tokio::test]
 async fn copy_collection_into_own_subdirectory_is_409() {
-    let (_dir, app) = test_app();
+    let (_dir, _uploads_dir, app) = test_app();
 
     let mkcol = Request::builder()
         .method("MKCOL")
@@ -334,7 +336,7 @@ async fn copy_collection_into_own_subdirectory_is_409() {
 
 #[tokio::test]
 async fn options_advertises_dav_class_1_and_methods() {
-    let (_dir, app) = test_app();
+    let (_dir, _uploads_dir, app) = test_app();
     let req = Request::builder()
         .method("OPTIONS")
         .uri("/")
@@ -349,10 +351,86 @@ async fn options_advertises_dav_class_1_and_methods() {
 }
 
 #[tokio::test]
+async fn chunked_finalize_with_stale_if_match_is_412_and_leaves_destination_untouched() {
+    let (_dir, _uploads_dir, app) = test_app();
+
+    // An existing destination file the client believes it holds the
+    // current etag for, but does not (someone else changed it, or the
+    // client's local cache is just stale).
+    let put_dest = Request::builder()
+        .method("PUT")
+        .uri("/dest.txt")
+        .body(Body::from("original content"))
+        .unwrap();
+    let response = app.clone().oneshot(put_dest).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let original_etag = response
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Drive the NG chunking v2 flow: MKCOL the transfer collection, PUT
+    // one chunk into it.
+    let mkcol = Request::builder()
+        .method("MKCOL")
+        .uri("/remote.php/dav/uploads/testuser/txn1")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(mkcol).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    let chunk_body = "replacement content";
+    let put_chunk = Request::builder()
+        .method("PUT")
+        .uri("/remote.php/dav/uploads/testuser/txn1/1")
+        .body(Body::from(chunk_body))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(put_chunk).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    // Finalize with an If-Match that does not match the destination's
+    // real current etag. This must 412 before assembling the chunks
+    // onto /dest.txt, exactly like a plain PUT with the same stale
+    // If-Match would.
+    let finalize = Request::builder()
+        .method("MOVE")
+        .uri("/remote.php/dav/uploads/testuser/txn1/.file")
+        .header("Destination", "/dest.txt")
+        .header("If-Match", "\"totally-wrong-stale-etag\"")
+        .header("OC-Total-Length", chunk_body.len().to_string())
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(finalize).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+
+    // The destination must be entirely unaffected: same content, same
+    // etag, no partial or replaced write.
+    let get_dest = Request::builder()
+        .method("GET")
+        .uri("/dest.txt")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(get_dest).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("etag").unwrap(), &original_etag);
+    let body = body_string(response).await;
+    assert_eq!(body, "original content");
+}
+
+#[tokio::test]
 async fn basic_auth_rejects_missing_and_wrong_credentials() {
     let dir = TempDir::new().unwrap();
+    let uploads_dir = TempDir::new().unwrap();
     let storage = Storage::new(dir.path());
-    let state = AppState::new(storage).with_auth("alice", "secret");
+    let uploads = Storage::new(uploads_dir.path());
+    let state = AppState::new(storage, uploads).with_auth("alice", "secret");
     let app = router(state);
 
     let no_auth = Request::builder()

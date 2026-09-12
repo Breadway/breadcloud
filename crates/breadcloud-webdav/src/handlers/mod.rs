@@ -1,7 +1,9 @@
 pub mod copy_move;
 pub mod delete;
+pub mod discovery;
 pub mod get;
 pub mod mkcol;
 pub mod options;
 pub mod propfind;
 pub mod put;
+pub mod uploads;

@@ -11,7 +11,13 @@ use crate::xml::content_type_for;
 /// GET and HEAD share everything except whether the body is sent.
 pub async fn handle(state: &AppState, path: &DavPath, head_only: bool) -> Response {
     match state.storage.open(path).await {
-        Ok((file, metadata)) => file_response(file, &metadata, path, head_only),
+        Ok((file, metadata)) => {
+            let etag = match state.storage.etag_for(path, &metadata).await {
+                Ok(e) => e,
+                Err(err) => return storage_error_response(err),
+            };
+            file_response(file, &metadata, &etag, path, head_only)
+        }
         Err(StorageError::IsADirectory) => {
             if head_only {
                 Response::builder()
@@ -30,6 +36,7 @@ pub async fn handle(state: &AppState, path: &DavPath, head_only: bool) -> Respon
 fn file_response(
     file: tokio::fs::File,
     metadata: &Metadata,
+    etag: &str,
     path: &DavPath,
     head_only: bool,
 ) -> Response {
@@ -37,7 +44,7 @@ fn file_response(
         .status(StatusCode::OK)
         .header("Content-Length", metadata.len.to_string())
         .header("Content-Type", content_type_for(path))
-        .header("ETag", metadata.etag())
+        .header("ETag", etag)
         .header("Last-Modified", httpdate::fmt_http_date(metadata.modified));
 
     if head_only {

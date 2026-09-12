@@ -33,6 +33,7 @@ fn parse_depth(headers: &HeaderMap) -> Depth {
 pub async fn handle(
     state: &AppState,
     path: &DavPath,
+    prefix: &str,
     headers: &HeaderMap,
     req: Request,
 ) -> Response {
@@ -63,9 +64,15 @@ pub async fn handle(
         None
     };
 
+    let self_etag = match state.storage.etag_for(path, &self_metadata).await {
+        Ok(e) => e,
+        Err(err) => return storage_error_response(err),
+    };
+
     let mut entries = vec![ResourceEntry {
         path: path.clone(),
         metadata: self_metadata.clone(),
+        etag: self_etag,
         quota,
     }];
 
@@ -78,9 +85,14 @@ pub async fn handle(
         match children {
             Ok(children) => {
                 for child in children {
+                    let etag = match state.storage.etag_for(&child.path, &child.metadata).await {
+                        Ok(e) => e,
+                        Err(err) => return storage_error_response(err),
+                    };
                     entries.push(ResourceEntry {
                         path: child.path,
                         metadata: child.metadata,
+                        etag,
                         quota: None,
                     });
                 }
@@ -89,7 +101,7 @@ pub async fn handle(
         }
     }
 
-    let xml = build_multistatus(&entries, &propfind_request);
+    let xml = build_multistatus(&entries, &propfind_request, prefix);
     Response::builder()
         .status(multi_status())
         .header("Content-Type", "application/xml; charset=utf-8")

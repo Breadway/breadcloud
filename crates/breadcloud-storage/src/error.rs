@@ -23,6 +23,13 @@ pub enum StorageError {
     #[error("is not a directory")]
     NotADirectory,
 
+    /// The assembled size of a chunked upload did not match the client's
+    /// declared `OC-Total-Length`. Maps to 412 Precondition Failed: the
+    /// client's own precondition on the upload it just finished didn't
+    /// hold, so it should not be treated as if it landed correctly.
+    #[error("assembled size {actual} does not match declared total length {expected}")]
+    LengthMismatch { expected: u64, actual: u64 },
+
     #[error(transparent)]
     InvalidPath(#[from] InvalidPath),
 

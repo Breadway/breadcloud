@@ -1,3 +1,4 @@
+use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use breadcloud_storage::{DavPath, StorageError, WriteOutcome};
@@ -22,21 +23,9 @@ pub async fn handle(
             .into_response();
     }
 
-    let destination_header = match headers.get("Destination").and_then(|v| v.to_str().ok()) {
-        Some(v) => v,
-        None => return (StatusCode::BAD_REQUEST, "missing Destination header").into_response(),
-    };
-
-    let dest_path_raw = extract_path(destination_header);
-    let decoded = match percent_decode_str(&dest_path_raw).decode_utf8() {
-        Ok(s) => s.into_owned(),
-        Err(_) => {
-            return (StatusCode::BAD_REQUEST, "Destination is not valid UTF-8").into_response()
-        }
-    };
-    let destination = match DavPath::parse(&decoded) {
+    let destination = match extract_destination_path(headers) {
         Ok(p) => p,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid Destination path").into_response(),
+        Err((status, msg)) => return (status, msg).into_response(),
     };
 
     // RFC 4918 10.6: Overwrite defaults to T (true) when the header is
@@ -54,8 +43,25 @@ pub async fn handle(
     };
 
     match result {
-        Ok(WriteOutcome::Created) => StatusCode::CREATED.into_response(),
-        Ok(WriteOutcome::Overwritten) => StatusCode::NO_CONTENT.into_response(),
+        Ok(outcome) => {
+            let status = match outcome {
+                WriteOutcome::Created => StatusCode::CREATED,
+                WriteOutcome::Overwritten => StatusCode::NO_CONTENT,
+            };
+            // Best-effort: report the resulting resource's etag the same
+            // way PUT does, so a client that relies on the response
+            // (rather than a follow-up PROPFIND) to learn the new etag
+            // stays in sync. Not fatal if this races with something else
+            // touching the destination immediately after.
+            match state.storage.etag(&destination).await {
+                Ok(etag) => Response::builder()
+                    .status(status)
+                    .header("ETag", etag)
+                    .body(Body::empty())
+                    .unwrap(),
+                Err(_) => status.into_response(),
+            }
+        }
         // RFC 4918 9.9.4 / 9.8.5: destination exists and Overwrite is F.
         Err(StorageError::AlreadyExists) => (
             StatusCode::PRECONDITION_FAILED,
@@ -64,6 +70,31 @@ pub async fn handle(
             .into_response(),
         Err(err) => storage_error_response(err),
     }
+}
+
+/// Extract, percent-decode, strip any DAV mount prefix from, and parse
+/// the `Destination` header into a storage-relative `DavPath`. Shared
+/// with the chunked-upload finalize MOVE (`handlers::uploads`), which
+/// takes the same header to name where the assembled file should land.
+///
+/// Returns a plain `(StatusCode, message)` rather than a full `Response`
+/// on error (clippy's `result_large_err`: `Response` itself is large
+/// enough that returning it by value in the error case is wasteful) --
+/// callers turn that into a response with `.into_response()`.
+pub(crate) fn extract_destination_path(
+    headers: &HeaderMap,
+) -> Result<DavPath, (StatusCode, &'static str)> {
+    let destination_header = headers
+        .get("Destination")
+        .and_then(|v| v.to_str().ok())
+        .ok_or((StatusCode::BAD_REQUEST, "missing Destination header"))?;
+
+    let dest_path_raw = extract_path(destination_header);
+    let decoded = percent_decode_str(&dest_path_raw)
+        .decode_utf8()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Destination is not valid UTF-8"))?;
+    let (_prefix, dav_relative) = crate::split_mount_prefix(&decoded);
+    DavPath::parse(dav_relative).map_err(|_| (StatusCode::BAD_REQUEST, "invalid Destination path"))
 }
 
 /// Pull the path component out of a Destination header value. RFC 4918

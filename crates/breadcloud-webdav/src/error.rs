@@ -18,6 +18,7 @@ fn default_status(err: &StorageError) -> StatusCode {
         StorageError::Conflict(_) => StatusCode::CONFLICT,
         StorageError::IsADirectory => StatusCode::CONFLICT,
         StorageError::NotADirectory => StatusCode::CONFLICT,
+        StorageError::LengthMismatch { .. } => StatusCode::PRECONDITION_FAILED,
         StorageError::InvalidPath(_) => StatusCode::BAD_REQUEST,
         StorageError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }

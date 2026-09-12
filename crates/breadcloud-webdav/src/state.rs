@@ -6,6 +6,12 @@ use breadcloud_storage::Storage;
 #[derive(Clone)]
 pub struct AppState {
     pub storage: Arc<Storage>,
+    /// Staging area for in-progress chunked (NG chunking v2) uploads,
+    /// sandboxed to its own root distinct from `storage`. Kept separate
+    /// rather than a dotdir under the served tree so a PROPFIND on the
+    /// real tree never has a chance of listing someone's in-flight
+    /// upload chunks alongside their files.
+    pub uploads: Arc<Storage>,
     pub auth: Option<BasicAuthConfig>,
 }
 
@@ -19,9 +25,10 @@ pub struct BasicAuthConfig {
 }
 
 impl AppState {
-    pub fn new(storage: Storage) -> Self {
+    pub fn new(storage: Storage, uploads: Storage) -> Self {
         AppState {
             storage: Arc::new(storage),
+            uploads: Arc::new(uploads),
             auth: None,
         }
     }

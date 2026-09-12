@@ -33,6 +33,11 @@ const PATH_ENCODE_SET: &AsciiSet = &CONTROLS
 pub struct ResourceEntry {
     pub path: DavPath,
     pub metadata: Metadata,
+    /// The etag to report, precomputed by the caller (via
+    /// `Storage::etag`) rather than derived here: for a file this is a
+    /// content-derived hash, which `Metadata` alone cannot produce
+    /// without an async storage lookup.
+    pub etag: String,
     /// `Some` only for the collections we want to report quota on
     /// (currently: any directory, computed from the filesystem backing
     /// the storage root -- see [`breadcloud_storage::Storage::quota`]).
@@ -40,10 +45,21 @@ pub struct ResourceEntry {
 }
 
 /// Build a full `multistatus` XML document for a PROPFIND response.
-pub fn build_multistatus(resources: &[ResourceEntry], request: &PropfindRequest) -> String {
+///
+/// `prefix` is prepended to every href verbatim (no extra slash inserted):
+/// real Nextcloud clients mount the tree at
+/// `/remote.php/dav/files/<user>` and reject a response whose hrefs don't
+/// start with that exact prefix, so it must be echoed back, not just the
+/// storage-relative path. Pass `""` for a bare root mount (this crate's
+/// own tests, or a non-Nextcloud client like rclone/davfs2).
+pub fn build_multistatus(
+    resources: &[ResourceEntry],
+    request: &PropfindRequest,
+    prefix: &str,
+) -> String {
     let mut body = String::new();
     body.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
-    body.push_str("<d:multistatus xmlns:d=\"DAV:\">\n");
+    body.push_str("<d:multistatus xmlns:d=\"DAV:\" xmlns:oc=\"http://owncloud.org/ns\">\n");
 
     for entry in resources {
         body.push_str("  <d:response>\n");
@@ -51,6 +67,7 @@ pub fn build_multistatus(resources: &[ResourceEntry], request: &PropfindRequest)
         body.push_str(&xml_escape(&encode_href(
             &entry.path,
             entry.metadata.is_dir(),
+            prefix,
         )));
         body.push_str("</d:href>\n");
 
@@ -59,7 +76,7 @@ pub fn build_multistatus(resources: &[ResourceEntry], request: &PropfindRequest)
                 let applicable = applicable_props(entry);
                 body.push_str("    <d:propstat>\n      <d:prop>\n");
                 for name in applicable {
-                    body.push_str(&format!("        <d:{name}/>\n"));
+                    body.push_str(&format!("        <{}:{name}/>\n", prop_namespace(name)));
                 }
                 body.push_str("      </d:prop>\n      <d:status>HTTP/1.1 200 OK</d:status>\n    </d:propstat>\n");
             }
@@ -92,7 +109,7 @@ pub fn build_multistatus(resources: &[ResourceEntry], request: &PropfindRequest)
                 if !missing.is_empty() {
                     body.push_str("    <d:propstat>\n      <d:prop>\n");
                     for name in missing {
-                        body.push_str(&format!("        <d:{name}/>\n"));
+                        body.push_str(&format!("        <{}:{name}/>\n", prop_namespace(name)));
                     }
                     body.push_str(
                         "      </d:prop>\n      <d:status>HTTP/1.1 404 Not Found</d:status>\n    </d:propstat>\n",
@@ -108,11 +125,40 @@ pub fn build_multistatus(resources: &[ResourceEntry], request: &PropfindRequest)
     body
 }
 
+/// Nextcloud's own extension properties (`oc:fileid`, `oc:permissions`,
+/// and so on) live in the `http://owncloud.org/ns` namespace, bound to
+/// the `oc:` prefix on the multistatus root; everything this server
+/// understands otherwise is a plain WebDAV property in `DAV:` (`d:`).
+fn prop_namespace(name: &str) -> &'static str {
+    match name {
+        "fileid" | "id" | "permissions" => "oc",
+        _ => "d",
+    }
+}
+
 /// Properties we can actually answer for this specific resource (e.g.
 /// `getcontentlength` only makes sense for a file, quota only for a
 /// collection whose quota we computed).
+///
+/// `fileid`, `id`, and `permissions` are always applicable: confirmed
+/// against the real Nextcloud desktop client that a second sync pass
+/// (not just the initial upload) requires all three on every entry, or
+/// it marks the whole item "not accessible on the server" and refuses to
+/// proceed, regardless of getetag/getcontentlength/displayname all being
+/// present and correct. mirall's PROPFIND requests both `oc:id` and
+/// `oc:fileid` (observed) and reads its internal file-id field from
+/// `oc:id`, not `oc:fileid` -- both get the same value here since real
+/// Nextcloud reports the same id under both names too.
 fn applicable_props(entry: &ResourceEntry) -> Vec<&'static str> {
-    let mut props = vec!["resourcetype", "getetag", "getlastmodified", "displayname"];
+    let mut props = vec![
+        "resourcetype",
+        "getetag",
+        "getlastmodified",
+        "displayname",
+        "fileid",
+        "id",
+        "permissions",
+    ];
     if !entry.metadata.is_dir() {
         props.push("getcontentlength");
         props.push("getcontenttype");
@@ -137,7 +183,7 @@ fn render_prop_values(entry: &ResourceEntry, names: &[&str]) -> String {
             }
             "getetag" => {
                 out.push_str("        <d:getetag>");
-                out.push_str(&xml_escape(&entry.metadata.etag()));
+                out.push_str(&xml_escape(&entry.etag));
                 out.push_str("</d:getetag>\n");
             }
             "getlastmodified" => {
@@ -162,6 +208,34 @@ fn render_prop_values(entry: &ResourceEntry, names: &[&str]) -> String {
                 out.push_str("        <d:displayname>");
                 out.push_str(&xml_escape(entry.path.name().unwrap_or("")));
                 out.push_str("</d:displayname>\n");
+            }
+            "fileid" => {
+                out.push_str("        <oc:fileid>");
+                out.push_str(&xml_escape(&crate::fileid::for_path(&entry.path)));
+                out.push_str("</oc:fileid>\n");
+            }
+            "id" => {
+                // Same value as fileid: see this function's doc comment.
+                out.push_str("        <oc:id>");
+                out.push_str(&xml_escape(&crate::fileid::for_path(&entry.path)));
+                out.push_str("</oc:id>\n");
+            }
+            "permissions" => {
+                // This server has one owner-equivalent user (see
+                // breadcloud_webdav::auth) with full rights over
+                // everything until CLOUD-11 adds real multi-user
+                // accounts, so every resource gets the same generous
+                // permission set: Read, delete (D), reNamable/move (NV),
+                // Write (W), and for a collection also Create files (C)
+                // and mKdir (K).
+                let perms = if entry.metadata.is_dir() {
+                    "RGDNVCK"
+                } else {
+                    "RGDNVW"
+                };
+                out.push_str("        <oc:permissions>");
+                out.push_str(perms);
+                out.push_str("</oc:permissions>\n");
             }
             "quota-used-bytes" => {
                 if let Some(q) = &entry.quota {
@@ -196,14 +270,18 @@ pub fn content_type_for(path: &DavPath) -> String {
 
 /// Percent-encode a `DavPath` into an href, with a trailing slash for
 /// collections (both mirall and iOS's WebDAV client rely on the trailing
-/// slash to tell collections and files apart in a PROPFIND response).
-pub fn encode_href(path: &DavPath, is_collection: bool) -> String {
-    let mut out = String::new();
+/// slash to tell collections and files apart in a PROPFIND response), and
+/// `prefix` prepended verbatim (see [`build_multistatus`]).
+pub fn encode_href(path: &DavPath, is_collection: bool, prefix: &str) -> String {
+    let mut out = String::from(prefix);
     for seg in path.segments() {
         out.push('/');
         out.push_str(&utf8_percent_encode(seg, PATH_ENCODE_SET).to_string());
     }
-    if out.is_empty() || is_collection {
+    if out.is_empty() || out == prefix {
+        out.push('/');
+    }
+    if is_collection && !out.ends_with('/') {
         out.push('/');
     }
     out
@@ -248,6 +326,7 @@ mod tests {
                 len: 42,
                 modified: UNIX_EPOCH,
             },
+            etag: "\"deadbeef\"".to_string(),
             quota: None,
         }
     }
@@ -260,6 +339,7 @@ mod tests {
                 len: 0,
                 modified: UNIX_EPOCH,
             },
+            etag: "\"cafef00d\"".to_string(),
             quota,
         }
     }
@@ -267,7 +347,7 @@ mod tests {
     #[test]
     fn file_href_has_no_trailing_slash() {
         let entries = vec![file_entry("/docs/a.txt")];
-        let xml = build_multistatus(&entries, &PropfindRequest::AllProp);
+        let xml = build_multistatus(&entries, &PropfindRequest::AllProp, "");
         assert!(xml.contains("<d:href>/docs/a.txt</d:href>"));
         assert!(xml.contains("<d:getcontentlength>42</d:getcontentlength>"));
         assert!(xml.contains("<d:resourcetype/>"));
@@ -282,7 +362,7 @@ mod tests {
                 available_bytes: 900,
             }),
         )];
-        let xml = build_multistatus(&entries, &PropfindRequest::AllProp);
+        let xml = build_multistatus(&entries, &PropfindRequest::AllProp, "");
         assert!(xml.contains("<d:href>/docs/</d:href>"));
         assert!(xml.contains("<d:resourcetype><d:collection/></d:resourcetype>"));
         assert!(xml.contains("<d:quota-used-bytes>100</d:quota-used-bytes>"));
@@ -293,25 +373,97 @@ mod tests {
     #[test]
     fn unsupported_requested_prop_gets_its_own_404_propstat() {
         let entries = vec![file_entry("/docs/a.txt")];
-        let request = PropfindRequest::Prop(vec!["getetag".to_string(), "fileid".to_string()]);
-        let xml = build_multistatus(&entries, &request);
+        // share-types is a real oc: property this server does not
+        // implement (there is no sharing yet); fileid and permissions
+        // are both supported (see the tests below) so they no longer
+        // belong in this list.
+        let request = PropfindRequest::Prop(vec!["getetag".to_string(), "share-types".to_string()]);
+        let xml = build_multistatus(&entries, &request, "");
         assert!(xml.contains("<d:getetag>"));
-        assert!(xml.contains("<d:fileid/>"));
+        assert!(xml.contains("<d:share-types/>"));
         assert!(xml.contains("404 Not Found"));
         assert!(xml.contains("200 OK"));
     }
 
     #[test]
+    fn fileid_and_permissions_are_always_reported() {
+        // A real Nextcloud desktop client's *second* sync pass (not just
+        // the initial upload) requires all of these on every entry or it
+        // marks the item "not accessible on the server" -- confirmed
+        // against nextcloudcmd. It requests both oc:id and oc:fileid but
+        // reads its internal file-id field from oc:id.
+        let file = vec![file_entry("/docs/a.txt")];
+        let xml = build_multistatus(&file, &PropfindRequest::AllProp, "");
+        assert!(xml.contains("<oc:fileid>"));
+        assert!(xml.contains("<oc:id>"));
+        assert!(xml.contains("<oc:permissions>RGDNVW</oc:permissions>"));
+
+        let dir = vec![dir_entry("/docs", None)];
+        let xml = build_multistatus(&dir, &PropfindRequest::AllProp, "");
+        assert!(xml.contains("<oc:fileid>"));
+        assert!(xml.contains("<oc:id>"));
+        assert!(xml.contains("<oc:permissions>RGDNVCK</oc:permissions>"));
+    }
+
+    #[test]
+    fn fileid_is_stable_for_the_same_path() {
+        let a = vec![file_entry("/docs/a.txt")];
+        let b = vec![file_entry("/docs/a.txt")];
+        let xml_a = build_multistatus(&a, &PropfindRequest::AllProp, "");
+        let xml_b = build_multistatus(&b, &PropfindRequest::AllProp, "");
+        let extract = |xml: &str| {
+            let start = xml.find("<oc:fileid>").unwrap() + "<oc:fileid>".len();
+            let end = xml[start..].find("</oc:fileid>").unwrap() + start;
+            xml[start..end].to_string()
+        };
+        assert_eq!(extract(&xml_a), extract(&xml_b));
+    }
+
+    #[test]
+    fn multistatus_root_declares_the_oc_namespace() {
+        let entries = vec![file_entry("/a.txt")];
+        let xml = build_multistatus(&entries, &PropfindRequest::AllProp, "");
+        assert!(xml.contains("xmlns:oc=\"http://owncloud.org/ns\""));
+    }
+
+    #[test]
     fn href_percent_encodes_reserved_characters() {
         let entries = vec![file_entry("/a b#c.txt")];
-        let xml = build_multistatus(&entries, &PropfindRequest::AllProp);
+        let xml = build_multistatus(&entries, &PropfindRequest::AllProp, "");
         assert!(xml.contains("<d:href>/a%20b%23c.txt</d:href>"));
+    }
+
+    #[test]
+    fn href_carries_the_dav_mount_prefix_real_clients_require() {
+        // Real Nextcloud clients (mirall) mount at
+        // /remote.php/dav/files/<user> and reject a PROPFIND response
+        // whose hrefs don't start with that exact prefix.
+        let prefix = "/remote.php/dav/files/dev";
+        let file = vec![file_entry("/docs/a.txt")];
+        let xml = build_multistatus(&file, &PropfindRequest::AllProp, prefix);
+        assert!(xml.contains("<d:href>/remote.php/dav/files/dev/docs/a.txt</d:href>"));
+
+        let root = vec![dir_entry("/", None)];
+        let xml = build_multistatus(&root, &PropfindRequest::AllProp, prefix);
+        assert!(xml.contains("<d:href>/remote.php/dav/files/dev/</d:href>"));
+
+        let dir = vec![dir_entry("/docs", None)];
+        let xml = build_multistatus(&dir, &PropfindRequest::AllProp, prefix);
+        assert!(xml.contains("<d:href>/remote.php/dav/files/dev/docs/</d:href>"));
+    }
+
+    #[test]
+    fn getetag_uses_the_precomputed_entry_etag() {
+        let entries = vec![file_entry("/a.txt")];
+        let xml = build_multistatus(&entries, &PropfindRequest::AllProp, "");
+        // The quotes in the etag get XML-escaped like any other content.
+        assert!(xml.contains("<d:getetag>&quot;deadbeef&quot;</d:getetag>"));
     }
 
     #[test]
     fn displayname_escapes_xml_special_characters() {
         let entries = vec![file_entry("/a&b<c>.txt")];
-        let xml = build_multistatus(&entries, &PropfindRequest::AllProp);
+        let xml = build_multistatus(&entries, &PropfindRequest::AllProp, "");
         assert!(xml.contains("<d:displayname>a&amp;b&lt;c&gt;.txt</d:displayname>"));
     }
 }

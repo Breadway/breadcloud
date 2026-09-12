@@ -13,9 +13,12 @@ pub mod path;
 pub use error::StorageError;
 pub use path::DavPath;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Kind of filesystem entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,20 +40,33 @@ impl Metadata {
         self.kind == EntryKind::Directory
     }
 
-    /// A quoted etag derived from mtime and size. Cheap enough to compute
-    /// on every PROPFIND over a multi-gigabyte tree, and changes whenever
-    /// the file is rewritten (mtime bumps) or truncated/extended. It is
-    /// not a strong content hash: two writes that land in the same
-    /// millisecond with the same length would collide, which is an
-    /// acceptable tradeoff against hashing file contents on every listing.
+    /// A quoted etag derived from mtime and size, at nanosecond precision.
+    /// This is what collections get (there is no useful "content" to hash
+    /// for a directory), and it is also the cache-validity key behind
+    /// [`Storage::etag`]'s content-derived etags for files: cheap to
+    /// compute, but not a strong content signature -- two writes to the
+    /// same file landing in the same nanosecond with the same length
+    /// would collide. See [`Storage::etag`] for the file case, which
+    /// hashes content instead and does not have that problem.
     pub fn etag(&self) -> String {
-        let millis = self
+        let nanos = self
             .modified
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
+            .map(|d| d.as_nanos())
             .unwrap_or(0);
-        format!("\"{millis:x}-{:x}\"", self.len)
+        format!("\"{nanos:x}-{:x}\"", self.len)
     }
+}
+
+/// A content-derived etag cached against the (mtime, len) it was computed
+/// for, so a PROPFIND over an unchanged tree only ever does hashmap
+/// lookups, not rehashing. Invalidated (recomputed) whenever mtime or len
+/// changes, which write_bytes/assemble bump on every write.
+#[derive(Debug, Clone)]
+struct CachedEtag {
+    modified: SystemTime,
+    len: u64,
+    etag: String,
 }
 
 /// Disk usage of the filesystem backing the storage root.
@@ -82,16 +98,21 @@ pub struct DirEntry {
 
 /// Filesystem-backed storage, sandboxed to a root directory.
 ///
-/// Cheap to clone (just an `Arc`-free `PathBuf`); callers typically wrap
-/// it in an `Arc` once and share it across the whole HTTP server.
+/// Cheap to clone: the etag cache is behind an `Arc`, so clones share it
+/// (callers typically wrap the whole `Storage` in an `Arc` once anyway and
+/// share that across the HTTP server, but cloning is safe either way).
 #[derive(Debug, Clone)]
 pub struct Storage {
     root: PathBuf,
+    etag_cache: Arc<Mutex<HashMap<PathBuf, CachedEtag>>>,
 }
 
 impl Storage {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Storage { root: root.into() }
+        Storage {
+            root: root.into(),
+            etag_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -172,11 +193,16 @@ impl Storage {
     /// 4918 9.7.1). Writes go to a temp file in the same directory and
     /// are then renamed into place, so a concurrent GET never observes a
     /// partially-written file.
+    ///
+    /// Returns the content-derived etag of the written data alongside the
+    /// outcome, computed from `data` directly (no extra disk read) and
+    /// seeded into the etag cache so the next GET/PROPFIND/HEAD of this
+    /// path is a cache hit rather than a rehash.
     pub async fn write_bytes(
         &self,
         path: &DavPath,
         data: &[u8],
-    ) -> Result<WriteOutcome, StorageError> {
+    ) -> Result<(WriteOutcome, String), StorageError> {
         let parent_dav = path
             .parent()
             .ok_or_else(|| StorageError::Conflict("cannot write to the storage root".into()))?;
@@ -197,6 +223,8 @@ impl Storage {
             Err(_) => false,
         };
 
+        let etag = format_etag(blake3::hash(data));
+
         let tmp_path = parent_fs.join(format!(".breadcloud-tmp-{}", tmp_suffix()));
         fs::write(&tmp_path, data).await?;
         if let Err(e) = fs::rename(&tmp_path, &fs_path).await {
@@ -204,11 +232,153 @@ impl Storage {
             return Err(e.into());
         }
 
-        Ok(if existed {
-            WriteOutcome::Overwritten
-        } else {
-            WriteOutcome::Created
-        })
+        if let Ok(meta) = fs::metadata(&fs_path).await {
+            self.seed_etag_cache(&fs_path, &to_metadata(&meta), etag.clone());
+        }
+
+        Ok((
+            if existed {
+                WriteOutcome::Overwritten
+            } else {
+                WriteOutcome::Created
+            },
+            etag,
+        ))
+    }
+
+    /// The etag RFC 4918 clients should see for `path`: content-derived
+    /// (cached, keyed on mtime+len) for a file, the cheaper mtime/len
+    /// signature for a collection (there is no meaningful "content" to
+    /// hash for a directory; see [`Metadata::etag`]).
+    ///
+    /// Consistent across PROPFIND, GET, HEAD and PUT/MOVE/COPY responses:
+    /// every one of those handlers goes through this method (or reuses a
+    /// value it returned) rather than deriving its own etag.
+    pub async fn etag(&self, path: &DavPath) -> Result<String, StorageError> {
+        let fs_path = self.resolve(path);
+        let meta = fs::metadata(&fs_path).await.map_err(map_not_found)?;
+        self.content_etag(&fs_path, &to_metadata(&meta)).await
+    }
+
+    /// Same as [`Storage::etag`], but for a caller that already has this
+    /// path's `Metadata` in hand (from `metadata`, `list_dir`, or
+    /// `list_recursive`) and wants to avoid a redundant stat -- notably
+    /// PROPFIND, which fetches metadata for a whole directory listing and
+    /// would otherwise stat every entry twice.
+    pub async fn etag_for(&self, path: &DavPath, meta: &Metadata) -> Result<String, StorageError> {
+        let fs_path = self.resolve(path);
+        self.content_etag(&fs_path, meta).await
+    }
+
+    /// Content-derived etag for a file already known to exist, reusing a
+    /// `Metadata` the caller already fetched. Checks the cache first;
+    /// only reads and hashes the file when the cache is cold or stale
+    /// (mtime/len changed since the cached hash was computed, e.g. a
+    /// write that happened outside `write_bytes`/`assemble`, or the first
+    /// access after a server restart with an empty cache).
+    async fn content_etag(&self, fs_path: &Path, meta: &Metadata) -> Result<String, StorageError> {
+        if meta.is_dir() {
+            return Ok(meta.etag());
+        }
+        {
+            let cache = self.etag_cache.lock().expect("etag cache lock poisoned");
+            if let Some(cached) = cache.get(fs_path) {
+                if cached.modified == meta.modified && cached.len == meta.len {
+                    return Ok(cached.etag.clone());
+                }
+            }
+        }
+
+        let hash = hash_file(fs_path).await?;
+        let etag = format_etag(hash);
+        self.seed_etag_cache(fs_path, meta, etag.clone());
+        Ok(etag)
+    }
+
+    fn seed_etag_cache(&self, fs_path: &Path, meta: &Metadata, etag: String) {
+        let mut cache = self.etag_cache.lock().expect("etag cache lock poisoned");
+        cache.insert(
+            fs_path.to_path_buf(),
+            CachedEtag {
+                modified: meta.modified,
+                len: meta.len,
+                etag,
+            },
+        );
+    }
+
+    /// Assemble `chunk_files` (in the order given -- the caller is
+    /// responsible for sorting them into upload order) into `dest`,
+    /// streaming each one through rather than buffering the whole result
+    /// in memory. Used to finalize a chunked (NG chunking v2) upload: the
+    /// chunks live in a separate staging `Storage`, so this takes plain
+    /// filesystem paths for them rather than `DavPath`s in `self`.
+    ///
+    /// `expected_total`, when given (from the client's `OC-Total-Length`
+    /// header), is checked against the assembled size before the result
+    /// is renamed into place; a mismatch leaves `dest` untouched and
+    /// returns `StorageError::LengthMismatch` so the caller can 412 and
+    /// let the client retry rather than silently accepting a truncated or
+    /// overlong file.
+    pub async fn assemble(
+        &self,
+        dest: &DavPath,
+        chunk_files: &[PathBuf],
+        overwrite: bool,
+        expected_total: Option<u64>,
+    ) -> Result<(WriteOutcome, u64, String), StorageError> {
+        let parent_dav = dest
+            .parent()
+            .ok_or_else(|| StorageError::Conflict("cannot write to the storage root".into()))?;
+        let parent_fs = self.resolve(&parent_dav);
+        let parent_meta = fs::metadata(&parent_fs).await.map_err(|_| {
+            StorageError::Conflict(format!("parent collection {parent_dav} does not exist"))
+        })?;
+        if !parent_meta.is_dir() {
+            return Err(StorageError::Conflict(format!(
+                "{parent_dav} is not a collection"
+            )));
+        }
+
+        let dest_fs = self.resolve(dest);
+        let existed = match fs::metadata(&dest_fs).await {
+            Ok(meta) if meta.is_dir() => return Err(StorageError::IsADirectory),
+            Ok(_) => true,
+            Err(_) => false,
+        };
+        if existed && !overwrite {
+            return Err(StorageError::AlreadyExists);
+        }
+
+        let tmp_path = parent_fs.join(format!(".breadcloud-tmp-{}", tmp_suffix()));
+        let result = assemble_into(&tmp_path, chunk_files, expected_total).await;
+        let (total, hash) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path).await;
+                return Err(e);
+            }
+        };
+
+        if let Err(e) = fs::rename(&tmp_path, &dest_fs).await {
+            let _ = fs::remove_file(&tmp_path).await;
+            return Err(e.into());
+        }
+
+        let etag = format_etag(hash);
+        if let Ok(meta) = fs::metadata(&dest_fs).await {
+            self.seed_etag_cache(&dest_fs, &to_metadata(&meta), etag.clone());
+        }
+
+        Ok((
+            if existed {
+                WriteOutcome::Overwritten
+            } else {
+                WriteOutcome::Created
+            },
+            total,
+            etag,
+        ))
     }
 
     /// Create a new, empty collection (MKCOL). The parent must already
@@ -367,6 +537,77 @@ fn map_not_found(e: std::io::Error) -> StorageError {
     }
 }
 
+fn format_etag(hash: blake3::Hash) -> String {
+    // 32 hex chars (128 bits) is plenty of collision resistance for an
+    // etag and keeps the header short; blake3's full digest is 64 hex
+    // chars.
+    format!("\"{}\"", &hash.to_hex()[..32])
+}
+
+/// Hash a file's full content. Used when the etag cache is cold (first
+/// access after a restart, or a file written outside `write_bytes`).
+async fn hash_file(fs_path: &Path) -> Result<blake3::Hash, StorageError> {
+    let mut file = fs::File::open(fs_path).await.map_err(map_not_found)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize())
+}
+
+/// Stream-concatenate `chunk_files` into `tmp_path` in order, hashing as
+/// it goes. Returns the total bytes written and their combined hash.
+/// Leaves `tmp_path`'s state up to the caller on error (they remove it).
+async fn assemble_into(
+    tmp_path: &Path,
+    chunk_files: &[PathBuf],
+    expected_total: Option<u64>,
+) -> Result<(u64, blake3::Hash), StorageError> {
+    let mut out = fs::File::create(tmp_path).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut total: u64 = 0;
+    let mut buf = vec![0u8; 256 * 1024];
+
+    for chunk_path in chunk_files {
+        let mut chunk = fs::File::open(chunk_path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StorageError::Conflict(format!(
+                    "chunk {} vanished before assembly",
+                    chunk_path.display()
+                ))
+            } else {
+                StorageError::Io(e)
+            }
+        })?;
+        loop {
+            let n = chunk.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n]).await?;
+            hasher.update(&buf[..n]);
+            total += n as u64;
+        }
+    }
+    out.flush().await?;
+
+    if let Some(expected) = expected_total {
+        if expected != total {
+            return Err(StorageError::LengthMismatch {
+                expected,
+                actual: total,
+            });
+        }
+    }
+
+    Ok((total, hasher.finalize()))
+}
+
 fn tmp_suffix() -> String {
     use std::time::SystemTime;
     let nanos = SystemTime::now()
@@ -412,8 +653,9 @@ mod tests {
     async fn write_new_file_reports_created() {
         let (_dir, storage) = storage().await;
         let path = DavPath::parse("/hello.txt").unwrap();
-        let outcome = storage.write_bytes(&path, b"hi").await.unwrap();
+        let (outcome, etag) = storage.write_bytes(&path, b"hi").await.unwrap();
         assert_eq!(outcome, WriteOutcome::Created);
+        assert!(!etag.is_empty());
         let meta = storage.metadata(&path).await.unwrap();
         assert_eq!(meta.len, 2);
         assert!(!meta.is_dir());
@@ -424,7 +666,7 @@ mod tests {
         let (_dir, storage) = storage().await;
         let path = DavPath::parse("/hello.txt").unwrap();
         storage.write_bytes(&path, b"hi").await.unwrap();
-        let outcome = storage.write_bytes(&path, b"hello there").await.unwrap();
+        let (outcome, _etag) = storage.write_bytes(&path, b"hello there").await.unwrap();
         assert_eq!(outcome, WriteOutcome::Overwritten);
         let meta = storage.metadata(&path).await.unwrap();
         assert_eq!(meta.len, 11);
@@ -619,5 +861,140 @@ mod tests {
         let (_dir, storage) = storage().await;
         let quota = storage.quota().unwrap();
         assert!(quota.available_bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn etag_is_content_derived_not_just_mtime() {
+        let (_dir, storage) = storage().await;
+        let a = DavPath::parse("/a.txt").unwrap();
+        let b = DavPath::parse("/b.txt").unwrap();
+        // Same length, different content, written back to back (likely
+        // the same nanosecond on a fast test machine): a pure mtime+len
+        // etag would be prone to colliding here, a content etag never
+        // does.
+        storage.write_bytes(&a, b"aaaaaaaa").await.unwrap();
+        storage.write_bytes(&b, b"bbbbbbbb").await.unwrap();
+        let etag_a = storage.etag(&a).await.unwrap();
+        let etag_b = storage.etag(&b).await.unwrap();
+        assert_ne!(etag_a, etag_b);
+    }
+
+    #[tokio::test]
+    async fn etag_is_stable_across_rereads() {
+        let (_dir, storage) = storage().await;
+        let path = DavPath::parse("/a.txt").unwrap();
+        storage.write_bytes(&path, b"stable content").await.unwrap();
+        let first = storage.etag(&path).await.unwrap();
+        let second = storage.etag(&path).await.unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn etag_changes_when_content_is_overwritten() {
+        let (_dir, storage) = storage().await;
+        let path = DavPath::parse("/a.txt").unwrap();
+        storage.write_bytes(&path, b"version one").await.unwrap();
+        let before = storage.etag(&path).await.unwrap();
+        storage.write_bytes(&path, b"version two").await.unwrap();
+        let after = storage.etag(&path).await.unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn etag_matches_the_one_returned_by_write_bytes() {
+        let (_dir, storage) = storage().await;
+        let path = DavPath::parse("/a.txt").unwrap();
+        let (_outcome, written_etag) = storage.write_bytes(&path, b"payload").await.unwrap();
+        let read_etag = storage.etag(&path).await.unwrap();
+        assert_eq!(written_etag, read_etag);
+    }
+
+    #[tokio::test]
+    async fn etag_recomputes_when_written_outside_write_bytes() {
+        let (_dir, storage) = storage().await;
+        let path = DavPath::parse("/a.txt").unwrap();
+        storage.write_bytes(&path, b"first").await.unwrap();
+        let first_etag = storage.etag(&path).await.unwrap();
+
+        // Simulate a write that bypassed write_bytes (e.g. a file dropped
+        // directly into the served tree): the cache still has the old
+        // (mtime, len) keyed to the old hash, so this must detect the
+        // mismatch and rehash rather than serving a stale etag.
+        let fs_path = storage.resolve(&path);
+        tokio::fs::write(&fs_path, b"replaced-outside-storage")
+            .await
+            .unwrap();
+
+        let second_etag = storage.etag(&path).await.unwrap();
+        assert_ne!(first_etag, second_etag);
+    }
+
+    #[tokio::test]
+    async fn assemble_concatenates_chunks_in_given_order() {
+        let (dir, storage) = storage().await;
+        let chunks_dir = dir.path().join("chunks");
+        tokio::fs::create_dir_all(&chunks_dir).await.unwrap();
+        let c0 = chunks_dir.join("0");
+        let c1 = chunks_dir.join("1");
+        tokio::fs::write(&c0, b"hello, ").await.unwrap();
+        tokio::fs::write(&c1, b"world!").await.unwrap();
+
+        let dest = DavPath::parse("/assembled.txt").unwrap();
+        let (outcome, total, etag) = storage
+            .assemble(&dest, &[c0, c1], false, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome, WriteOutcome::Created);
+        assert_eq!(total, 13);
+        assert!(!etag.is_empty());
+
+        let meta = storage.metadata(&dest).await.unwrap();
+        assert_eq!(meta.len, 13);
+        assert_eq!(storage.etag(&dest).await.unwrap(), etag);
+    }
+
+    #[tokio::test]
+    async fn assemble_rejects_mismatched_total_length() {
+        let (dir, storage) = storage().await;
+        let chunk = dir.path().join("chunk0");
+        tokio::fs::write(&chunk, b"only-ten-b").await.unwrap();
+
+        let dest = DavPath::parse("/assembled.txt").unwrap();
+        let err = storage
+            .assemble(&dest, &[chunk], false, Some(999))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::LengthMismatch { .. }));
+        assert!(!storage.exists(&dest).await);
+    }
+
+    #[tokio::test]
+    async fn assemble_onto_existing_without_overwrite_fails() {
+        let (dir, storage) = storage().await;
+        let dest = DavPath::parse("/dest.txt").unwrap();
+        storage.write_bytes(&dest, b"already here").await.unwrap();
+
+        let chunk = dir.path().join("chunk0");
+        tokio::fs::write(&chunk, b"new content").await.unwrap();
+
+        let err = storage
+            .assemble(&dest, &[chunk], false, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::AlreadyExists));
+    }
+
+    #[tokio::test]
+    async fn assemble_missing_parent_is_conflict() {
+        let (dir, storage) = storage().await;
+        let chunk = dir.path().join("chunk0");
+        tokio::fs::write(&chunk, b"x").await.unwrap();
+
+        let dest = DavPath::parse("/missing/dest.txt").unwrap();
+        let err = storage
+            .assemble(&dest, &[chunk], false, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Conflict(_)));
     }
 }

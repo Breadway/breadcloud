@@ -10,6 +10,15 @@ use crate::state::{AppState, BasicAuthConfig};
 /// (local development only). This is a placeholder: CLOUD-11 replaces it
 /// with real multi-user accounts.
 pub async fn require_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    // Real Nextcloud serves status.php unauthenticated: it is the first
+    // request a client makes, before it has any credentials to send (the
+    // "add account" flow uses it to confirm there is a Nextcloud-shaped
+    // server at this URL at all). Gating it behind auth would break that
+    // flow for every real client, mirall included.
+    if req.uri().path().ends_with("/status.php") {
+        return next.run(req).await;
+    }
+
     let Some(auth) = &state.auth else {
         return next.run(req).await;
     };
