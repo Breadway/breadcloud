@@ -1,0 +1,25 @@
+[package]
+name = "breadcloud-webdav"
+version = "0.1.0"
+edition = "2021"
+description = "WebDAV (RFC 4918) HTTP layer for breadcloud, built on axum"
+
+[dependencies]
+breadcloud-storage = { path = "../breadcloud-storage" }
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace"] }
+tracing = "0.1"
+quick-xml = "0.36"
+percent-encoding = "2"
+httpdate = "1"
+base64 = "0.22"
+bytes = "1"
+mime_guess = "2"
+tokio-util = { version = "0.7", features = ["io"] }
+
+[dev-dependencies]
+tempfile = "3"
+http-body-util = "0.1"
+tower = { version = "0.4", features = ["util"] }

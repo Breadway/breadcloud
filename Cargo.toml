@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/breadcloud-storage",
+    "crates/breadcloud-webdav",
+    "crates/breadcloud-server",
+]
+
+[profile.release]
+lto = true

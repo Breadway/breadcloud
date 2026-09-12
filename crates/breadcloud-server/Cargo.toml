@@ -1,0 +1,17 @@
+[package]
+name = "breadcloud-server"
+version = "0.1.0"
+edition = "2021"
+description = "breadcloud WebDAV server binary"
+
+[[bin]]
+name = "breadcloud-server"
+path = "src/main.rs"
+
+[dependencies]
+breadcloud-storage = { path = "../breadcloud-storage" }
+breadcloud-webdav = { path = "../breadcloud-webdav" }
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

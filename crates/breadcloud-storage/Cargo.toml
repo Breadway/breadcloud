@@ -1,0 +1,13 @@
+[package]
+name = "breadcloud-storage"
+version = "0.1.0"
+edition = "2021"
+description = "Filesystem-backed storage primitives for breadcloud"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+thiserror = "1"
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
