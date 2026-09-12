@@ -26,6 +26,13 @@ pub async fn handle(state: &AppState, path: &DavPath, req: Request) -> Response 
         return conflict;
     }
 
+    // Snapshot whatever is currently at `path` into version history
+    // (CLOUD-4) before the write below can replace it. A no-op if `path`
+    // does not exist yet -- first creation is not a "previous version".
+    if let Err(resp) = crate::versioning::snapshot_before_overwrite(state, path).await {
+        return resp;
+    }
+
     let bytes = match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "could not read request body").into_response(),

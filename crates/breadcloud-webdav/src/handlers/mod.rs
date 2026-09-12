@@ -7,3 +7,4 @@ pub mod options;
 pub mod propfind;
 pub mod put;
 pub mod uploads;
+pub mod versions;

@@ -5,7 +5,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use breadcloud_storage::Storage;
+use breadcloud_storage::{Storage, VersionStore};
 use breadcloud_webdav::AppState;
 
 #[tokio::main]
@@ -33,6 +33,21 @@ async fn main() {
         .canonicalize()
         .expect("failed to resolve uploads staging root");
 
+    // Per-file version history (CLOUD-4). Kept outside BREADCLOUD_ROOT,
+    // same reasoning as the uploads staging area above: a PROPFIND of the
+    // real tree must never see it. Unlike uploads staging this needs to
+    // persist across restarts, so it defaults to a sibling directory of
+    // the data root rather than the system temp dir.
+    let versions_root = std::env::var("BREADCLOUD_VERSIONS_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./breadcloud-versions"));
+    if !versions_root.exists() {
+        std::fs::create_dir_all(&versions_root).expect("failed to create version history root");
+    }
+    let versions_root = versions_root
+        .canonicalize()
+        .expect("failed to resolve version history root");
+
     let bind = std::env::var("BREADCLOUD_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     let addr: SocketAddr = bind
         .parse()
@@ -40,7 +55,8 @@ async fn main() {
 
     let storage = Storage::new(root.clone());
     let uploads = Storage::new(uploads_root.clone());
-    let mut state = AppState::new(storage, uploads);
+    let versions = VersionStore::new(versions_root.clone());
+    let mut state = AppState::new(storage, uploads, versions);
 
     let user = std::env::var("BREADCLOUD_USER").ok();
     let pass = std::env::var("BREADCLOUD_PASS").ok();
@@ -57,10 +73,11 @@ async fn main() {
     }
 
     tracing::info!(
-        "serving {} on {} (chunked-upload staging: {})",
+        "serving {} on {} (chunked-upload staging: {}, version history: {})",
         root.display(),
         addr,
-        uploads_root.display()
+        uploads_root.display(),
+        versions_root.display()
     );
 
     let app = breadcloud_webdav::router(state);

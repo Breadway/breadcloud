@@ -21,7 +21,7 @@ use axum::response::{IntoResponse, Response};
 
 const STATUS_JSON: &str = r#"{"installed":true,"maintenance":false,"needsDbUpgrade":false,"version":"28.0.0.0","versionstring":"28.0.0","edition":"","productname":"breadcloud","extendedSupport":false}"#;
 
-const CAPABILITIES_JSON: &str = r#"{"ocs":{"meta":{"status":"ok","statuscode":100,"message":"OK"},"data":{"version":{"major":28,"minor":0,"micro":0,"string":"28.0.0","edition":"","extended_support":false},"capabilities":{"core":{"pollinterval":60,"webdav-root":"remote.php/webdav"},"dav":{"chunking":"1.0"},"files":{"bigfileupload":true,"blacklisted_files":[],"chunking":"1.0","comments":false,"undelete":false,"versioning":false}}}}}"#;
+const CAPABILITIES_JSON: &str = r#"{"ocs":{"meta":{"status":"ok","statuscode":100,"message":"OK"},"data":{"version":{"major":28,"minor":0,"micro":0,"string":"28.0.0","edition":"","extended_support":false},"capabilities":{"core":{"pollinterval":60,"webdav-root":"remote.php/webdav"},"dav":{"chunking":"1.0"},"files":{"bigfileupload":true,"blacklisted_files":[],"chunking":"1.0","comments":false,"undelete":false,"versioning":true}}}}}"#;
 
 /// `GET /status.php`. Deliberately does not require authentication (the
 /// auth middleware exempts it): real Nextcloud serves this endpoint
@@ -39,7 +39,10 @@ pub fn status() -> Response {
 /// `GET /ocs/v1.php/cloud/capabilities` (and the `v2.php` alias some
 /// client versions use). Reports `dav.chunking: "1.0"` so the client
 /// knows this server accepts NG chunked uploads (see
-/// `crate::handlers::uploads`).
+/// `crate::handlers::uploads`), and `files.versioning: true` now that
+/// overwrites are captured into version history (CLOUD-4, see
+/// `crate::versioning` and `crate::handlers::versions`) -- `undelete`
+/// stays `false` since there is no trash yet (a separate, later issue).
 pub fn capabilities() -> Response {
     (
         StatusCode::OK,

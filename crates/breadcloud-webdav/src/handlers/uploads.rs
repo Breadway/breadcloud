@@ -264,11 +264,48 @@ async fn finalize(state: &AppState, transfer_dir: &DavPath, headers: &HeaderMap)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
 
-    match state
+    // Validates the finalize against `dest` and assembles the chunks into
+    // a temp file, without touching `dest` yet. Every failure mode that
+    // depends on `dest` or the chunks (Overwrite:F conflict, OC-Total-Length
+    // mismatch, a vanished chunk) surfaces here, before anything is
+    // snapshotted or replaced -- see CLOUD-4 rework notes on why the
+    // version snapshot must not happen any earlier than this.
+    let prepared = match state
         .storage
-        .assemble(&dest, &chunk_paths, overwrite, expected_total)
+        .prepare_assemble(&dest, &chunk_paths, overwrite, expected_total)
         .await
     {
+        Ok(p) => p,
+        Err(StorageError::AlreadyExists) => {
+            return (
+                StatusCode::PRECONDITION_FAILED,
+                "destination exists and Overwrite is F",
+            )
+                .into_response()
+        }
+        Err(StorageError::LengthMismatch { expected, actual }) => {
+            return (
+                StatusCode::PRECONDITION_FAILED,
+                format!("assembled {actual} bytes but OC-Total-Length declared {expected}"),
+            )
+                .into_response()
+        }
+        Err(err) => return storage_error_response(err),
+    };
+
+    // Same version-history snapshot plain PUT gets (CLOUD-4). By this
+    // point the finalize is known to actually replace `dest`'s content
+    // once committed, so this can no longer fire for a finalize the
+    // empty-chunks check, an Overwrite:F conflict, or a length mismatch
+    // is about to reject. Most files in a real synced dataset take this
+    // chunked path rather than plain PUT (see CLOUD-3), so skipping this
+    // here would leave versioning working only for small files.
+    if let Err(resp) = crate::versioning::snapshot_before_overwrite(state, &dest).await {
+        prepared.discard().await;
+        return resp;
+    }
+
+    match state.storage.commit_assemble(prepared).await {
         Ok((outcome, _total, etag)) => {
             let mtime_accepted = match crate::mtime::parse_oc_mtime(headers) {
                 Some(mtime) => crate::mtime::apply(state.storage.resolve(&dest), mtime),
@@ -292,16 +329,6 @@ async fn finalize(state: &AppState, transfer_dir: &DavPath, headers: &HeaderMap)
             }
             builder.body(Body::empty()).unwrap()
         }
-        Err(StorageError::AlreadyExists) => (
-            StatusCode::PRECONDITION_FAILED,
-            "destination exists and Overwrite is F",
-        )
-            .into_response(),
-        Err(StorageError::LengthMismatch { expected, actual }) => (
-            StatusCode::PRECONDITION_FAILED,
-            format!("assembled {actual} bytes but OC-Total-Length declared {expected}"),
-        )
-            .into_response(),
         Err(err) => storage_error_response(err),
     }
 }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use breadcloud_storage::Storage;
+use breadcloud_storage::{Storage, VersionStore};
 
 /// Shared state for the whole WebDAV router.
 #[derive(Clone)]
@@ -12,6 +12,13 @@ pub struct AppState {
     /// real tree never has a chance of listing someone's in-flight
     /// upload chunks alongside their files.
     pub uploads: Arc<Storage>,
+    /// Per-file version history (CLOUD-4), sandboxed to its own root
+    /// distinct from both `storage` and `uploads`, for the same reason as
+    /// `uploads`: a PROPFIND of the real tree must never see this data.
+    /// See `crate::versioning` for where snapshots get taken, and
+    /// `crate::handlers::versions` for the minimal DAV surface that
+    /// browses it.
+    pub versions: Arc<VersionStore>,
     pub auth: Option<BasicAuthConfig>,
 }
 
@@ -25,10 +32,11 @@ pub struct BasicAuthConfig {
 }
 
 impl AppState {
-    pub fn new(storage: Storage, uploads: Storage) -> Self {
+    pub fn new(storage: Storage, uploads: Storage, versions: VersionStore) -> Self {
         AppState {
             storage: Arc::new(storage),
             uploads: Arc::new(uploads),
+            versions: Arc::new(versions),
             auth: None,
         }
     }

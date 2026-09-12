@@ -9,9 +9,13 @@
 
 pub mod error;
 pub mod path;
+pub mod versions;
 
 pub use error::StorageError;
 pub use path::DavPath;
+pub use versions::{
+    VersionInfo, VersionStore, DEFAULT_MAX_VERSIONS_PER_FILE, DEFAULT_MAX_VERSION_SET_BYTES,
+};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -94,6 +98,34 @@ pub enum WriteOutcome {
 pub struct DirEntry {
     pub path: DavPath,
     pub metadata: Metadata,
+}
+
+/// A chunked upload validated and assembled into a temp file by
+/// [`Storage::prepare_assemble`], not yet committed onto its destination.
+/// Nothing at the destination has been touched: a caller that decides not
+/// to proceed should call [`PreparedAssembly::discard`] rather than
+/// [`Storage::commit_assemble`], so the temp file does not leak.
+pub struct PreparedAssembly {
+    dest_fs: PathBuf,
+    tmp_path: PathBuf,
+    existed: bool,
+    total: u64,
+    hash: blake3::Hash,
+}
+
+impl PreparedAssembly {
+    /// Whether the destination already had content that committing this
+    /// assembly will overwrite. `false` means this is a first creation,
+    /// with nothing for a caller to snapshot before committing.
+    pub fn existed(&self) -> bool {
+        self.existed
+    }
+
+    /// Discard this prepared assembly without ever touching its
+    /// destination, cleaning up the temp file.
+    pub async fn discard(self) {
+        let _ = fs::remove_file(&self.tmp_path).await;
+    }
 }
 
 /// Filesystem-backed storage, sandboxed to a root directory.
@@ -246,6 +278,19 @@ impl Storage {
         ))
     }
 
+    /// Read a file's full content into memory. Used by version
+    /// snapshotting (CLOUD-4), which needs the previous content of a file
+    /// immediately before an overwrite replaces it. Not used for serving
+    /// GET (`handlers::get` streams instead: target files can be large,
+    /// and GET is on the hot path for concurrent downloads in a way a
+    /// pre-overwrite snapshot is not).
+    pub async fn read_bytes(&self, path: &DavPath) -> Result<Vec<u8>, StorageError> {
+        let (mut file, meta) = self.open(path).await?;
+        let mut buf = Vec::with_capacity(meta.len as usize);
+        file.read_to_end(&mut buf).await?;
+        Ok(buf)
+    }
+
     /// The etag RFC 4918 clients should see for `path`: content-derived
     /// (cached, keyed on mtime+len) for a file, the cheaper mtime/len
     /// signature for a collection (there is no meaningful "content" to
@@ -320,13 +365,25 @@ impl Storage {
     /// returns `StorageError::LengthMismatch` so the caller can 412 and
     /// let the client retry rather than silently accepting a truncated or
     /// overlong file.
-    pub async fn assemble(
+    /// Validate `chunk_files` against `dest` and assemble them into a temp
+    /// file next to it, without touching `dest` itself. Every failure mode
+    /// that depends on the state of `dest` or the chunks (an `Overwrite: F`
+    /// conflict, an `OC-Total-Length` mismatch, a chunk that vanished mid-
+    /// assembly) surfaces here, before any caller-visible content is
+    /// replaced.
+    ///
+    /// This lets a caller know an overwrite will actually happen -- and do
+    /// anything that must only happen for a genuine overwrite, such as
+    /// taking a version snapshot (CLOUD-4) -- strictly between this call
+    /// succeeding and [`Storage::commit_assemble`]. Call [`PreparedAssembly::discard`]
+    /// instead of committing if that intervening step fails.
+    pub async fn prepare_assemble(
         &self,
         dest: &DavPath,
         chunk_files: &[PathBuf],
         overwrite: bool,
         expected_total: Option<u64>,
-    ) -> Result<(WriteOutcome, u64, String), StorageError> {
+    ) -> Result<PreparedAssembly, StorageError> {
         let parent_dav = dest
             .parent()
             .ok_or_else(|| StorageError::Conflict("cannot write to the storage root".into()))?;
@@ -360,6 +417,31 @@ impl Storage {
             }
         };
 
+        Ok(PreparedAssembly {
+            dest_fs,
+            tmp_path,
+            existed,
+            total,
+            hash,
+        })
+    }
+
+    /// Atomically replace `prepared`'s destination with the assembled
+    /// content. The only failure mode left at this point is the rename
+    /// itself; everything that depends on chunk or destination state was
+    /// already validated by [`Storage::prepare_assemble`].
+    pub async fn commit_assemble(
+        &self,
+        prepared: PreparedAssembly,
+    ) -> Result<(WriteOutcome, u64, String), StorageError> {
+        let PreparedAssembly {
+            dest_fs,
+            tmp_path,
+            existed,
+            total,
+            hash,
+        } = prepared;
+
         if let Err(e) = fs::rename(&tmp_path, &dest_fs).await {
             let _ = fs::remove_file(&tmp_path).await;
             return Err(e.into());
@@ -379,6 +461,24 @@ impl Storage {
             total,
             etag,
         ))
+    }
+
+    /// Convenience wrapper for callers that have no intervening step
+    /// between validation and commit (nothing that must only happen once
+    /// the overwrite is known to succeed). Equivalent to calling
+    /// [`Storage::prepare_assemble`] then immediately
+    /// [`Storage::commit_assemble`].
+    pub async fn assemble(
+        &self,
+        dest: &DavPath,
+        chunk_files: &[PathBuf],
+        overwrite: bool,
+        expected_total: Option<u64>,
+    ) -> Result<(WriteOutcome, u64, String), StorageError> {
+        let prepared = self
+            .prepare_assemble(dest, chunk_files, overwrite, expected_total)
+            .await?;
+        self.commit_assemble(prepared).await
     }
 
     /// Create a new, empty collection (MKCOL). The parent must already
@@ -982,6 +1082,23 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, StorageError::AlreadyExists));
+    }
+
+    #[tokio::test]
+    async fn read_bytes_returns_the_full_content() {
+        let (_dir, storage) = storage().await;
+        let path = DavPath::parse("/a.txt").unwrap();
+        storage.write_bytes(&path, b"some content").await.unwrap();
+        let bytes = storage.read_bytes(&path).await.unwrap();
+        assert_eq!(bytes, b"some content");
+    }
+
+    #[tokio::test]
+    async fn read_bytes_missing_file_is_not_found() {
+        let (_dir, storage) = storage().await;
+        let path = DavPath::parse("/nope.txt").unwrap();
+        let err = storage.read_bytes(&path).await.unwrap_err();
+        assert!(matches!(err, StorageError::NotFound));
     }
 
     #[tokio::test]

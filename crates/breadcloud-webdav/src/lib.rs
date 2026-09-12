@@ -17,6 +17,11 @@
 //! `/remote.php/dav/files/<user>/...` mount a Nextcloud client insists
 //! on -- see [`split_mount_prefix`].
 //!
+//! Also covers per-file version history (CLOUD-4): every overwriting PUT
+//! or chunked-upload finalize snapshots the content it is about to
+//! replace (`versioning`), and a minimal DAV surface
+//! (`handlers::versions`) lets a client browse and fetch prior versions.
+//!
 //! Scope note: this does not do WebDAV locking (LOCK/UNLOCK) -- a
 //! separate, later issue in the breadcloud epic.
 
@@ -27,6 +32,7 @@ pub mod handlers;
 pub mod mtime;
 pub mod preconditions;
 pub mod state;
+pub mod versioning;
 pub mod xml;
 
 pub use state::{AppState, BasicAuthConfig};
@@ -118,6 +124,13 @@ async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
     // PROPFIND of the real files can see -- see `handlers::uploads`.
     if let Some(remainder) = decoded.strip_prefix("/remote.php/dav/uploads") {
         return handlers::uploads::dispatch(&state, &method, &headers, remainder, req).await;
+    }
+
+    // Version history (CLOUD-4) lives in its own namespace and its own
+    // VersionStore root (AppState::versions), for the same reason as
+    // uploads staging -- see `handlers::versions`.
+    if let Some(remainder) = decoded.strip_prefix("/remote.php/dav/versions") {
+        return handlers::versions::dispatch(&state, &method, &headers, remainder).await;
     }
 
     let (prefix, dav_relative) = split_mount_prefix(&decoded);

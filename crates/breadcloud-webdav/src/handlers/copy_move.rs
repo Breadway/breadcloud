@@ -44,6 +44,23 @@ pub async fn handle(
 
     match result {
         Ok(outcome) => {
+            // Version history (CLOUD-4) follows a rename, but not a copy:
+            // a COPY produces an independent new resource with no history
+            // of its own, matching the fact that the copied bytes have no
+            // prior overwrite events at the destination path. On MOVE,
+            // if the destination already had its own version history
+            // (because a file there is being replaced or removed by this
+            // same move), that history is discarded first -- it belonged
+            // to content this move is removing. Best-effort: a failure
+            // here is logged but does not turn an already-successful
+            // MOVE/COPY into an error response.
+            if !copy {
+                if let Err(err) = state.versions.move_all(source, &destination).await {
+                    tracing::warn!(
+                        "failed to carry version history from {source} to {destination}: {err}"
+                    );
+                }
+            }
             let status = match outcome {
                 WriteOutcome::Created => StatusCode::CREATED,
                 WriteOutcome::Overwritten => StatusCode::NO_CONTENT,
