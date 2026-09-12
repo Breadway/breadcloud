@@ -22,6 +22,13 @@
 //! replace (`versioning`), and a minimal DAV surface
 //! (`handlers::versions`) lets a client browse and fetch prior versions.
 //!
+//! And soft-delete trash with a retention cap (CLOUD-5): DELETE moves a
+//! resource (and its version history) into trash instead of removing it
+//! (`trash::move_to_trash`), subject to an age and total-size cap enforced
+//! after every trash/restore/purge (`breadcloud_storage::TrashStore`), and
+//! a minimal DAV surface (`handlers::trashbin`) lets a client list,
+//! restore, and early-purge trashed items.
+//!
 //! Scope note: this does not do WebDAV locking (LOCK/UNLOCK) -- a
 //! separate, later issue in the breadcloud epic.
 
@@ -32,6 +39,7 @@ pub mod handlers;
 pub mod mtime;
 pub mod preconditions;
 pub mod state;
+pub mod trash;
 pub mod versioning;
 pub mod xml;
 
@@ -131,6 +139,13 @@ async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
     // uploads staging -- see `handlers::versions`.
     if let Some(remainder) = decoded.strip_prefix("/remote.php/dav/versions") {
         return handlers::versions::dispatch(&state, &method, &headers, remainder).await;
+    }
+
+    // Soft-delete trash (CLOUD-5) lives in its own namespace and its own
+    // TrashStore root (AppState::trash), for the same reason as uploads
+    // staging and version history -- see `handlers::trashbin`.
+    if let Some(remainder) = decoded.strip_prefix("/remote.php/dav/trashbin") {
+        return handlers::trashbin::dispatch(&state, &method, &headers, remainder).await;
     }
 
     let (prefix, dav_relative) = split_mount_prefix(&decoded);

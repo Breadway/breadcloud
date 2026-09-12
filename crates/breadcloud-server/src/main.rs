@@ -5,7 +5,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use breadcloud_storage::{Storage, VersionStore};
+use breadcloud_storage::{Storage, TrashStore, VersionStore};
 use breadcloud_webdav::AppState;
 
 #[tokio::main]
@@ -48,6 +48,21 @@ async fn main() {
         .canonicalize()
         .expect("failed to resolve version history root");
 
+    // Soft-delete trash (CLOUD-5). Kept outside BREADCLOUD_ROOT, same
+    // reasoning as uploads staging and version history above, and (like
+    // version history) needs to persist across restarts, so it also
+    // defaults to a sibling directory of the data root rather than the
+    // system temp dir.
+    let trash_root = std::env::var("BREADCLOUD_TRASH_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./breadcloud-trash"));
+    if !trash_root.exists() {
+        std::fs::create_dir_all(&trash_root).expect("failed to create trash root");
+    }
+    let trash_root = trash_root
+        .canonicalize()
+        .expect("failed to resolve trash root");
+
     let bind = std::env::var("BREADCLOUD_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     let addr: SocketAddr = bind
         .parse()
@@ -56,7 +71,8 @@ async fn main() {
     let storage = Storage::new(root.clone());
     let uploads = Storage::new(uploads_root.clone());
     let versions = VersionStore::new(versions_root.clone());
-    let mut state = AppState::new(storage, uploads, versions);
+    let trash = TrashStore::new(trash_root.clone());
+    let mut state = AppState::new(storage, uploads, versions, trash);
 
     let user = std::env::var("BREADCLOUD_USER").ok();
     let pass = std::env::var("BREADCLOUD_PASS").ok();
@@ -73,11 +89,12 @@ async fn main() {
     }
 
     tracing::info!(
-        "serving {} on {} (chunked-upload staging: {}, version history: {})",
+        "serving {} on {} (chunked-upload staging: {}, version history: {}, trash: {})",
         root.display(),
         addr,
         uploads_root.display(),
-        versions_root.display()
+        versions_root.display(),
+        trash_root.display()
     );
 
     let app = breadcloud_webdav::router(state);

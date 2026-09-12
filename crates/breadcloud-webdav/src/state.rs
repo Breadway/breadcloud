@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use breadcloud_storage::{Storage, VersionStore};
+use breadcloud_storage::{Storage, TrashStore, VersionStore};
 
 /// Shared state for the whole WebDAV router.
 #[derive(Clone)]
@@ -19,6 +19,12 @@ pub struct AppState {
     /// `crate::handlers::versions` for the minimal DAV surface that
     /// browses it.
     pub versions: Arc<VersionStore>,
+    /// Soft-delete trash (CLOUD-5), sandboxed to its own root distinct
+    /// from all of the above, same reason again. See `crate::trash` for
+    /// where DELETE moves content here instead of removing it, and
+    /// `crate::handlers::trashbin` for the DAV surface that lists,
+    /// restores, and purges entries.
+    pub trash: Arc<TrashStore>,
     pub auth: Option<BasicAuthConfig>,
 }
 
@@ -32,11 +38,17 @@ pub struct BasicAuthConfig {
 }
 
 impl AppState {
-    pub fn new(storage: Storage, uploads: Storage, versions: VersionStore) -> Self {
+    pub fn new(
+        storage: Storage,
+        uploads: Storage,
+        versions: VersionStore,
+        trash: TrashStore,
+    ) -> Self {
         AppState {
             storage: Arc::new(storage),
             uploads: Arc::new(uploads),
             versions: Arc::new(versions),
+            trash: Arc::new(trash),
             auth: None,
         }
     }

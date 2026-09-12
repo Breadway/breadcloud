@@ -9,10 +9,12 @@
 
 pub mod error;
 pub mod path;
+pub mod trash;
 pub mod versions;
 
 pub use error::StorageError;
 pub use path::DavPath;
+pub use trash::{TrashEntry, TrashStore, DEFAULT_TRASH_MAX_AGE, DEFAULT_TRASH_MAX_TOTAL_BYTES};
 pub use versions::{
     VersionInfo, VersionStore, DEFAULT_MAX_VERSIONS_PER_FILE, DEFAULT_MAX_VERSION_SET_BYTES,
 };
@@ -717,7 +719,329 @@ fn tmp_suffix() -> String {
     format!("{:x}-{:x}", nanos, std::process::id())
 }
 
-fn copy_dir_recursive<'a>(
+/// # Cross-root move safety
+///
+/// [`move_path`] is the one primitive behind every move that crosses one of
+/// this codebase's independently-configurable storage roots: `TrashStore`
+/// moving a resource's payload into and out of a trash entry, and
+/// `VersionStore` moving a file's version history into and out of one
+/// alongside it. Three earlier rounds of fixes in this area (see the CLOUD-5
+/// issue history) each patched one partial-failure path here, only to have
+/// the fix itself introduce a new one: a rename-then-copy-on-EXDEV fallback
+/// that didn't reorder a caller's own two dependent moves safely; a rollback
+/// added to fix that, which was itself just another unconditionally
+/// destructive move. The common root cause was always the same: treating
+/// "does the destination already have content" as the signal for whether
+/// it's safe to discard, when that signal cannot tell a genuine pre-existing
+/// file apart from a partial leftover of a previous, half-failed attempt at
+/// this exact move.
+///
+/// [`move_path`] sidesteps that distinction instead of trying to make it.
+/// Nothing at `dest` is ever destroyed until `src`'s content is fully
+/// staged, on `dest`'s own filesystem, and confirmed complete; nothing at
+/// `src` is ever removed until that staged content is durably swapped into
+/// `dest`. Concretely:
+///
+/// 1. `src`'s content is moved into a staging path beside `dest` (same
+///    directory, so guaranteed the same filesystem as `dest`). A plain
+///    rename is tried first -- free when `src` and `dest` happen to share a
+///    filesystem too -- falling back to a recursive copy, verified complete
+///    (same file count and total bytes as `src`) before anything downstream
+///    trusts it. A failure here leaves both `src` and `dest` completely
+///    untouched.
+/// 2. Whatever currently occupies `dest`, if anything, is renamed aside
+///    (same filesystem, atomic) rather than deleted. It is not touched
+///    again until step 3 has committed.
+/// 3. The staged content is renamed into `dest`. Same filesystem as both the
+///    staging path and the old-content backup, so this is a single atomic
+///    rename.
+/// 4. Only now -- new content durably live at `dest` -- are the old `dest`
+///    content (from step 2) and the original `src` cleaned up, both
+///    best-effort: neither failing is a correctness problem, only litter.
+///
+/// A failure at step 2 or 3 unwinds back to the pre-call state (`src`
+/// restored if step 1 moved it by rename rather than copy; `dest`'s original
+/// content renamed back if it had been moved aside), so callers can treat
+/// an ordinary `Err` from this function as "nothing moved", exactly as
+/// before this redesign. Because nothing is ever destroyed before its
+/// replacement is confirmed safely in place, the whole operation is
+/// idempotent: a caller that retries a failed higher-level operation (a
+/// soft-delete, a restore, a rollback of either) from scratch never
+/// compounds a first failure into a second one, and never needs bespoke
+/// per-call rollback logic layered on top -- retrying just re-runs this
+/// same safe replace, which is a no-op if `dest` already holds the right
+/// content.
+///
+/// That unwind is itself just more filesystem mutation, and it can fail
+/// too (the same class of fault that broke the primary step -- a
+/// permission change, a disk remount, an I/O hiccup -- can just as easily
+/// hit the compensating rename a moment later). When it does, this
+/// function returns [`StorageError::RecoveryFailed`] instead of the
+/// primary error, naming exactly where the content that could not be put
+/// back is sitting. Callers must check for that variant specifically and
+/// must not treat it as "nothing moved": unlike an ordinary `Err`, it means
+/// this function's own safety net also failed, and something upstream
+/// (ideally a human, per the loud `tracing::error!` this logs) needs to
+/// look at the named path(s) before anything else touches `src`, `dest`,
+/// or whatever container (a trash entry, in this codebase) they live
+/// under.
+///
+/// Shared by [`crate::trash::TrashStore`] (moving a resource's payload
+/// into/out of a trash entry) and [`crate::versions::VersionStore`]
+/// (moving a file's version history into/out of a trash entry, including
+/// the rollback move a failed restore uses to undo a version-history move
+/// that already succeeded): both a trash root and a versions root are
+/// independently configurable and can each land on a different volume than
+/// the served tree, and any of these calls can be the one that lands on the
+/// live side or the trash side of an in-progress, possibly-retried
+/// operation, so all of them need this same safety, not just the common
+/// case.
+pub(crate) async fn move_path(src: &Path, dest: &Path) -> Result<(), StorageError> {
+    let dest_parent = dest
+        .parent()
+        .ok_or_else(|| StorageError::Conflict("destination has no parent directory".into()))?;
+    fs::create_dir_all(dest_parent).await?;
+
+    let staging = dest_parent.join(format!(".breadcloud-stage-{}", tmp_suffix()));
+
+    // Step 1: get a complete copy of `src`'s content onto `dest`'s
+    // filesystem, at `staging`, without touching `src` or `dest` yet.
+    let staged_via_rename = fs::rename(src, &staging).await.is_ok();
+    if !staged_via_rename {
+        if let Err(e) = copy_verified(src, &staging).await {
+            remove_any(&staging).await;
+            return Err(e);
+        }
+    }
+
+    // Step 2: move whatever is at `dest` aside rather than deleting it --
+    // it might be real content this call must not lose, or nothing at
+    // all. Either way it is not touched again until step 3 commits.
+    let backup = dest_parent.join(format!(".breadcloud-backup-{}", tmp_suffix()));
+    let had_backup = match fs::rename(dest, &backup).await {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return Err(
+                unwind_after_failure(src, &staging, staged_via_rename, None, e.into()).await,
+            );
+        }
+    };
+
+    // Step 3: the atomic swap. `staging`, `backup` and `dest` all share a
+    // parent directory, so this is a single same-filesystem rename.
+    if let Err(e) = fs::rename(&staging, dest).await {
+        let backup_restore = if had_backup {
+            Some((backup.as_path(), dest))
+        } else {
+            None
+        };
+        return Err(unwind_after_failure(
+            src,
+            &staging,
+            staged_via_rename,
+            backup_restore,
+            e.into(),
+        )
+        .await);
+    }
+
+    // Step 4: new content is durably live at `dest`. Clean up, best
+    // effort -- nothing below can turn this success back into a failure.
+    if had_backup {
+        remove_any(&backup).await;
+    }
+    if !staged_via_rename {
+        remove_any(src).await;
+    }
+    Ok(())
+}
+
+/// Undo step 1 of [`move_path`] on a later failure, so callers can keep
+/// relying on "`src` is untouched on `Err`" regardless of which path step 1
+/// took internally. The `Result` is load-bearing, not litter: when
+/// `staged_via_rename` is true, `staging` holds `src`'s *only* copy of the
+/// content, so a failure here means that content is stranded rather than
+/// restored, and the caller (`unwind_after_failure`) must surface that
+/// distinctly rather than discard it via `let _ =`.
+async fn restore_staged_src(
+    src: &Path,
+    staging: &Path,
+    staged_via_rename: bool,
+) -> std::io::Result<()> {
+    if staged_via_rename {
+        // `staging` holds `src`'s only copy (a plain rename doesn't
+        // duplicate); put it back.
+        fs::rename(staging, src).await
+    } else {
+        // `src` was never touched; only the copy at `staging` needs
+        // cleanup. Failing to remove it is litter, not data loss -- the
+        // one real copy is still at `src`, untouched.
+        remove_any(staging).await;
+        Ok(())
+    }
+}
+
+/// Unwind [`move_path`]'s step 2 or step 3 back to the pre-call state after
+/// one of them fails: restore `dest`'s original content (if `backup_restore`
+/// says it was moved aside to a backup path), then restore `src`'s content
+/// (via [`restore_staged_src`]). `primary` is the error that triggered the
+/// unwind in the first place.
+///
+/// Returns `primary` unchanged if both compensating actions succeed (or
+/// there was nothing to undo for one of them) -- exactly the "nothing
+/// moved" contract callers of [`move_path`] rely on. If either compensating
+/// action itself fails, returns [`StorageError::RecoveryFailed`] instead,
+/// naming precisely where the content that could not be put back is
+/// sitting, and logs it at `error!` (not `warn!`): this is a materially
+/// different, worse outcome than the primary failure alone, and must never
+/// be folded into the same "safe to retry" `Err` a caller already knows how
+/// to handle.
+async fn unwind_after_failure(
+    src: &Path,
+    staging: &Path,
+    staged_via_rename: bool,
+    backup_restore: Option<(&Path, &Path)>,
+    primary: StorageError,
+) -> StorageError {
+    let stranded_dest = match backup_restore {
+        Some((backup, dest)) => match fs::rename(backup, dest).await {
+            Ok(()) => None,
+            Err(_) => Some(backup.to_path_buf()),
+        },
+        None => None,
+    };
+
+    let stranded_src = match restore_staged_src(src, staging, staged_via_rename).await {
+        Ok(()) => None,
+        Err(_) => Some(staging.to_path_buf()),
+    };
+
+    if stranded_src.is_none() && stranded_dest.is_none() {
+        return primary;
+    }
+
+    tracing::error!(
+        "move_path recovery failed after a primary failure ({primary}); \
+         stranded_src={stranded_src:?} stranded_dest={stranded_dest:?}; this content has \
+         NOT been lost but needs manual recovery, do not touch these paths automatically"
+    );
+    StorageError::RecoveryFailed {
+        primary: Box::new(primary),
+        stranded_src,
+        stranded_dest,
+    }
+}
+
+/// Remove a file or directory tree, ignoring the result: used for
+/// best-effort cleanup where failing to remove something is litter, not a
+/// correctness problem.
+async fn remove_any(path: &Path) {
+    match fs::metadata(path).await {
+        Ok(meta) if meta.is_dir() => {
+            let _ = fs::remove_dir_all(path).await;
+        }
+        Ok(_) => {
+            let _ = fs::remove_file(path).await;
+        }
+        Err(_) => {}
+    }
+}
+
+/// Recursively copy `src` to `dest`, then verify the copy landed whole
+/// (same file count and total bytes as `src`) before returning. This is
+/// [`move_path`]'s cross-filesystem fallback: exercised whenever a plain
+/// rename cannot move a trashed directory or a version-history subtree in
+/// one step, most likely because `src` and `dest` are on different
+/// filesystems (a rename can never cross those, e.g. `EXDEV`). Split out
+/// from [`move_path`] so it can be exercised directly by a test without
+/// needing two real filesystems to provoke a genuine rename failure.
+///
+/// Never touches `src`: removing it once its content is safely elsewhere is
+/// [`move_path`]'s job, not this function's, since [`move_path`] only knows
+/// it is safe to do so once the copy verified here has also been swapped
+/// into `dest` in place of whatever was there before.
+///
+/// On any failure -- the copy itself, or the verification -- any partial
+/// output at `dest` is removed before returning, so a caller never has to
+/// distinguish "nothing was written" from "something incomplete was
+/// written": either this fully succeeds and `dest` matches `src` exactly,
+/// or it fails and `dest` has nothing new.
+pub(crate) async fn copy_verified(src: &Path, dest: &Path) -> Result<(), StorageError> {
+    match copy_verified_inner(src, dest).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            remove_any(dest).await;
+            Err(e)
+        }
+    }
+}
+
+async fn copy_verified_inner(src: &Path, dest: &Path) -> Result<(), StorageError> {
+    let meta = fs::metadata(src).await.map_err(map_not_found)?;
+    if meta.is_dir() {
+        copy_dir_recursive(src, dest).await?;
+    } else {
+        fs::copy(src, dest).await?;
+    }
+
+    let (src_count, src_bytes) = tally(src).await?;
+    let (dest_count, dest_bytes) = tally(dest).await?;
+    if src_count != dest_count || src_bytes != dest_bytes {
+        return Err(StorageError::Io(std::io::Error::other(format!(
+            "copy verification failed: source had {src_count} file(s) totalling \
+             {src_bytes} bytes, staged copy had {dest_count} file(s) totalling \
+             {dest_bytes} bytes"
+        ))));
+    }
+    Ok(())
+}
+
+/// A recursive async function's boxed, pinned future -- needed because
+/// [`tally`] calls itself across an `.await` and Rust cannot express an
+/// infinitely-sized recursive `async fn` any other way.
+type TallyFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(u64, u64), StorageError>> + Send + 'a>,
+>;
+
+/// Total file count and byte size of `path`, recursively if it is a
+/// directory (one file is `(1, len)`). Used only by [`copy_verified`] to
+/// confirm a copy landed completely; cheap (a second directory walk, no
+/// rehashing) relative to the copy it is checking.
+fn tally(path: &Path) -> TallyFuture<'_> {
+    Box::pin(async move {
+        let meta = fs::metadata(path).await?;
+        if !meta.is_dir() {
+            return Ok((1, meta.len()));
+        }
+        let mut count = 0u64;
+        let mut bytes = 0u64;
+        let mut rd = fs::read_dir(path).await?;
+        while let Some(entry) = rd.next_entry().await? {
+            let child_meta = entry.metadata().await?;
+            if child_meta.is_dir() {
+                let (c, b) = tally(&entry.path()).await?;
+                count += c;
+                bytes += b;
+            } else {
+                count += 1;
+                bytes += child_meta.len();
+            }
+        }
+        Ok((count, bytes))
+    })
+}
+
+/// Recursively copy a directory tree. `pub(crate)` so [`copy_verified`] (the
+/// verified cross-filesystem copy behind [`move_path`], shared by
+/// [`crate::trash`] and [`crate::versions`]) can reuse it when a plain
+/// rename cannot move a trashed directory or a version-history subtree into
+/// place in one step. Also reused directly by [`Storage::relocate`] for an
+/// ordinary same-root `COPY`, which has no cross-filesystem concern and no
+/// need for verification (there is no separate `src` to protect: on
+/// failure, whatever this leaves at `to_fs` is just replaced by the next
+/// attempt).
+pub(crate) fn copy_dir_recursive<'a>(
     from: &'a Path,
     to: &'a Path,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
@@ -1113,5 +1437,277 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, StorageError::Conflict(_)));
+    }
+
+    // `move_path` itself: the safe replace primitive behind every
+    // cross-storage-root move in this codebase (see its doc comment for
+    // the full safety argument). These exercise it directly, independent
+    // of `TrashStore`/`VersionStore`, covering the properties every caller
+    // relies on: a fresh destination is just a move, an occupied
+    // destination is replaced only once the replacement is confirmed
+    // whole, and any failure before that point leaves both sides exactly
+    // as they were.
+
+    #[tokio::test]
+    async fn move_path_onto_a_fresh_destination_just_moves_it() {
+        let src_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+        let src = src_dir.path().join("payload");
+        tokio::fs::write(&src, b"content").await.unwrap();
+        let dest = dest_dir.path().join("nested").join("payload");
+
+        move_path(&src, &dest).await.unwrap();
+
+        assert!(!src.exists());
+        assert_eq!(tokio::fs::read(&dest).await.unwrap(), b"content");
+    }
+
+    #[tokio::test]
+    async fn move_path_onto_an_occupied_destination_replaces_it_without_merging() {
+        let src_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+        let src = src_dir.path().join("payload");
+        tokio::fs::write(&src, b"new content").await.unwrap();
+        let dest = dest_dir.path().join("payload");
+        tokio::fs::write(&dest, b"old content").await.unwrap();
+
+        move_path(&src, &dest).await.unwrap();
+
+        assert!(!src.exists());
+        assert_eq!(tokio::fs::read(&dest).await.unwrap(), b"new content");
+        // The old content's backup/staging litter must not survive a
+        // successful move.
+        let leftovers: Vec<_> = std::fs::read_dir(dest_dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("payload")]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn move_path_forced_failure_before_the_swap_leaves_both_sides_untouched() {
+        // Force the earliest possible failure -- staging `src`'s content
+        // beside `dest` -- by making `dest`'s parent read-only. Neither
+        // `src` nor `dest`'s real, pre-existing content may be touched:
+        // this is the property every caller (`TrashStore`, `VersionStore`)
+        // depends on to treat any `Err` from this function as "nothing
+        // moved".
+        use std::os::unix::fs::PermissionsExt;
+
+        let src_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+        let src = src_dir.path().join("payload");
+        tokio::fs::write(&src, b"the only copy of this content")
+            .await
+            .unwrap();
+        let dest_parent = dest_dir.path().join("entry");
+        tokio::fs::create_dir_all(&dest_parent).await.unwrap();
+        let dest = dest_parent.join("payload");
+        tokio::fs::write(&dest, b"real content already at the destination")
+            .await
+            .unwrap();
+
+        let mut perms = std::fs::metadata(&dest_parent).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&dest_parent, perms.clone()).unwrap();
+
+        let err = move_path(&src, &dest).await.unwrap_err();
+        assert!(matches!(err, StorageError::Io(_)));
+        assert_eq!(
+            tokio::fs::read(&src).await.unwrap(),
+            b"the only copy of this content",
+            "a failure before the swap must never touch src"
+        );
+
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dest_parent, perms).unwrap();
+        assert_eq!(
+            tokio::fs::read(&dest).await.unwrap(),
+            b"real content already at the destination",
+            "a failure before the swap must never touch dest's real content"
+        );
+
+        // Retrying with permissions fixed must fully succeed.
+        move_path(&src, &dest).await.unwrap();
+        assert!(!src.exists());
+        assert_eq!(
+            tokio::fs::read(&dest).await.unwrap(),
+            b"the only copy of this content"
+        );
+    }
+
+    // Round 5 (CLOUD-5): `move_path`'s own step 2/3 error recovery
+    // (`restore_staged_src`, and the step 3 backup-restore) used to discard
+    // the result of its own compensating `fs::rename` via `let _ = ...` and
+    // then return the *primary* error regardless of whether the
+    // compensation actually worked -- so a failed recovery looked
+    // identical to the safe "nothing moved" case, while the content it was
+    // supposed to restore was actually stranded. These tests exercise the
+    // two recovery helpers directly (the same level the reviewer's own
+    // repro used): `move_path` shares one `dest_parent` between `staging`,
+    // `backup` and `dest`, so once that directory is writable enough for
+    // step 1 to stage content there, steps 2 and 3 need the exact same
+    // permission to run -- there is no static, non-racing filesystem state
+    // that fails step 2 or step 3 without also failing step 1 first. The
+    // recovery helpers are the one place this failure mode can be forced
+    // deterministically without instrumenting a race into `move_path`
+    // itself, which is exactly why the reviewer's own reproduction was
+    // built at this level too.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_staged_src_reports_failure_instead_of_silently_stranding_content() {
+        // The reviewer's exact round-5 repro: `staging` holds `src`'s only
+        // copy of some content (as it does whenever `move_path` staged it
+        // via a plain rename), and the rename-back that is supposed to
+        // undo that is made to fail by taking away write permission on
+        // `src`'s parent directory at the moment of the call. Before this
+        // fix, the old `let _ = fs::rename(staging, src).await;` discarded
+        // that failure and returned as if the undo had succeeded, leaving
+        // the content stranded at `staging` with nothing pointing back to
+        // it.
+        use std::os::unix::fs::PermissionsExt;
+
+        let src_parent = TempDir::new().unwrap();
+        let staging_dir = TempDir::new().unwrap();
+        let src = src_parent.path().join("payload");
+        let staging = staging_dir.path().join(".breadcloud-stage-test");
+        tokio::fs::write(&staging, b"the only copy of this content")
+            .await
+            .unwrap();
+
+        let mut perms = std::fs::metadata(src_parent.path()).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(src_parent.path(), perms.clone()).unwrap();
+
+        let result = restore_staged_src(&src, &staging, true).await;
+
+        perms.set_mode(0o755);
+        std::fs::set_permissions(src_parent.path(), perms).unwrap();
+
+        assert!(
+            result.is_err(),
+            "a failed rename-back must be reported, not silently swallowed"
+        );
+        assert!(
+            !src.exists(),
+            "src's parent was unwritable, so the rename-back could not possibly have landed"
+        );
+        assert_eq!(
+            tokio::fs::read(&staging).await.unwrap(),
+            b"the only copy of this content",
+            "the content must still be findable at the staging path, not lost"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unwind_after_failure_reports_recovery_failed_when_the_src_restore_fails() {
+        // `unwind_after_failure` is what step 2 and step 3's error
+        // branches both call. When its own attempt to restore `src` fails
+        // (the same fault as above), it must return
+        // `StorageError::RecoveryFailed` naming `staging` as where the
+        // content actually is, not the original primary error -- a caller
+        // must never be able to mistake this for the ordinary "nothing
+        // moved" case.
+        use std::os::unix::fs::PermissionsExt;
+
+        let src_parent = TempDir::new().unwrap();
+        let staging_dir = TempDir::new().unwrap();
+        let src = src_parent.path().join("payload");
+        let staging = staging_dir.path().join(".breadcloud-stage-test");
+        tokio::fs::write(&staging, b"only copy").await.unwrap();
+
+        let mut perms = std::fs::metadata(src_parent.path()).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(src_parent.path(), perms.clone()).unwrap();
+
+        let primary = StorageError::Io(std::io::Error::other("primary failure"));
+        let result = unwind_after_failure(&src, &staging, true, None, primary).await;
+
+        perms.set_mode(0o755);
+        std::fs::set_permissions(src_parent.path(), perms).unwrap();
+
+        match result {
+            StorageError::RecoveryFailed {
+                stranded_src,
+                stranded_dest,
+                ..
+            } => {
+                assert_eq!(stranded_src, Some(staging.clone()));
+                assert_eq!(stranded_dest, None);
+            }
+            other => panic!("expected RecoveryFailed, got {other:?}"),
+        }
+        assert_eq!(
+            tokio::fs::read(&staging).await.unwrap(),
+            b"only copy",
+            "the content must still be findable at the staging path, not lost"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unwind_after_failure_reports_recovery_failed_when_the_backup_restore_fails() {
+        // Same idea, for the step 3 backup-restore: when moving `dest`'s
+        // original content back from `backup` fails, `unwind_after_failure`
+        // must report `RecoveryFailed` naming `backup` as where that
+        // content actually is, rather than returning the primary error as
+        // if `dest` had been safely put back.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dest_parent = TempDir::new().unwrap();
+        let src_parent = TempDir::new().unwrap();
+        let dest = dest_parent.path().join("payload");
+        let backup = dest_parent.path().join(".breadcloud-backup-test");
+        let src = src_parent.path().join("payload");
+        tokio::fs::write(&backup, b"dest's original content")
+            .await
+            .unwrap();
+        tokio::fs::write(&src, b"src content, restored independently")
+            .await
+            .unwrap();
+
+        let mut perms = std::fs::metadata(dest_parent.path()).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(dest_parent.path(), perms.clone()).unwrap();
+
+        let primary = StorageError::Io(std::io::Error::other("primary failure"));
+        // `staged_via_rename: false` here so the src-restore side of this
+        // call is a no-op (nothing to undo there), isolating the assertion
+        // to the backup-restore failure this test is about.
+        let result = unwind_after_failure(
+            &src,
+            Path::new("/unused"),
+            false,
+            Some((&backup, &dest)),
+            primary,
+        )
+        .await;
+
+        perms.set_mode(0o755);
+        std::fs::set_permissions(dest_parent.path(), perms).unwrap();
+
+        match result {
+            StorageError::RecoveryFailed {
+                stranded_src,
+                stranded_dest,
+                ..
+            } => {
+                assert_eq!(stranded_src, None);
+                assert_eq!(stranded_dest, Some(backup.clone()));
+            }
+            other => panic!("expected RecoveryFailed, got {other:?}"),
+        }
+        assert_eq!(
+            tokio::fs::read(&backup).await.unwrap(),
+            b"dest's original content",
+            "the content must still be findable at the backup path, not lost"
+        );
+        assert!(
+            !dest.exists(),
+            "dest was never actually restored, so it must not appear to exist"
+        );
     }
 }

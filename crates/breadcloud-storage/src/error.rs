@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::path::InvalidPath;
 
 /// Errors from the storage layer. The WebDAV layer maps each variant to
@@ -35,4 +37,35 @@ pub enum StorageError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// [`crate::move_path`]'s own compensating action, run to unwind a
+    /// primary step that failed partway (moving the destination's prior
+    /// content aside, or swapping the staged replacement into place),
+    /// itself failed. This is NOT the same situation as any other variant
+    /// above: those all mean "nothing moved, safe to retry or abandon",
+    /// while this means real content this crate is responsible for is
+    /// currently sitting at `stranded_src` and/or `stranded_dest` instead
+    /// of at its rightful location, and has NOT been destroyed but also
+    /// has NOT been automatically recovered. A caller must not treat this
+    /// the way it treats an ordinary failed move (in particular, must not
+    /// go on to purge or otherwise discard anything that assumed the move
+    /// either fully succeeded or fully unwound), and should surface it
+    /// loudly so an operator can find and manually recover the named
+    /// path(s).
+    #[error(
+        "move recovery failed after a primary failure ({primary}); content was NOT lost but \
+         was also NOT restored to its rightful place and needs manual recovery: \
+         source content stranded at {stranded_src:?}, destination's original content \
+         stranded at {stranded_dest:?}"
+    )]
+    RecoveryFailed {
+        primary: Box<StorageError>,
+        /// Set when the source's staged content could not be moved back
+        /// to its original location and is instead sitting at this path.
+        stranded_src: Option<PathBuf>,
+        /// Set when the destination's original content (moved aside
+        /// before the swap) could not be moved back into place and is
+        /// instead sitting at this path.
+        stranded_dest: Option<PathBuf>,
+    },
 }

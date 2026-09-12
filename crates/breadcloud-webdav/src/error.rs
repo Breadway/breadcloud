@@ -21,6 +21,11 @@ fn default_status(err: &StorageError) -> StatusCode {
         StorageError::LengthMismatch { .. } => StatusCode::PRECONDITION_FAILED,
         StorageError::InvalidPath(_) => StatusCode::BAD_REQUEST,
         StorageError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        // A move's own compensating recovery failed: real content is
+        // stranded (not lost) at a path only an operator can safely act
+        // on. This is a server-side problem, same bucket as `Io`, not
+        // something a client retry can fix.
+        StorageError::RecoveryFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 

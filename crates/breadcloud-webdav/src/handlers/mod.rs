@@ -6,5 +6,6 @@ pub mod mkcol;
 pub mod options;
 pub mod propfind;
 pub mod put;
+pub mod trashbin;
 pub mod uploads;
 pub mod versions;

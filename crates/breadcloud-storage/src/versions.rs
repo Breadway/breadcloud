@@ -223,6 +223,68 @@ impl VersionStore {
         }
     }
 
+    /// Move `path`'s entire retained-version subtree out to the external
+    /// directory `dest_dir`, outside this store entirely. Used when a
+    /// file (or, since version directories mirror the live tree's shape,
+    /// a whole directory's worth of descendant histories in one call) is
+    /// soft-deleted, so its history can travel into trash alongside it
+    /// instead of being purged outright (see CLOUD-5's `TrashStore` and
+    /// `breadcloud_webdav::trash`). Returns `true` if there was anything
+    /// to move (and `dest_dir` now holds it), `false` if `path` had no
+    /// history (a no-op; `dest_dir` is left untouched).
+    ///
+    /// Moves via [`crate::move_path`], the safe replace primitive
+    /// `TrashStore`'s own payload move also uses (see its doc comment for
+    /// the full safety argument): `BREADCLOUD_VERSIONS_ROOT` is exactly as
+    /// independently configurable as the trash root, so this move can
+    /// cross filesystems too, and this is also the move a failed restore's
+    /// rollback uses to undo an already-succeeded [`VersionStore::move_in`]
+    /// -- both need the same guarantee that a failure never destroys real
+    /// content on either side, not just a cross-filesystem fallback.
+    pub async fn move_out(&self, path: &DavPath, dest_dir: &Path) -> Result<bool, StorageError> {
+        let dir = self.dir_for(path);
+        if fs::metadata(&dir).await.is_err() {
+            return Ok(false);
+        }
+        crate::move_path(&dir, dest_dir).await?;
+        Ok(true)
+    }
+
+    /// The inverse of [`VersionStore::move_out`]: bring a previously
+    /// extracted subtree at `src_dir` back in as `path`'s retained-version
+    /// set (used when restoring a soft-deleted resource from trash). A
+    /// no-op if `src_dir` does not exist (the resource had no history when
+    /// it was trashed, or a prior call already moved it in).
+    ///
+    /// Moves via [`crate::move_path`], which handles a pre-existing
+    /// `path` version directory itself: unlike [`VersionStore::move_all`]
+    /// (an ordinary rename on a DAV `MOVE`, where discarding the
+    /// destination's own prior history outright is the correct, intended
+    /// behavior), this call's destination can legitimately already hold
+    /// real content -- most importantly, a leftover from a previous
+    /// restore attempt whose own rollback (a [`VersionStore::move_out`]
+    /// call, the reverse of this one) failed partway. `move_path` never
+    /// discards existing destination content until the new content is
+    /// fully staged and verified, so that case is handled correctly here
+    /// without this method needing to reason about it itself. Callers must
+    /// treat an ordinary `Err` here as the version history genuinely not
+    /// having moved (it is still at `src_dir`, untouched) and must not go
+    /// on to discard `src_dir`'s containing trash entry as if the move had
+    /// succeeded. The one exception is `StorageError::RecoveryFailed`:
+    /// `move_path`'s own unwind of a failed move can itself fail, in which
+    /// case the content is stranded at the stage/backup path the error
+    /// names rather than safely back at `src_dir` -- callers must check
+    /// for that variant distinctly and must not assume `src_dir` still
+    /// holds the history in that case.
+    pub async fn move_in(&self, path: &DavPath, src_dir: &Path) -> Result<(), StorageError> {
+        if fs::metadata(src_dir).await.is_err() {
+            return Ok(());
+        }
+        let dir = self.dir_for(path);
+        crate::move_path(src_dir, &dir).await?;
+        Ok(())
+    }
+
     /// Carry `from`'s version history over to `to` on a rename (MOVE).
     /// A no-op if `from` has no history yet. If `to` already has its own
     /// version history (its previous content is being replaced or
@@ -471,6 +533,195 @@ mod tests {
         let to = DavPath::parse("/b.txt").unwrap();
         store.move_all(&from, &to).await.unwrap();
         assert!(store.list(&to).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn move_out_then_move_in_roundtrips_history() {
+        let (dir, store) = store(10, 1024 * 1024);
+        let path = DavPath::parse("/a.txt").unwrap();
+        store.snapshot(&path, b"v1").await.unwrap();
+        store.snapshot(&path, b"v2").await.unwrap();
+
+        let external = dir.path().join("trash-entry").join("versions");
+        let moved = store.move_out(&path, &external).await.unwrap();
+        assert!(moved);
+        assert!(store.list(&path).await.unwrap().is_empty());
+        assert!(external.is_dir());
+
+        store.move_in(&path, &external).await.unwrap();
+        assert_eq!(store.list(&path).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn move_out_on_unversioned_path_is_a_no_op() {
+        let (dir, store) = store(10, 1024 * 1024);
+        let path = DavPath::parse("/never-written.txt").unwrap();
+        let external = dir.path().join("trash-entry").join("versions");
+
+        let moved = store.move_out(&path, &external).await.unwrap();
+        assert!(!moved);
+        assert!(!external.exists());
+    }
+
+    #[tokio::test]
+    async fn move_in_on_missing_source_is_a_no_op() {
+        let (dir, store) = store(10, 1024 * 1024);
+        let path = DavPath::parse("/a.txt").unwrap();
+        let external = dir.path().join("trash-entry").join("versions");
+
+        store.move_in(&path, &external).await.unwrap();
+        assert!(store.list(&path).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn move_out_and_move_in_survive_the_cross_device_fallback() {
+        // `VersionStore::move_out`/`move_in` both go through
+        // `crate::move_path`, which always tries a plain rename first --
+        // a test on one real filesystem can never make that fail with a
+        // genuine EXDEV. Exercise its cross-device fallback
+        // (`crate::copy_verified`) directly instead, shaped exactly like a
+        // real version-history move: a directory of version files, not a
+        // single file, since that is what `dir_for` always produces.
+        // Unlike the old fallback this replaces, `copy_verified` never
+        // removes its source itself -- that is `move_path`'s job, done
+        // only after the copy is safely swapped into the real destination
+        // -- so this only asserts the copy landed correctly.
+        let src_dir = TempDir::new().unwrap();
+        let dest_dir = TempDir::new().unwrap();
+        let versions_subdir = src_dir.path().join("a.txt");
+        tokio::fs::create_dir_all(&versions_subdir).await.unwrap();
+        tokio::fs::write(versions_subdir.join("00000000000000000001"), b"v1")
+            .await
+            .unwrap();
+        tokio::fs::write(versions_subdir.join("00000000000000000002"), b"v2")
+            .await
+            .unwrap();
+        let dest = dest_dir.path().join("trash-entry").join("versions");
+
+        crate::copy_verified(&versions_subdir, &dest).await.unwrap();
+
+        assert_eq!(
+            tokio::fs::read(dest.join("00000000000000000001"))
+                .await
+                .unwrap(),
+            b"v1"
+        );
+        assert_eq!(
+            tokio::fs::read(dest.join("00000000000000000002"))
+                .await
+                .unwrap(),
+            b"v2"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn move_in_never_destroys_real_history_when_its_own_rollback_fails_twice() {
+        // Reproduces the round-3 CLOUD-5 bug directly at the level it
+        // actually lived at: `VersionStore::move_in`'s destination-clobber
+        // used to be unconditional (`let _ = fs::remove_dir_all(&dir)`),
+        // so it could not tell a genuine pre-existing version directory
+        // apart from a partial leftover of a previous, half-failed
+        // attempt at the exact same move. This drives the real sequence a
+        // restore-then-roll-back-then-retry produces -- two independent
+        // forced failures, one on the forward move and one on the
+        // rollback that a later step would trigger -- and asserts the
+        // real, complete version history is never destroyed at any point
+        // along the way, with more than one retained version so a naive
+        // "did *something* survive" check could not paper over partial
+        // loss.
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, store) = store(10, 1024 * 1024);
+        let path = DavPath::parse("/a.txt").unwrap();
+        store.snapshot(&path, b"v1").await.unwrap();
+        store.snapshot(&path, b"v2").await.unwrap();
+
+        // "Delete": move the whole history out into a trash-entry-shaped
+        // external directory.
+        let entry_dir = dir.path().join("trash-entry");
+        let external_versions = entry_dir.join("versions");
+        tokio::fs::create_dir_all(&entry_dir).await.unwrap();
+        assert!(store.move_out(&path, &external_versions).await.unwrap());
+        assert!(store.list(&path).await.unwrap().is_empty());
+
+        // First forced failure: block the forward restore move by making
+        // the version store's own root (the destination's parent)
+        // read-only, the same as a real permissions problem or a
+        // read-only mount would.
+        let mut root_perms = std::fs::metadata(store.root()).unwrap().permissions();
+        root_perms.set_mode(0o555);
+        std::fs::set_permissions(store.root(), root_perms.clone()).unwrap();
+
+        assert!(
+            store.move_in(&path, &external_versions).await.is_err(),
+            "the forced failure must surface as an error"
+        );
+        assert!(
+            store.list(&path).await.unwrap().is_empty(),
+            "a failed forward move must leave the live side empty"
+        );
+
+        // Fix permissions and retry: the forward move must now fully
+        // succeed.
+        root_perms.set_mode(0o755);
+        std::fs::set_permissions(store.root(), root_perms).unwrap();
+        store.move_in(&path, &external_versions).await.unwrap();
+        assert_eq!(store.list(&path).await.unwrap().len(), 2);
+
+        // Second, independent forced failure: simulate a later payload
+        // move failing (as the real restore handler does) by forcing the
+        // *rollback* -- moving the live-mirror history just restored above
+        // back out to the trash entry -- to fail partway. Block writes to
+        // the trash entry directory itself, the same class of real-world
+        // fault (a permissions problem, or an I/O hiccup partway through a
+        // genuine cross-device copy) that a rollback is exactly as exposed
+        // to as the move it is undoing.
+        let mut entry_perms = std::fs::metadata(&entry_dir).unwrap().permissions();
+        entry_perms.set_mode(0o555);
+        std::fs::set_permissions(&entry_dir, entry_perms.clone()).unwrap();
+
+        assert!(
+            store.move_out(&path, &external_versions).await.is_err(),
+            "the forced rollback failure must surface as an error"
+        );
+
+        // The critical property this test exists for: the real, complete
+        // version history must still be findable, intact, at the
+        // live-mirror path the forward move put it at. This is exactly
+        // what the round-3 bug lost -- the next `move_in` unconditionally
+        // discarded "the destination has content" without asking whether
+        // that content was legitimate, destroying it.
+        assert_eq!(
+            store.list(&path).await.unwrap().len(),
+            2,
+            "a failed rollback must never destroy the real history it failed to move"
+        );
+
+        // Fix permissions and retry the rollback: it must now fully
+        // succeed, landing exactly the original two versions in the trash
+        // entry, no more, no less (no duplication from the earlier failed
+        // attempt either).
+        entry_perms.set_mode(0o755);
+        std::fs::set_permissions(&entry_dir, entry_perms).unwrap();
+        store.move_out(&path, &external_versions).await.unwrap();
+        assert!(store.list(&path).await.unwrap().is_empty());
+
+        // Bring it back one final time to confirm the whole roundtrip is
+        // intact end to end, not just "some files survived somewhere".
+        store.move_in(&path, &external_versions).await.unwrap();
+        let versions = store.list(&path).await.unwrap();
+        assert_eq!(versions.len(), 2);
+        use tokio::io::AsyncReadExt;
+        let mut contents = Vec::new();
+        for v in &versions {
+            let (mut file, _len) = store.read(&path, &v.id).await.unwrap();
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf).await.unwrap();
+            contents.push(String::from_utf8(buf).unwrap());
+        }
+        assert!(contents.contains(&"v1".to_string()));
+        assert!(contents.contains(&"v2".to_string()));
     }
 
     #[tokio::test]
