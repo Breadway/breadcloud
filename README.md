@@ -10,11 +10,14 @@ age and size retention cap; CLOUD-6 added a CalDAV server (calendar
 collections, multi-calendar per user, sync-collection/ctag) that runs on the
 same HTTP server as WebDAV rather than as a second process; CLOUD-7 added a
 CardDAV server (a single addressbook, contact groups as vCard `KIND:group`
-resources, sync-collection/ctag) on that same shared server; CLOUD-11 (this
-one) replaced the single placeholder account every prior issue ran against
-with a real, small multi-user account model: independently authenticated,
+resources, sync-collection/ctag) on that same shared server; CLOUD-11
+replaced the single placeholder account every prior issue ran against with a
+real, small multi-user account model: independently authenticated,
 independently quota'd, independently storage-isolated accounts, see "Multi-
-user accounts (CLOUD-11)" under `breadcloud-server` below.
+user accounts (CLOUD-11)" under `breadcloud-server` below; CLOUD-12 (this
+one) added a minimal server-rendered web UI (file browser + read-only
+calendar month view) on that same combined server and the same account
+model, see "Web UI (CLOUD-12)" under `breadcloud-server` below.
 
 ## Workspace layout
 
@@ -27,7 +30,8 @@ crates/
   breadcloud-webdav/    WebDAV (RFC 4918) HTTP layer, built on axum
   breadcloud-caldav/    CalDAV (RFC 4791) HTTP layer, built on axum
   breadcloud-carddav/   CardDAV (RFC 6352) HTTP layer, built on axum
-  breadcloud-server/    binary: wires storage + webdav + caldav + carddav into one server
+  breadcloud-webui/     minimal server-rendered web UI (file browser + calendar view), built on axum
+  breadcloud-server/    binary: wires storage + webdav + caldav + carddav + webui into one server
 ```
 
 ### breadcloud-storage
@@ -762,6 +766,68 @@ addressbook" regardless of body shape, since nothing else lives under that
 path -- it just reads `displayname` out of the body if present, falling back
 to the addressbook id if the body is absent or has none.
 
+### breadcloud-webui (CLOUD-12)
+
+A minimal server-rendered web UI: a file browser and a read-only calendar
+month view, covering the "open Firefox and look at my files/calendar"
+access pattern the issue names -- explicitly not a Nextcloud-style
+dashboard, activity feed, or notification center.
+
+**No new dependency-heavy toolchain.** Pages are plain `format!`-built HTML
+strings (see `template.rs`), not a templating crate (askama or similar) or a
+JS frontend framework/build step -- the whole UI is a handful of small
+pages, genuinely minimal per the issue's own framing, and this workspace has
+no `serde`, no JS build step, and no date/time crate anywhere else either
+(see `breadcloud-webui::datetime`'s own doc comment for the small
+dependency-free civil-calendar math that keeps it that way). A sprinkle of
+vanilla JS (`confirm()` on delete) is the only client-side script.
+
+**Same auth gate, not a second login system.** There is no session/cookie
+login here: a browser hitting `/ui/*` unauthenticated gets the same 401 with
+`WWW-Authenticate: Basic` every DAV client already gets, and the browser's
+native Basic Auth prompt handles the rest -- consistent with how every DAV
+client already authenticates against this server, and correctly scoped for
+a single-family home-server deployment. `breadcloud-server::combined`
+resolves the authenticated account once, centrally, exactly as it already
+does for WebDAV/CalDAV/CardDAV (CLOUD-11); `breadcloud-webui::dispatch`
+receives that identity directly rather than checking credentials a second
+time. There is deliberately no `<user>` segment anywhere in the `/ui/*` URL
+space (unlike `/remote.php/dav/files/<user>/...`) for a request to name a
+different account than the one that authenticated -- every page always
+operates against the caller's own account, so CLOUD-11's `url_scoped_user`
+check has nothing to validate in this URL space at all.
+
+**File browser** (`/ui/files/`, and `/ui/files/<path>` to navigate into a
+subdirectory): list, navigate, download (`/ui/download/<path>`, which calls
+straight into `breadcloud_webdav::handlers::get::handle` -- the same
+etag/content-type/streaming logic real DAV downloads already use), upload
+(`/ui/upload`, a multipart POST; goes through the same
+`versioning::snapshot_before_overwrite` + `Storage::quota_gate` +
+`Storage::write_bytes` sequence the plain WebDAV PUT handler uses), create a
+folder (`/ui/mkdir`, calling `breadcloud_webdav::handlers::mkcol::handle`
+directly), and delete (`/ui/delete`, calling
+`breadcloud_webdav::handlers::delete::handle` directly -- so a UI delete
+soft-deletes into trash exactly like a DAV client's DELETE already does,
+CLOUD-5's trash surface is not a UI-only concept). **Trash/version browsing
+through the UI is deliberately not included**: a delete already lands in
+trash (nothing is destructively lost -- recoverable via a DAV client or
+`handlers::trashbin` directly), and the issue frames this as "just a file
+browser," so a second browsing surface for CLOUD-4/CLOUD-5's existing DAV
+surfaces would be scope beyond what "minimal" asks for.
+
+**Calendar view** (`/ui/calendar?year=&month=`, defaulting to the current
+month): a month grid across every one of the account's calendars
+(personal/family/school), reusing `breadcloud_caldav::ical::summarize` (a
+small CLOUD-12 addition to that module) for the same "wall-clock digits, not
+tz-aware" `DTSTART` reading the CalDAV `time-range` filter already relies
+on, rather than a second iCalendar parser. **Read-only**: creating/editing
+events is left to a real CalDAV client (DAVx5, iOS Calendar, any desktop
+client already pointed at this server per CLOUD-6), which already has to
+exist for this deployment to have events at all -- a write path here would
+mean either a second, form-shaped entry point into
+`breadcloud-caldav`'s PUT logic or a second event-authoring implementation,
+more surface than a "minimal" calendar *view* needs.
+
 ### breadcloud-server
 
 Thin binary. Configuration is environment variables:
@@ -1076,6 +1142,19 @@ native Contacts account type both take just the bare server address plus the
 same Basic-auth credentials and discover the addressbook automatically, via
 the same `current-user-principal` -> principal -> `addressbook-home-set`
 chain CalDAV discovery uses. Covered in "Real-client verification" below.
+
+```bash
+# minimal web UI (CLOUD-12): open in a browser, or exercise it directly --
+# the browser's native Basic Auth prompt is the login, same credentials as
+# every DAV client above.
+open http://127.0.0.1:8080/ui/          # file browser landing page
+open http://127.0.0.1:8080/ui/calendar  # this month's calendar view
+
+# or drive it with curl, same as any other endpoint on this server
+curl -u dev:dev http://127.0.0.1:8080/ui/files/
+curl -u dev:dev -F dir=/ -F file=@example.txt http://127.0.0.1:8080/ui/upload
+curl -u dev:dev "http://127.0.0.1:8080/ui/calendar?year=2026&month=3"
+```
 
 ## Testing
 
@@ -1477,6 +1556,49 @@ instance was not something this task was asked to do, and touching real
 personal contact content without being asked would be scope creep beyond
 implementing and verifying the protocol.
 
+### Real-client verification (CLOUD-12)
+
+No browser automation was available, so this was verified with a real
+running `breadcloud-server` instance (a disposable local instance, two
+synthetic multi-account users, never real data) driven with `curl`, exactly
+as a browser's requests would look on the wire:
+
+- Unauthenticated `GET /ui/` returns `401` with the same `WWW-Authenticate:
+  Basic` challenge every DAV endpoint already returns.
+- A multipart upload (`POST /ui/upload`) lands real content on the
+  account's real `Storage` root: fetchable afterward both through the
+  plain WebDAV `GET` path and through `/ui/download/<path>`, byte for
+  byte.
+- `POST /ui/mkdir` creates a real collection (`MKCOL` under the hood);
+  the new folder appears in the `/ui/files/` listing and can be navigated
+  into (`/ui/files/<folder>`), which then correctly lists the file
+  uploaded into it.
+- `POST /ui/delete` soft-deletes (confirmed via the real
+  `/remote.php/dav/trashbin/<user>/` PROPFIND surface showing the deleted
+  item, not destructively removed) and the item disappears from
+  `/ui/files/`.
+- Two independent accounts (`alice`, `bob`, `BREADCLOUD_ACCOUNT_<n>_*`):
+  bob's `/ui/files/` never shows alice's uploads, and bob cannot browse
+  alice's folder by guessing its path (`404`, since there is no `<user>`
+  segment in this URL space to spoof in the first place -- see
+  `breadcloud-webui`'s own section above).
+- A real event PUT via CalDAV (`/remote.php/dav/calendars/alice/personal/
+  <uid>.ics`) appears in `/ui/calendar?year=&month=` for its actual month,
+  correctly does not appear in the adjacent month, the default (no query
+  params) view renders the current month without error, the prev/next nav
+  links point at the correct adjacent year/month, and bob's calendar view
+  never shows alice's event.
+
+Real DAVx5/iOS browser verification of the rendered pages themselves was not
+available in this environment; the `curl`-driven checks above confirm the
+served HTML/redirect/status-code behavior for every real scenario the issue
+names (list files, navigate a subdirectory, view a calendar month with real
+events in it) against the real data model (real per-user storage roots,
+real calendars, real multi-account auth), which is what this issue asks to
+be verified against. The full `breadcloud-server` integration test suite
+(`combined.rs`'s `ui_*` tests) covers the same surface automatically,
+including the quota-rejection and cross-account isolation paths.
+
 **Not live-verified**: DAVx5 (Android) and iOS's native Contacts account
 type specifically -- neither device/emulator was available on this machine.
 Both are implemented against the documented RFC 6352/6578 protocol and the
@@ -1491,13 +1613,13 @@ what was and wasn't live-verified.
 
 ## What's next in the epic
 
-See the CLOUD project on breadboard for the full epic. In rough order after
-CLOUD-7: notes, multi-user auth + per-user quotas (replacing the placeholder
-Basic auth here, and giving `fileid.rs` a real persistent id to hand out
-instead of a path-derived one -- which would also let the versions and
+See the CLOUD project on breadboard for the full epic. CLOUD-11 (multi-user
+auth + per-user quotas) and CLOUD-12 (the minimal web UI) are both done, per
+their own sections above. Remaining, in rough order: notes (CLOUD-8, left in
+todo pending user input), giving `fileid.rs` a real persistent id to hand
+out instead of a path-derived one (which would also let the versions and
 trashbin DAV surfaces move to a real `<fileid>`-keyed layout instead of the
-path-/opaque-id-keyed ones they use today), a minimal web UI, and
-bread-ecosystem event integration. Each of those should be a new crate under
-`crates/` that depends on `breadcloud-storage` and, where it needs HTTP,
-nests alongside or reuses `breadcloud-webdav`'s router rather than
-duplicating it.
+path-/opaque-id-keyed ones they use today), and bread-ecosystem event
+integration. Each of those should be a new crate under `crates/` that
+depends on `breadcloud-storage` and, where it needs HTTP, nests alongside or
+reuses `breadcloud-webdav`'s router rather than duplicating it.

@@ -1,0 +1,18 @@
+[package]
+name = "breadcloud-webui"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal server-rendered web UI (file browser + calendar view) for breadcloud, built on axum"
+
+[dependencies]
+breadcloud-storage = { path = "../breadcloud-storage" }
+breadcloud-webdav = { path = "../breadcloud-webdav" }
+breadcloud-caldav = { path = "../breadcloud-caldav" }
+axum = { version = "0.7", features = ["multipart"] }
+tokio = { version = "1", features = ["full"] }
+percent-encoding = "2"
+
+[dev-dependencies]
+tempfile = "3"
+http-body-util = "0.1"
+tower = { version = "0.4", features = ["util"] }

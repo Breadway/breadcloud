@@ -65,6 +65,7 @@ dependencies = [
  "matchit",
  "memchr",
  "mime",
+ "multer",
  "percent-encoding",
  "pin-project-lite",
  "rustversion",
@@ -196,6 +197,7 @@ dependencies = [
  "breadcloud-carddav",
  "breadcloud-storage",
  "breadcloud-webdav",
+ "breadcloud-webui",
  "http-body-util",
  "tempfile",
  "tokio",
@@ -237,6 +239,21 @@ dependencies = [
  "tower 0.4.13",
  "tower-http",
  "tracing",
+]
+
+[[package]]
+name = "breadcloud-webui"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "breadcloud-caldav",
+ "breadcloud-storage",
+ "breadcloud-webdav",
+ "http-body-util",
+ "percent-encoding",
+ "tempfile",
+ "tokio",
+ "tower 0.4.13",
 ]
 
 [[package]]
@@ -304,6 +321,15 @@ dependencies = [
  "block-buffer",
  "crypto-common",
  "subtle",
+]
+
+[[package]]
+name = "encoding_rs"
+version = "0.8.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
+dependencies = [
+ "cfg-if",
 ]
 
 [[package]]
@@ -583,6 +609,23 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys",
+]
+
+[[package]]
+name = "multer"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83e87776546dc87511aa5ee218730c92b666d7264ab6ed41f9d215af9cd5224b"
+dependencies = [
+ "bytes",
+ "encoding_rs",
+ "futures-util",
+ "http",
+ "httparse",
+ "memchr",
+ "mime",
+ "spin",
+ "version_check",
 ]
 
 [[package]]
@@ -876,6 +919,12 @@ dependencies = [
  "libc",
  "windows-sys",
 ]
+
+[[package]]
+name = "spin"
+version = "0.9.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 
 [[package]]
 name = "subtle"

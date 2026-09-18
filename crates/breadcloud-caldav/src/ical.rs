@@ -97,6 +97,104 @@ pub fn extract_uid(ics: &[u8]) -> Option<String> {
     None
 }
 
+/// Extract the `SUMMARY` of the first component in an iCalendar object.
+/// `None` if there is no `SUMMARY` line (RFC 5545 does not require one,
+/// unlike `UID`).
+pub fn extract_summary(ics: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(ics);
+    let unfolded = unfold(&text);
+    for line in unfolded.lines() {
+        if let Some((name, value)) = split_line(line) {
+            if property_name(name).eq_ignore_ascii_case("SUMMARY") {
+                let value = value.trim();
+                if value.is_empty() {
+                    return None;
+                }
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// A minimal event summary extracted for display purposes (`breadcloud-webui`'s
+/// calendar month view, CLOUD-12): just enough to place an event on a
+/// specific day and show a short label, without this module becoming a
+/// general iCalendar library. Reuses exactly the same "wall-clock digits,
+/// not tz-aware" `DTSTART` reading [`time_range_overlaps`] already uses
+/// (see this module's doc comment for why), just exposed as calendar
+/// fields instead of folded into a range comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventSummary {
+    pub uid: String,
+    /// `SUMMARY`, or a placeholder when the event has none.
+    pub summary: String,
+    pub year: u32,
+    pub month: u32,
+    pub day: u32,
+    pub hour: u32,
+    pub minute: u32,
+    /// `true` for a `DTSTART;VALUE=DATE` (all-day) event.
+    pub all_day: bool,
+}
+
+/// Pull a display summary out of `ics`: `None` if there is no `UID` or no
+/// parseable `DTSTART` (the same "cannot confidently place this in time"
+/// cases [`time_range_overlaps`] treats as "always include" for a filter,
+/// but for a calendar view there is no day to place an unparseable event
+/// on, so it is left out instead).
+pub fn summarize(ics: &[u8]) -> Option<EventSummary> {
+    let uid = extract_uid(ics)?;
+    let summary = extract_summary(ics).unwrap_or_else(|| "(untitled)".to_string());
+
+    let text = String::from_utf8_lossy(ics);
+    let unfolded = unfold(&text);
+    let mut dtstart_raw: Option<String> = None;
+    let mut is_date_only = false;
+    for line in unfolded.lines() {
+        let Some((name, value)) = split_line(line) else {
+            continue;
+        };
+        if property_name(name).eq_ignore_ascii_case("DTSTART") {
+            dtstart_raw = Some(value.trim().to_string());
+            is_date_only = name.to_ascii_uppercase().contains("VALUE=DATE")
+                && !name.to_ascii_uppercase().contains("VALUE=DATE-TIME");
+            break;
+        }
+    }
+    let dtstart_raw = dtstart_raw?;
+    let digits: String = dtstart_raw
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .take(14)
+        .collect();
+    if digits.len() < 8 {
+        return None;
+    }
+    let year: u32 = digits[0..4].parse().ok()?;
+    let month: u32 = digits[4..6].parse().ok()?;
+    let day: u32 = digits[6..8].parse().ok()?;
+    let (hour, minute) = if digits.len() >= 12 {
+        (
+            digits[8..10].parse().unwrap_or(0),
+            digits[10..12].parse().unwrap_or(0),
+        )
+    } else {
+        (0, 0)
+    };
+
+    Some(EventSummary {
+        uid,
+        summary,
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        all_day: is_date_only,
+    })
+}
+
 /// Whether the object contains a component of the given type (compared
 /// case-insensitively), e.g. `has_component(ics, "VEVENT")`.
 pub fn has_component(ics: &[u8], component: &str) -> bool {
@@ -380,6 +478,48 @@ mod tests {
     fn no_bounds_always_matches() {
         let ics = event("20260115T090000Z", Some("20260115T100000Z"));
         assert!(time_range_overlaps(&ics, None, None));
+    }
+
+    #[test]
+    fn summarize_extracts_uid_summary_and_wall_clock_start() {
+        let ics = b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:abc-123\r\nDTSTART:20260115T090000Z\r\nSUMMARY:Team sync\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let s = summarize(ics).unwrap();
+        assert_eq!(s.uid, "abc-123");
+        assert_eq!(s.summary, "Team sync");
+        assert_eq!((s.year, s.month, s.day), (2026, 1, 15));
+        assert_eq!((s.hour, s.minute), (9, 0));
+        assert!(!s.all_day);
+    }
+
+    #[test]
+    fn summarize_marks_all_day_events() {
+        let ics = b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x\r\nDTSTART;VALUE=DATE:20260301\r\nSUMMARY:Public holiday\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let s = summarize(ics).unwrap();
+        assert_eq!((s.year, s.month, s.day), (2026, 3, 1));
+        assert!(s.all_day);
+    }
+
+    #[test]
+    fn summarize_defaults_missing_summary_to_placeholder() {
+        let ics = b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x\r\nDTSTART:20260115T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let s = summarize(ics).unwrap();
+        assert_eq!(s.summary, "(untitled)");
+    }
+
+    #[test]
+    fn summarize_is_none_without_uid_or_dtstart() {
+        let no_uid = b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nDTSTART:20260115T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert!(summarize(no_uid).is_none());
+
+        let no_dtstart =
+            b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x\r\nSUMMARY:y\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert!(summarize(no_dtstart).is_none());
+    }
+
+    #[test]
+    fn extract_summary_ignores_an_empty_value() {
+        let ics = b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x\r\nSUMMARY:\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert_eq!(extract_summary(ics), None);
     }
 
     #[test]

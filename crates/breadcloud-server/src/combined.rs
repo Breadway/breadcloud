@@ -39,7 +39,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -101,6 +101,21 @@ pub fn router(
         .fallback(dispatch)
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, auth_gate))
+        // axum applies its own 2 MiB default body-size limit to any
+        // request read through a `DefaultBodyLimit`-aware extractor,
+        // silently overriding a handler's own larger cap unless this is
+        // raised to match. `breadcloud_webui::files::upload`'s
+        // `Multipart::from_request` is the *only* such extractor
+        // anywhere in this workspace -- every other handler
+        // (`breadcloud_webdav::handlers::put`, this crate's own
+        // `mkdir`/`delete` form-body reads, and so on) reads its body via
+        // a plain `axum::body::to_bytes(req.into_body(), <its own cap>)`
+        // call on the raw `Request`, which this layer has no effect on
+        // at all -- so raising it here, once, for the whole combined
+        // router is equivalent to raising it for exactly the one route
+        // that needs it, not a blanket loosening of every route's body
+        // size handling.
+        .layer(DefaultBodyLimit::max(breadcloud_webui::MAX_UPLOAD_BYTES))
 }
 
 /// Path prefixes where the very next segment names an account (Nextcloud's
@@ -171,6 +186,17 @@ async fn dispatch(State(state): State<CombinedState>, req: Request) -> Response 
         )
             .into_response();
     };
+
+    if breadcloud_webui::owns_path(&path) {
+        // CLOUD-12: the minimal web UI. Runs against `authed_user`'s own
+        // already-resolved `webdav_state` and the shared `caldav` state,
+        // exactly the identity `auth_gate` already established above --
+        // there is no `<user>` segment in this URL space at all for the
+        // `url_scoped_user` check above to have anything to validate (see
+        // `breadcloud_webui`'s own doc comment).
+        return breadcloud_webui::dispatch(webdav_state, state.caldav.clone(), &authed_user, req)
+            .await;
+    }
 
     if breadcloud_caldav::owns_path(&path) {
         // A PROPFIND on the principal resource is the second hop of the
@@ -1612,5 +1638,539 @@ mod tests {
             used <= 1000,
             "final reported usage {used} must never exceed the 1000-byte quota, xml: {xml}"
         );
+    }
+
+    // --- CLOUD-12: the minimal web UI ----------------------------------
+    //
+    // These exercise `breadcloud_webui::dispatch` through this module's own
+    // `router()`, the same combined app a real request hits -- not the
+    // `breadcloud-webui` crate's handlers in isolation -- so they cover
+    // exactly the thing CLOUD-12 asks to be verified against: the real
+    // multi-account auth gate, real per-user `Storage`, and the real
+    // shared `CalendarStore`, wired together the way `main.rs` wires them.
+
+    fn multipart_body(
+        boundary: &str,
+        form_fields: &[(&str, &str)],
+        file: (&str, &str, &[u8]),
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (name, value) in form_fields {
+            body.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+                    .as_bytes(),
+            );
+        }
+        let (field_name, filename, content) = file;
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{field_name}\"; \
+                 filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(content);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    async fn upload_via_ui(
+        app: &Router,
+        user: &str,
+        pass: &str,
+        dir: &str,
+        filename: &str,
+        content: &[u8],
+    ) -> Response {
+        let boundary = "----breadcloudUiTestBoundary";
+        let body = multipart_body(boundary, &[("dir", dir)], ("file", filename, content));
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        request_as(
+            app,
+            "POST",
+            "/ui/upload",
+            user,
+            pass,
+            &[("Content-Type", &content_type)],
+            body,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn ui_home_page_requires_auth_and_links_to_files_and_calendar() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
+
+        let unauthed = Request::builder()
+            .method("GET")
+            .uri("/ui")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(unauthed).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = request_as(&app, "GET", "/ui/", "alice", "secret1", &[], Vec::new()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = body_string(response).await;
+        assert!(html.contains("/ui/files/"));
+        assert!(html.contains("/ui/calendar"));
+    }
+
+    #[tokio::test]
+    async fn ui_upload_lands_on_real_storage_and_is_fetchable_via_webdav_and_download() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
+
+        let upload = upload_via_ui(
+            &app,
+            "alice",
+            "secret1",
+            "/",
+            "hello.txt",
+            b"hello from the web ui",
+        )
+        .await;
+        assert_eq!(upload.status(), StatusCode::SEE_OTHER);
+
+        // The very same content is reachable through plain WebDAV GET --
+        // the upload went through `Storage::write_bytes` on the account's
+        // real root, not a separate UI-only store.
+        let webdav_get = request_as(
+            &app,
+            "GET",
+            "/hello.txt",
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(webdav_get.status(), StatusCode::OK);
+        assert_eq!(body_string(webdav_get).await, "hello from the web ui");
+
+        let download = request_as(
+            &app,
+            "GET",
+            "/ui/download/hello.txt",
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(download.status(), StatusCode::OK);
+        assert_eq!(body_string(download).await, "hello from the web ui");
+    }
+
+    #[tokio::test]
+    async fn ui_files_listing_shows_uploads_and_stays_isolated_per_account() {
+        let (_dirs, app) = multi_user_test_app(&[
+            ("alice", "secret1", 100 * GIB),
+            ("bob", "secret2", 100 * GIB),
+        ])
+        .await;
+
+        upload_via_ui(&app, "alice", "secret1", "/", "alice-note.txt", b"private").await;
+
+        let alice_listing = request_as(
+            &app,
+            "GET",
+            "/ui/files/",
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(alice_listing.status(), StatusCode::OK);
+        assert!(body_string(alice_listing).await.contains("alice-note.txt"));
+
+        // Bob's own listing (his own, separately-rooted `Storage`, the
+        // same isolation `files_are_isolated_between_accounts` proves at
+        // the DAV layer) never shows alice's file.
+        let bob_listing =
+            request_as(&app, "GET", "/ui/files/", "bob", "secret2", &[], Vec::new()).await;
+        assert!(!body_string(bob_listing).await.contains("alice-note.txt"));
+    }
+
+    #[tokio::test]
+    async fn ui_mkdir_creates_a_folder_that_then_lists_and_can_be_browsed() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
+
+        let mkdir = request_as(
+            &app,
+            "POST",
+            "/ui/mkdir",
+            "alice",
+            "secret1",
+            &[("Content-Type", "application/x-www-form-urlencoded")],
+            b"dir=%2F&name=Photos".to_vec(),
+        )
+        .await;
+        assert_eq!(mkdir.status(), StatusCode::SEE_OTHER);
+
+        let listing = request_as(
+            &app,
+            "GET",
+            "/ui/files/",
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert!(body_string(listing).await.contains("Photos"));
+
+        let browse_new_dir = request_as(
+            &app,
+            "GET",
+            "/ui/files/Photos",
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(browse_new_dir.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ui_delete_soft_deletes_through_the_real_trash_and_disappears_from_the_listing() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
+        upload_via_ui(&app, "alice", "secret1", "/", "throwaway.txt", b"bye").await;
+
+        let delete = request_as(
+            &app,
+            "POST",
+            "/ui/delete",
+            "alice",
+            "secret1",
+            &[("Content-Type", "application/x-www-form-urlencoded")],
+            b"path=%2Fthrowaway.txt".to_vec(),
+        )
+        .await;
+        assert_eq!(delete.status(), StatusCode::SEE_OTHER);
+
+        let listing = request_as(
+            &app,
+            "GET",
+            "/ui/files/",
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert!(!body_string(listing).await.contains("throwaway.txt"));
+
+        // Not actually destroyed -- `/ui/delete` calls straight into
+        // `breadcloud_webdav::handlers::delete::handle`, which moves it to
+        // trash (CLOUD-5), verified here through that same DAV surface.
+        let trash = request_as(
+            &app,
+            "PROPFIND",
+            "/remote.php/dav/trashbin/alice/",
+            "alice",
+            "secret1",
+            &[("Depth", "1")],
+            Vec::new(),
+        )
+        .await;
+        assert!(body_string(trash).await.contains("throwaway.txt"));
+    }
+
+    #[tokio::test]
+    async fn ui_upload_over_quota_is_rejected_and_does_not_land_on_disk() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 10)]).await;
+
+        let upload = upload_via_ui(
+            &app,
+            "alice",
+            "secret1",
+            "/",
+            "big.bin",
+            b"this payload is way more than ten bytes",
+        )
+        .await;
+        assert_eq!(upload.status(), StatusCode::from_u16(507).unwrap());
+
+        let get = request_as(&app, "GET", "/big.bin", "alice", "secret1", &[], Vec::new()).await;
+        assert_eq!(get.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Regression test for the CLOUD-12 review's second finding: axum
+    /// applies its own 2 MiB default body-size limit to any request read
+    /// through a `DefaultBodyLimit`-aware extractor, and
+    /// `/ui/upload`'s `Multipart::from_request` is exactly such an
+    /// extractor -- before the combined router's `DefaultBodyLimit` layer
+    /// was raised to match `MAX_UPLOAD_BYTES`, this exact shape of
+    /// request (comfortably over 2 MiB, comfortably under both the real
+    /// cap and the account's quota) failed with a generic 400, live-
+    /// verified by the reviewer via bisection at exactly the 2 MiB
+    /// boundary. The prior quota test above uses a 10-byte quota and a
+    /// payload nowhere near 2 MiB, so it could not have caught this; this
+    /// test exists specifically because that one does not exercise a
+    /// realistic size.
+    #[tokio::test]
+    async fn ui_upload_larger_than_axum_default_body_limit_succeeds() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", GIB)]).await;
+
+        // 3 MiB: well past axum's 2,097,152-byte default and the exact
+        // boundary the reviewer bisected at, nowhere near the real 20 GiB
+        // cap or this account's 1 GiB quota.
+        let content = vec![b'x'; 3 * 1024 * 1024];
+        let upload =
+            upload_via_ui(&app, "alice", "secret1", "/", "big-but-legit.bin", &content).await;
+        assert_eq!(
+            upload.status(),
+            StatusCode::SEE_OTHER,
+            "a {}-byte upload, well under both MAX_UPLOAD_BYTES and the account's quota, \
+             must succeed rather than being silently capped at axum's 2 MiB default",
+            content.len()
+        );
+
+        let get = request_as(
+            &app,
+            "GET",
+            "/big-but-legit.bin",
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(
+            get.into_body().collect().await.unwrap().to_bytes().len(),
+            content.len()
+        );
+    }
+
+    /// The quota-rejection path (507, nothing lands on disk) also holds
+    /// at a realistic upload size, not just the tiny few-bytes scale the
+    /// test above this one uses -- closing the exact gap the CLOUD-12
+    /// review called out ("the integration test's over-quota case almost
+    /// certainly only exercised a small file under a small quota").
+    #[tokio::test]
+    async fn ui_upload_over_quota_at_realistic_scale_is_rejected_and_does_not_land_on_disk() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 1024 * 1024)]).await;
+
+        let content = vec![b'x'; 3 * 1024 * 1024];
+        let upload = upload_via_ui(
+            &app,
+            "alice",
+            "secret1",
+            "/",
+            "too-big-for-quota.bin",
+            &content,
+        )
+        .await;
+        assert_eq!(upload.status(), StatusCode::from_u16(507).unwrap());
+
+        let get = request_as(
+            &app,
+            "GET",
+            "/too-big-for-quota.bin",
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(get.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Regression test for the CLOUD-12 review's first finding (stored
+    /// XSS via an unescaped `href` attribute): the exact payload the
+    /// reviewer used in their live repro against a running instance. The
+    /// filename contains the *text* `&quot;` (six literal characters:
+    /// `&`, `q`, `u`, `o`, `t`, `;`), not an actual `"` byte -- a naive
+    /// filesystem-safe-filename check would wave it through, and a
+    /// browser decodes that text back into a literal quote when it
+    /// parses the rendered HTML, which is exactly what let the injected
+    /// `<img onerror=...>` close the `href="..."` attribute and the
+    /// `<a>` tag early and execute unprompted before this fix.
+    #[tokio::test]
+    async fn ui_files_listing_html_escapes_a_filename_that_attempts_stored_xss() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
+
+        let payload = "pwn3&quot;><img src=x onerror=alert(document.cookie)>.txt";
+        let upload = upload_via_ui(&app, "alice", "secret1", "/", payload, b"gotcha").await;
+        assert_eq!(upload.status(), StatusCode::SEE_OTHER);
+
+        let listing = request_as(
+            &app,
+            "GET",
+            "/ui/files/",
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(listing.status(), StatusCode::OK);
+        let html = body_string(listing).await;
+
+        // The attribute-breakout and the live `<img>` tag must never
+        // appear unescaped in the rendered page.
+        assert!(
+            !html.contains("\"><img"),
+            "unescaped attribute break-out survived into the listing: {html}"
+        );
+        assert!(
+            !html.contains("<img src=x onerror="),
+            "the injected tag rendered as a live element: {html}"
+        );
+
+        // And the properly-escaped forms must be present, proving this is
+        // escaping the value, not merely stripping or rejecting it.
+        assert!(
+            html.contains("&amp;quot;"),
+            "expected the literal &quot; text itself to be escaped: {html}"
+        );
+        assert!(
+            html.contains("&lt;img"),
+            "expected the injected tag's `<` to be escaped: {html}"
+        );
+    }
+
+    /// Same bug, same fix, in `breadcrumbs()`'s directory-name links
+    /// (`template.rs`) rather than `files.rs`'s file-row links -- the
+    /// CLOUD-12 review flagged both sites by name.
+    #[tokio::test]
+    async fn ui_breadcrumbs_html_escapes_a_directory_name_that_attempts_stored_xss() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
+
+        // Same attack shape as the file-listing payload above (an
+        // HTML-entity-encoded quote plus a raw `<img>` tag), applied to a
+        // directory name. No `/` or `=`, so the name is valid for
+        // `mkdir` (which only rejects an embedded `/`) and the percent-
+        // encoding needed to carry it through a form body and a URL path
+        // segment in this test stays a fixed, known set of characters.
+        let payload = "x&quot;><img onerror.alert(1)>";
+        let encoded = percent_encode_test_payload(payload);
+
+        let mkdir = request_as(
+            &app,
+            "POST",
+            "/ui/mkdir",
+            "alice",
+            "secret1",
+            &[("Content-Type", "application/x-www-form-urlencoded")],
+            format!("dir=%2F&name={encoded}").into_bytes(),
+        )
+        .await;
+        assert_eq!(mkdir.status(), StatusCode::SEE_OTHER);
+
+        let browse = request_as(
+            &app,
+            "GET",
+            &format!("/ui/files/{encoded}"),
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(browse.status(), StatusCode::OK);
+        let html = body_string(browse).await;
+
+        assert!(
+            !html.contains("\"><img"),
+            "unescaped attribute break-out survived into the breadcrumbs: {html}"
+        );
+        assert!(
+            !html.contains("<img onerror"),
+            "the injected tag rendered as a live element in the breadcrumbs: {html}"
+        );
+        assert!(
+            html.contains("&amp;quot;"),
+            "expected the literal &quot; text itself to be escaped: {html}"
+        );
+        assert!(
+            html.contains("&lt;img"),
+            "expected the injected tag's `<` to be escaped: {html}"
+        );
+    }
+
+    /// Percent-encode the fixed, known set of characters the two XSS
+    /// regression tests' payloads use, so they can be carried unmangled
+    /// through both an `application/x-www-form-urlencoded` body (where
+    /// `&`/`=` are field delimiters) and a URL path segment (where `<`/
+    /// `>`/space are not valid raw bytes) -- a small fixed replace chain
+    /// rather than pulling in the `percent-encoding` crate as a dev-
+    /// dependency of this binary crate for two tests.
+    fn percent_encode_test_payload(input: &str) -> String {
+        input
+            .replace('%', "%25")
+            .replace(' ', "%20")
+            .replace('&', "%26")
+            .replace('<', "%3C")
+            .replace('>', "%3E")
+            .replace('(', "%28")
+            .replace(')', "%29")
+    }
+
+    #[tokio::test]
+    async fn ui_calendar_month_view_shows_events_in_that_month_and_stays_isolated_per_account() {
+        let (_dirs, app) = multi_user_test_app(&[
+            ("alice", "secret1", 100 * GIB),
+            ("bob", "secret2", 100 * GIB),
+        ])
+        .await;
+
+        let ics = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:standup-1\r\nDTSTART:20260115T090000Z\r\nDTEND:20260115T093000Z\r\nSUMMARY:Team standup\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".to_vec();
+        request_as(
+            &app,
+            "PUT",
+            "/remote.php/dav/calendars/alice/personal/standup-1.ics",
+            "alice",
+            "secret1",
+            &[],
+            ics,
+        )
+        .await;
+
+        let january = request_as(
+            &app,
+            "GET",
+            "/ui/calendar?year=2026&month=1",
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(january.status(), StatusCode::OK);
+        let january_html = body_string(january).await;
+        assert!(january_html.contains("Team standup"));
+        assert!(january_html.contains("Personal"));
+
+        // A different month never shows it.
+        let february = request_as(
+            &app,
+            "GET",
+            "/ui/calendar?year=2026&month=2",
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert!(!body_string(february).await.contains("Team standup"));
+
+        // Bob's own calendar view (same personal calendar id, a wholly
+        // separate `CalendarStore` namespace per CLOUD-6/11) never shows
+        // alice's event.
+        let bob_january = request_as(
+            &app,
+            "GET",
+            "/ui/calendar?year=2026&month=1",
+            "bob",
+            "secret2",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert!(!body_string(bob_january).await.contains("Team standup"));
     }
 }
