@@ -23,14 +23,21 @@ pub async fn require_auth(State(state): State<AppState>, req: Request, next: Nex
         return next.run(req).await;
     };
 
-    if credentials_match(req.headers(), auth) {
+    if check_basic_auth(req.headers(), auth) {
         next.run(req).await
     } else {
         unauthorized()
     }
 }
 
-fn credentials_match(headers: &HeaderMap, auth: &BasicAuthConfig) -> bool {
+/// The actual HTTP Basic credential check (parse the `Authorization`
+/// header, base64-decode, compare to `auth`). `pub` so `breadcloud-caldav`
+/// can reuse the exact same check for its own auth gate rather than
+/// keeping a second copy of the base64/header-parsing logic in sync by
+/// hand -- see that crate's `auth` module for why the *middleware*
+/// wrapper around this is not itself shared (different axum `State`
+/// types per crate).
+pub fn check_basic_auth(headers: &HeaderMap, auth: &BasicAuthConfig) -> bool {
     let Some(value) = headers.get("Authorization").and_then(|v| v.to_str().ok()) else {
         return false;
     };

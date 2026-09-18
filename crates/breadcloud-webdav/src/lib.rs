@@ -59,9 +59,15 @@ use percent_encoding::percent_decode_str;
 /// `MethodFilter` recognizes.
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .fallback(dispatch)
+        .fallback(dispatch_handler)
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, auth::require_auth))
+}
+
+/// Thin axum-extractor adapter around [`dispatch`], so `router()` above
+/// can still be registered as a plain `.fallback(...)` handler.
+async fn dispatch_handler(State(state): State<AppState>, req: Request) -> Response {
+    dispatch(state, req).await
 }
 
 /// Real Nextcloud clients (mirall / nextcloudcmd) mount the file tree at
@@ -92,7 +98,16 @@ pub(crate) fn split_mount_prefix(decoded: &str) -> (String, &str) {
     (String::new(), decoded)
 }
 
-async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
+/// The WebDAV request dispatcher, exposed directly (not just through
+/// [`router`]) so a binary that also serves CalDAV (`breadcloud-caldav`,
+/// CLOUD-6) can run both protocols on one axum app and one auth gate
+/// instead of standing up a second HTTP server: it inspects the request
+/// path itself, routes anything CalDAV owns to `breadcloud_caldav::dispatch`,
+/// and falls back to this function for everything else, under one shared
+/// `middleware::from_fn` auth layer built from the same credentials. See
+/// `breadcloud-server`'s combined router and the workspace README's
+/// "Sharing the HTTP server with CalDAV" section for the composition.
+pub async fn dispatch(state: AppState, req: Request) -> Response {
     let method = req.method().clone();
     let headers = req.headers().clone();
     let raw_path = req.uri().path().to_string();

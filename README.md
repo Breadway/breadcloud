@@ -5,20 +5,22 @@ A scoped Rust replacement for a self-hosted Nextcloud instance: file sync
 minimal web UI, built as a series of breadboard issues (CLOUD-2 through
 CLOUD-14). CLOUD-2 built the WebDAV core; CLOUD-3 made it actually work as a
 real Nextcloud desktop client (mirall) sync backend; CLOUD-4 added capped
-per-file version history; CLOUD-5 (this one) added soft-delete trash with an
-explicit age and size retention cap.
+per-file version history; CLOUD-5 added soft-delete trash with an explicit
+age and size retention cap; CLOUD-6 (this one) added a CalDAV server
+(calendar collections, multi-calendar per user, sync-collection/ctag) that
+runs on the same HTTP server as WebDAV rather than as a second process.
 
 ## Workspace layout
 
-A Cargo workspace, not a single binary, so later issues (CalDAV, CardDAV, the
-web UI) can add crates that reuse the storage and HTTP layers without a
-rewrite.
+A Cargo workspace, not a single binary, so later issues (CardDAV, the web UI)
+can add crates that reuse the storage and HTTP layers without a rewrite.
 
 ```
 crates/
   breadcloud-storage/   filesystem-backed storage primitives, no HTTP knowledge
   breadcloud-webdav/    WebDAV (RFC 4918) HTTP layer, built on axum
-  breadcloud-server/    binary: wires storage + webdav into a runnable server
+  breadcloud-caldav/    CalDAV (RFC 4791) HTTP layer, built on axum
+  breadcloud-server/    binary: wires storage + webdav + caldav into one server
 ```
 
 ### breadcloud-storage
@@ -314,6 +316,42 @@ either forced failure and the final state is correct either way -- two
 independent forced failures within one retry arc, not just the single
 forced failure each earlier round's tests added.
 
+#### Calendar storage (`calendar` module, CLOUD-6)
+
+`CalendarStore` is `breadcloud-storage`'s fourth root-sandboxed store,
+alongside `Storage`/`VersionStore`/`TrashStore` -- but a genuinely different
+shape than the other three, because a calendar event is not addressed by a
+served-tree path the way a file is. Layout: one directory per `(user,
+calendar id)` pair, holding an `events/` subdirectory (itself an ordinary
+`Storage` root: one `.ics` file per event, named `<uid>.ics`) plus small
+sidecar bookkeeping files (`display-name`, `color`, `ctag`, `changelog`) kept
+*outside* `events/`, the same "reserved sibling, not a dotfile inside the
+served tree" pattern the uploads/versions/trash roots already use, so a
+listing of a calendar's events never sees its own bookkeeping.
+
+Reusing `Storage` for `events/` rather than writing a second
+content-addressed file store from scratch gets calendar objects `Storage`'s
+existing atomic (temp-file-then-rename) writes and cached, content-derived
+blake3 etags for free -- exactly what CalDAV's `getetag` needs.
+
+`getctag` (the property every real CalDAV client polls to cheaply ask "did
+anything in this calendar change") is a plain decimal counter file, bumped on
+every event create/update/delete: checking it is an O(1) read, never a scan.
+`sync-collection` (RFC 6578) replays an append-only `changelog` (one line per
+change: `<seq>\t<uid>\t<C|D>`) since the sync-token a client presents, deduped
+to each uid's *latest* entry in that range -- an event created then deleted
+within one sync window collapses to "deleted", several updates collapse to
+one "changed", which is exactly the "tell me only the current diff" contract
+the REPORT needs.
+
+A single `tokio::sync::Mutex` guards every mutating operation across the
+*whole* store, not per-calendar. At this deployment's real scale (three
+calendars, on the order of a few hundred events total, one interactive user)
+that is not a contended bottleneck, and it sidesteps an entire class of
+sequence-number races a per-calendar lock map would need careful design to
+rule out (two events landing in the same calendar at once must never be
+assigned the same ctag bump).
+
 ### breadcloud-webdav
 
 Turns a `Storage` into an `axum::Router` implementing RFC 4918: `PROPFIND`,
@@ -432,6 +470,169 @@ Explicitly out of scope for this issue and later epic issues: WebDAV locking
 server derives `oc:fileid` from the path, since there is no persistent
 file-metadata database yet -- see `fileid.rs`).
 
+### breadcloud-caldav (CLOUD-6)
+
+Turns a `breadcloud_storage::CalendarStore` into an `axum::Router`
+implementing the CalDAV surface real clients (DAVx5 on Android, iOS's native
+Calendar account type) actually drive: principal / calendar-home-set
+discovery, `PROPFIND` on calendar collections, `MKCALENDAR`,
+`PUT`/`GET`/`DELETE` on individual `.ics` event resources, and `REPORT` with
+`calendar-query`, `calendar-multiget`, and `sync-collection` (RFC 6578).
+
+**What's reused from `breadcloud-webdav`, and what isn't.** CalDAV is
+WebDAV-derived (RFC 4791 extends RFC 4918: still `PROPFIND`, still a
+`multistatus` response, still HTTP Basic auth over the same kind of
+collection/resource hierarchy), so this crate depends on `breadcloud-webdav`
+and reuses:
+- `breadcloud_webdav::auth::check_basic_auth` for the actual credential
+  check (the base64/header-parsing logic itself, not the middleware wrapper
+  around it -- each crate's own wrapper is generic over that crate's own
+  `axum::State` type, so the wrapper can't literally be shared, only the
+  check it calls);
+- `breadcloud_webdav::xml::request::parse_propfind_body` for parsing a
+  PROPFIND body's requested-property list -- namespace-agnostic local-name
+  matching is exactly as applicable to a calendar property as a file one;
+- `breadcloud_webdav::error::storage_error_response` for mapping a
+  `StorageError` to an HTTP status, since both crates' storage layers mean
+  the same thing by `NotFound`/`Conflict`/etc.
+
+What it does *not* reuse: `ResourceEntry`/`build_multistatus` (built around a
+file's `Metadata` -- kind, length, mtime -- and a fixed WebDAV/Nextcloud
+property set; a principal, a calendar-home-set collection, a calendar
+collection, and a calendar object each have their own small, genuinely
+different property set instead). There is also no `REPORT` support in
+`breadcloud-webdav` to share at all -- WebDAV as implemented there never
+needed it, CalDAV cannot do without it. Calendar objects (`.ics` bytes) are
+stored and served as opaque content; `ical.rs` reads just enough of that
+content (a `UID`, a time range) to answer CalDAV queries, it is not a general
+iCalendar library.
+
+**One HTTP server, not two.** Per the issue's ask, this does not stand up a
+second server process. `breadcloud-server`'s `combined.rs` wires both
+protocols into one axum app on one port: a single top-level fallback asks
+`breadcloud_caldav::owns_path` which protocol a request belongs to
+(`/remote.php/dav/{principals,calendars}`, `/.well-known/caldav`, and the
+bare DAV root are CalDAV's; everything else is WebDAV's -- the two never
+overlap) and calls that crate's plain `dispatch(state, req)` function
+directly, under one shared `middleware::from_fn` auth layer built from the
+same `BREADCLOUD_USER`/`BREADCLOUD_PASS` credentials. Both crates still
+expose their own standalone `router()` (used by each crate's own test
+suite, and available to a caller that only wants one protocol), each with
+its own independent auth layer -- `combined.rs` deliberately does not call
+either, since composing them that way would check credentials twice per
+request. Composing two routers that both only use a top-level `.fallback()`
+does not work cleanly with axum's routing (`nest()`/`fallback_service()`
+compose only when at least one side has concrete, non-fallback routes;
+overriding one fallback-only router's fallback with the other just replaces
+it), which is why the combination happens at the plain-function level in
+`breadcloud-server` instead of by composing `Router`s.
+
+**Calendar storage.** Built on `breadcloud_storage::CalendarStore`
+(documented in that crate's own README section above) rather than a second
+storage concept in this crate: calendars-as-collections-of-events is a
+storage-layer decision, not an HTTP-layer one.
+
+**Bare-root discovery.** `owns_path` deliberately does not claim the bare
+server root (`/`, as opposed to `/remote.php/dav[/]`) -- that path is a
+WebDAV resource (the file tree's own root collection), and WebDAV needs to
+keep answering it normally for WebDAV-only clients. But a real CalDAV
+client configured with nothing more than a server address (DAVx5's and
+iOS's "Calendars" account type, the exact two clients this issue names)
+PROPFINDs that bare root first, looking for `current-user-principal`, and
+falls back to `.well-known/caldav` only when that request *errors* -- not
+when it succeeds without the property. Since WebDAV's own PROPFIND happily
+answers `/` with a valid (if `current-user-principal`-less) `207`, that
+fallback never used to fire, and discovery dead-ended right there (found
+live against `vdirsyncer` pointed at the bare root -- see "Real-client
+verification" below). Fixed additively, entirely in
+`breadcloud-server::combined`, without touching `breadcloud-webdav` at all:
+after `combined::dispatch` falls a bare-root `PROPFIND` through to
+`breadcloud_webdav::dispatch` as before, it splices one extra
+`<d:current-user-principal>` property, pointing at this server's CalDAV
+principal, into that same response before returning it. A WebDAV-only
+client's `/` response is otherwise byte-for-byte what
+`breadcloud-webdav`'s own (separately tested) PROPFIND handler produced --
+this only adds a property, never removes or changes one, and
+`breadcloud-webdav`'s own test suite is untouched by this fix.
+
+**Scope decisions in `ical.rs`, both load-bearing for correctness, not just
+style:**
+- **Timezones are compared as wall-clock digit strings, not resolved
+  against a real tz database.** `DTSTART;TZID=Australia/Sydney:20260115T090000`
+  and a UTC `time-range` bound are compared after stripping the `TZID`
+  parameter, not by actually resolving the zone and adjusting for
+  offset/DST. Accurate enough for a personal deployment where every real
+  calendar's events and every real client's query windows are in the same
+  one or two timezones, and avoids a full tz-database dependency for a
+  pre-filter whose job is "bound roughly this window" -- real clients
+  (DAVx5, iOS) always re-filter and re-render server results against their
+  own tz-aware logic anyway.
+- **A recurring event (`RRULE` present) always passes a time-range filter**,
+  rather than this module expanding the recurrence rule to find actual
+  occurrence instances. Full RFC 5545 recurrence expansion
+  (`FREQ`/`INTERVAL`/`BYDAY`/`COUNT`/`UNTIL`/exceptions) is substantially
+  more machinery than this issue asks for, and getting it subtly wrong would
+  silently drop a recurring event from a client's view of a queried window --
+  a real correctness bug a user would not notice until a meeting they
+  expected to see was missing. Always including it instead means a
+  time-range query on a recurring event is a superset filter (may return
+  more than the exact window), never a subset that silently loses data; RFC
+  4791 9.9 explicitly allows a server to return a superset, and both DAVx5
+  and iOS already do their own recurrence expansion client-side for display
+  regardless of what the server pre-filtered.
+- `xml/request.rs`'s REPORT body parser is a flat scan (first non-`VCALENDAR`
+  `comp-filter`, first `time-range`, anywhere in the body), not a
+  structurally-validating nested parser -- real clients always send the
+  canonical `VCALENDAR > VEVENT|VTODO [> time-range]` shape RFC 4791's own
+  examples use, so a flat scan finds the same element a structural parser
+  would, with much less code. Similarly, this server does not implement RFC
+  4791 9.7's full general filter grammar (property text-match filters,
+  nested `AND`/`OR` combinations of multiple component filters) -- DAVx5 and
+  iOS's Calendar app do not send it in practice.
+- `xml/response.rs` always answers the full property set this server knows
+  for a given resource kind, regardless of exactly which properties a
+  PROPFIND's `<d:prop>` named (still honoring a bare `<d:propname/>` request
+  -- names only, no values). Unlike `breadcloud-webdav`'s PROPFIND (which
+  precisely honors an exact requested-property list, because a real
+  Nextcloud desktop client's second sync pass depends on getting an exact
+  404 for a handful of specific unsupported properties), neither DAVx5 nor
+  iOS's Calendar app depends on selective per-property 404s here.
+
+**Multi-calendar and discovery.** At least personal/family/school are
+bootstrapped on server startup (`breadcloud-server`'s `ensure_calendar`
+calls, idempotent across restarts); more can be created at any time via
+`MKCALENDAR`. Discovery follows the real chain both DAVx5 and iOS's Calendar
+account type walk: `.well-known/caldav` redirects to the DAV root, `PROPFIND`
+there answers `current-user-principal`, `PROPFIND` on the principal resource
+answers `calendar-home-set`, and `PROPFIND` (Depth 0 or 1) on the
+calendar-home-set collection lists every calendar under it with `getctag`,
+`calendar-color`, and `supported-calendar-component-set`.
+`breadcloud-webdav`'s existing `handlers::discovery` (status.php, OCS
+capabilities/user) is WebDAV/Nextcloud-client-specific and unrelated to this
+chain -- CalDAV discovery needed its own properties (`current-user-principal`,
+`calendar-home-set`) on its own resources (a principal, a calendar
+collection), not an extension of the file-tree discovery endpoints. A client
+that starts this chain at the bare server root rather than the `/remote.php/dav/`
+CalDAV root gets `current-user-principal` there too -- see
+`breadcloud-server`'s "Bare-root discovery" section below for why that needed
+its own fix.
+
+**A real client surfaced a real gap: PROPFIND Depth 1 on a calendar
+collection must list its event resources, not just its own properties.**
+The initial implementation only ever answered a calendar collection's own
+properties on PROPFIND, on the assumption clients would always use `REPORT`
+to enumerate events. Live-testing against `vdirsyncer` (see "Real-client
+verification" below) found this wrong: vdirsyncer's CalDAV storage backend
+uses a plain PROPFIND Depth 1 on the calendar collection itself -- the same
+"list this collection's immediate members" idiom an ordinary WebDAV PROPFIND
+Depth 1 uses -- to enumerate a calendar's objects, and saw every calendar as
+permanently empty without it (`"Storage ... was completely emptied"`). Fixed
+by having Depth 1 also render each child event resource (href + `getetag`,
+`crate::xml::response::calendar_collection_multistatus`'s `children`
+parameter) -- this server now supports enumeration via either Depth 1
+PROPFIND or `REPORT`, since real clients are not consistent about which they
+prefer.
+
 ### breadcloud-server
 
 Thin binary. Configuration is environment variables:
@@ -442,8 +643,13 @@ Thin binary. Configuration is environment variables:
 | `BREADCLOUD_UPLOADS_ROOT` | system temp dir + `breadcloud-uploads` | Staging area for in-progress chunked uploads (created if missing). Deliberately outside `BREADCLOUD_ROOT`, not just dot-hidden inside it, so it can never appear in a PROPFIND of the served tree |
 | `BREADCLOUD_VERSIONS_ROOT` | `./breadcloud-versions` | Per-file version history root (created if missing), outside `BREADCLOUD_ROOT` for the same reason as uploads staging. Unlike uploads staging this needs to persist across restarts, so it defaults to a sibling directory rather than the system temp dir |
 | `BREADCLOUD_TRASH_ROOT` | `./breadcloud-trash` | Soft-delete trash root (created if missing), outside `BREADCLOUD_ROOT` for the same reason as uploads staging and version history, and (like version history) needs to persist across restarts, so it also defaults to a sibling directory rather than the system temp dir |
+| `BREADCLOUD_CALENDARS_ROOT` | `./breadcloud-calendars` | Calendar storage root (created if missing), outside `BREADCLOUD_ROOT` for the same reason as uploads/versions/trash, and (like versions/trash) needs to persist across restarts, so it also defaults to a sibling directory rather than the system temp dir |
 | `BREADCLOUD_BIND` | `127.0.0.1:8080` | Address to listen on |
-| `BREADCLOUD_USER` / `BREADCLOUD_PASS` | unset | HTTP Basic auth credentials. If either is unset, the server runs open (fine for `127.0.0.1`, never for anything reachable off localhost) |
+| `BREADCLOUD_USER` / `BREADCLOUD_PASS` | unset | HTTP Basic auth credentials, shared by both the WebDAV and CalDAV surfaces (one shared auth gate -- see `combined.rs` above). If either is unset, the server runs open (fine for `127.0.0.1`, never for anything reachable off localhost) |
+
+`BREADCLOUD_USER` (or `dev` if unset) also names the owner the baseline
+personal/family/school calendars are bootstrapped under on startup -- see
+`breadcloud-caldav`'s section above.
 
 ## Running locally
 
@@ -500,6 +706,68 @@ iOS. Nextcloud's desktop client (mirall) specifically wants
 `status.php` and the DAV mount (`/remote.php/dav/files/<user>/...`) itself,
 and the mount prefix is handled transparently either way (see
 `split_mount_prefix` in `lib.rs`).
+
+CalDAV (CLOUD-6) runs on the same server and port. The startup log lists the
+calendars root; `personal`/`family`/`school` are bootstrapped automatically:
+
+```bash
+# discover the current-user-principal
+curl -u dev:dev -X PROPFIND -H "Depth: 0" http://127.0.0.1:8080/remote.php/dav/
+
+# discover calendar-home-set from the principal
+curl -u dev:dev -X PROPFIND -H "Depth: 0" http://127.0.0.1:8080/remote.php/dav/principals/dev/
+
+# list every calendar (Depth 1) with getctag/color/supported components
+curl -u dev:dev -X PROPFIND -H "Depth: 1" http://127.0.0.1:8080/remote.php/dav/calendars/dev/
+
+# create an event
+curl -u dev:dev -X PUT --data-binary @- \
+  http://127.0.0.1:8080/remote.php/dav/calendars/dev/personal/example-1.ics <<'EOF'
+BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:example-1
+DTSTART:20260401T090000Z
+DTEND:20260401T100000Z
+SUMMARY:Example event
+END:VEVENT
+END:VCALENDAR
+EOF
+
+# list a calendar's events directly (Depth 1 PROPFIND on the calendar itself)
+curl -u dev:dev -X PROPFIND -H "Depth: 1" \
+  http://127.0.0.1:8080/remote.php/dav/calendars/dev/personal/
+
+# ...or fetch matching events via REPORT calendar-query (a time-range filter)
+curl -u dev:dev -X REPORT --data '<?xml version="1.0"?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:getetag/><c:calendar-data/></d:prop>
+  <c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT">
+    <c:time-range start="20260301T000000Z" end="20260501T000000Z"/>
+  </c:comp-filter></c:comp-filter></c:filter>
+</c:calendar-query>' http://127.0.0.1:8080/remote.php/dav/calendars/dev/personal/
+
+# incremental sync (RFC 6578) -- an empty <d:sync-token/> means "initial sync,
+# give me everything and a fresh token"; the response's own <d:sync-token>
+# is what a client presents next time to get only what changed since
+curl -u dev:dev -X REPORT --data '<?xml version="1.0"?>
+<d:sync-collection xmlns:d="DAV:">
+  <d:sync-token/><d:prop><d:getetag/></d:prop>
+</d:sync-collection>' http://127.0.0.1:8080/remote.php/dav/calendars/dev/personal/
+
+# delete it
+curl -u dev:dev -X DELETE \
+  http://127.0.0.1:8080/remote.php/dav/calendars/dev/personal/example-1.ics
+```
+
+Or point a real CalDAV client at the server: DAVx5 (Android) and iOS's native
+"Calendars" account type both take just the bare server address
+(`http://127.0.0.1:8080/`, the way both are normally configured -- neither
+client makes you type a DAV path) plus the same Basic-auth credentials and
+discover the calendars automatically, via `current-user-principal` answered
+right at that bare root (see "Bare-root discovery" above for why this needed
+its own fix beyond the basic discovery chain). The full `/remote.php/dav/`
+URL works too, and both are covered in "Real-client verification" below.
 
 ## Testing
 
@@ -712,10 +980,108 @@ producing a client-side "conflicted copy" rather than a silent overwrite. Tempor
 request-logging instrumentation used to discover the exact request sequence
 was removed before finishing; none of it is in this codebase.
 
+### CalDAV coverage (CLOUD-6)
+
+`breadcloud-caldav`'s own unit tests (`ical.rs`, `path.rs`, `xml/request.rs`,
+`xml/response.rs`) cover: UID extraction and line-unfolding, component-type
+detection, time-range overlap including the half-open-interval boundary
+cases, all-day (`VALUE=DATE`) events with no explicit `DTEND`, `DURATION`-based
+end times, and recurring (`RRULE`) events always matching; CalDAV path
+parsing for every resource shape and its rejections; REPORT body parsing for
+all three shapes (`calendar-multiget`, `calendar-query` with and without a
+time-range, `sync-collection` with and without a token) plus an unrecognized
+REPORT type; MKCALENDAR body parsing; and multistatus response building for
+every resource kind, including `PropfindRequest::PropName` (names only).
+
+`tests/caldav_test.rs` drives the real `axum::Router` end to end via
+`tower::ServiceExt::oneshot`, simulating the request sequence a real client
+actually issues: `current-user-principal` discovery, principal
+`calendar-home-set` discovery, calendar-home-set listing at Depth 0 and 1,
+MKCALENDAR (including rejecting a duplicate id with 405), PUT/GET/DELETE on
+events (including a missing-UID body rejected with 400 and a PUT into a
+nonexistent calendar rejected with 409), `getctag` bumping on every event
+create/update/delete, `REPORT calendar-query` filtering by time-range,
+`REPORT calendar-multiget` fetching only the explicit hrefs given, `REPORT
+sync-collection` doing a correct initial sync (live resources only, no
+tombstones) followed by a correct incremental sync (only what changed,
+deletions reported as 404, a new sync-token), Basic auth rejecting missing
+and wrong credentials, `.well-known/caldav`'s redirect, `OPTIONS`
+advertising the `calendar-access` DAV class, a Depth 1 PROPFIND on a
+calendar collection listing its event children (the real-client-discovered
+regression described in `breadcloud-caldav`'s own README section above), and
+a `full_discovery_to_sync_sequence` test that chains discovery -> MKCALENDAR
+-> multiple PUTs -> `calendar-query` -> `sync-collection` in one sequence,
+mirroring a real client's actual flow end to end.
+
+`breadcloud-storage`'s own unit tests cover `CalendarStore` directly:
+create/list/get roundtrips, duplicate-id rejection, idempotent bootstrap
+(`ensure_calendar`), calendar-id traversal rejection, `events_storage`
+requiring an existing calendar, ctag bumping on every recorded change, and
+`changes_since` both deduping to each uid's latest state and correctly
+filtering to only entries newer than a given token.
+
+### Real-client verification (CLOUD-6)
+
+DAVx5 and iOS were not available on this machine, so this was verified
+against `vdirsyncer` (already installed on this machine; a real, widely-used
+CalDAV/CardDAV sync client, not a purpose-built test harness), pointed at a
+disposable local server instance with disposable local storage -- never at
+any real calendar data. Covered end to end, with `vdirsyncer` pointed at the
+**bare server root** (`http://127.0.0.1:8099/`, not `/remote.php/dav/` --
+the address DAVx5's and iOS's "just enter a server address" setup actually
+uses, and the exact scenario a change-request review round found broken,
+see "Bare-root discovery" above): `vdirsyncer discover` finding all three
+calendars (`personal`/`family`/`school`) purely through this server's
+`current-user-principal` -> `calendar-home-set` -> calendar-listing
+discovery chain starting from that bare address, with no manual DAV path
+needed; a local `.ics` file uploaded to the server via `vdirsyncer sync` and
+confirmed present via a server-side `PROPFIND` Depth 1; an event created
+directly on the server via `curl PUT` and correctly downloaded to the local
+side on the next sync; `vdirsyncer` correctly recognizing identical content
+on both sides as "nothing to do" (a false-conflict check) rather than
+re-uploading; and a local deletion propagating to the server as a real
+`DELETE` that a subsequent `GET` then correctly 404s.
+
+This live pass is what caught the Depth 1 PROPFIND gap documented in
+`breadcloud-caldav`'s own README section: the first implementation passed
+every test in this crate's own suite (which, being written by the same
+implementation, shared its blind spot) but failed immediately against
+`vdirsyncer`, which showed every calendar as permanently empty. Fixed, then
+re-verified against `vdirsyncer` again through a full
+discover/sync/upload/download/delete cycle. A later change-request review
+round caught the separate bare-root gap described above (discovery worked
+against `/remote.php/dav/` but not the bare address DAVx5/iOS actually use);
+fixed, then the entire discover/upload/no-op/download/delete cycle above was
+re-run pointed at the bare root specifically, which is the version reflected
+above.
+
+Separately smoke-tested at moderate scale (50 events PUT into one calendar
+via a loop of plain `curl` requests, matching the order of magnitude the
+issue's real data implies -- 171/106/22 events across three calendars): a
+Depth 1 PROPFIND listing all 50 plus the collection itself completed in
+single-digit milliseconds, and `getctag` correctly read back as `50` after
+50 recorded changes. This did not use real personal calendar data --
+synthetic events only, on disposable scratch directories removed afterward
+-- since importing the real 171/106/22-event calendars into a running
+instance was not something this task was asked to do and touching real
+personal calendar content without being asked would be scope creep beyond
+implementing and verifying the protocol.
+
+**Not live-verified**: DAVx5 (Android) and iOS's native Calendar account
+type specifically -- neither device/emulator was available on this machine.
+Both are implemented against the documented RFC 4791/6578 protocol and the
+specific request shapes those two clients are known to send (the
+`comp-filter`/`time-range` shape, `sync-collection` with/without a token,
+Depth 1 PROPFIND-based enumeration alongside REPORT-based enumeration), and
+`vdirsyncer`'s own CalDAV storage backend exercises a materially similar
+protocol surface, but a real DAVx5/iOS pass has not happened. Flagged here
+explicitly per the issue's own ask to be clear about what was and wasn't
+live-verified.
+
 ## What's next in the epic
 
 See the CLOUD project on breadboard for the full epic. In rough order after
-CLOUD-5: CalDAV, CardDAV, notes, multi-user auth + per-user quotas (replacing
+CLOUD-6: CardDAV, notes, multi-user auth + per-user quotas (replacing
 the placeholder Basic auth here, and giving `fileid.rs` a real persistent id
 to hand out instead of a path-derived one -- which would also let the
 versions and trashbin DAV surfaces move to a real `<fileid>`-keyed layout

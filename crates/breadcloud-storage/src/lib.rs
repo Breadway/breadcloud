@@ -4,14 +4,21 @@
 //! wrapper around `tokio::fs` that a) sandboxes every operation to a root
 //! directory via [`DavPath`], and b) exposes the outcomes (created vs.
 //! overwritten, conflict vs. not-found) that RFC 4918 needs to pick the
-//! right status code. Anything built on top (WebDAV today, CalDAV/CardDAV
-//! later) talks to storage only through this API.
+//! right status code. Anything built on top (WebDAV, CalDAV, CardDAV
+//! later) talks to storage only through this API. `calendar` (CLOUD-6)
+//! is the one exception to "sandboxed to a root via `DavPath`": a
+//! calendar event is not addressed by a served-tree path the way a file
+//! is, so [`CalendarStore`] builds its own small root-sandboxed layout
+//! instead, reusing [`Storage`] itself for each calendar's actual `.ics`
+//! files -- see `calendar`'s module doc comment.
 
+pub mod calendar;
 pub mod error;
 pub mod path;
 pub mod trash;
 pub mod versions;
 
+pub use calendar::{CalendarInfo, CalendarStore, ChangeEntry};
 pub use error::StorageError;
 pub use path::DavPath;
 pub use trash::{TrashEntry, TrashStore, DEFAULT_TRASH_MAX_AGE, DEFAULT_TRASH_MAX_TOTAL_BYTES};

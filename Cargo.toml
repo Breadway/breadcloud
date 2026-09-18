@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/breadcloud-storage",
     "crates/breadcloud-webdav",
+    "crates/breadcloud-caldav",
     "crates/breadcloud-server",
 ]
 
