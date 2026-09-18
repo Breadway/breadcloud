@@ -26,6 +26,23 @@ pub struct AppState {
     /// restores, and purges entries.
     pub trash: Arc<TrashStore>,
     pub auth: Option<BasicAuthConfig>,
+    /// This account's storage quota in bytes (CLOUD-11). `None` means
+    /// unlimited -- the pre-CLOUD-11 default, still what a standalone/test
+    /// `AppState` gets unless a caller opts in with
+    /// [`AppState::with_quota_limit`]. See `Storage::quota_report` and
+    /// `Storage::check_quota`, which are what actually consult this.
+    pub quota_limit_bytes: Option<u64>,
+    /// The username this already-resolved `AppState` belongs to (CLOUD-11).
+    /// Distinct from `auth` (which is "credentials to check on this
+    /// crate's own standalone auth gate") -- in the real combined server,
+    /// `AppState` is resolved to one specific account *before* any
+    /// handler runs (see `breadcloud-server::combined`), and `auth` is
+    /// `None` there since authentication happens once, centrally, ahead
+    /// of that resolution. Handlers that need to know "whose data is
+    /// this" (the OCS `cloud/user` endpoint) read this field, falling
+    /// back to `auth`'s username for standalone/test use where `owner`
+    /// is never set.
+    pub owner: Option<String>,
 }
 
 /// Placeholder single-user credentials. CLOUD-11 replaces this with real
@@ -50,6 +67,8 @@ impl AppState {
             versions: Arc::new(versions),
             trash: Arc::new(trash),
             auth: None,
+            quota_limit_bytes: None,
+            owner: None,
         }
     }
 
@@ -61,6 +80,20 @@ impl AppState {
             username: username.into(),
             password: password.into(),
         });
+        self
+    }
+
+    /// Set this account's storage quota (CLOUD-11). See
+    /// `AppState::quota_limit_bytes`.
+    pub fn with_quota_limit(mut self, quota_limit_bytes: u64) -> Self {
+        self.quota_limit_bytes = Some(quota_limit_bytes);
+        self
+    }
+
+    /// Mark this already-resolved `AppState` as belonging to `username`
+    /// (CLOUD-11). See `AppState::owner`.
+    pub fn with_owner(mut self, username: impl Into<String>) -> Self {
+        self.owner = Some(username.into());
         self
     }
 }

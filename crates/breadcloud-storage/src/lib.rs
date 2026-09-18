@@ -133,6 +133,17 @@ impl PreparedAssembly {
         self.existed
     }
 
+    /// The total assembled size, already validated against
+    /// `OC-Total-Length` (if the client sent one) by
+    /// `Storage::prepare_assemble`. Used by callers that need to
+    /// quota-check (CLOUD-11) a chunked upload's finalize before
+    /// committing it -- the content is already fully staged in a temp
+    /// file at this point, so its exact size is known without reading
+    /// anything back off disk.
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
     /// Discard this prepared assembly without ever touching its
     /// destination, cleaning up the temp file.
     pub async fn discard(self) {
@@ -148,14 +159,30 @@ impl PreparedAssembly {
 #[derive(Debug, Clone)]
 pub struct Storage {
     root: PathBuf,
+    /// Where [`Storage::prepare_assemble`] stages a chunked upload's fully
+    /// assembled content before it is committed into `root` (CLOUD-11
+    /// round 3 rework). A sibling of `root`, not a subdirectory of it --
+    /// see [`sibling_staging_root`] for why.
+    staging_root: PathBuf,
     etag_cache: Arc<Mutex<HashMap<PathBuf, CachedEtag>>>,
+    /// Serializes `check_quota`-then-write sequences for this account
+    /// (CLOUD-11): see [`Storage::quota_gate`], which is the only thing
+    /// that ever locks this. Each account gets its own `Storage` instance
+    /// (its own root, its own clone of this `Arc`), so this never
+    /// serializes anything across accounts, only concurrent quota-gated
+    /// writes to this one account's tree.
+    quota_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Storage {
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let staging_root = sibling_staging_root(&root);
         Storage {
-            root: root.into(),
+            root,
+            staging_root,
             etag_cache: Arc::new(Mutex::new(HashMap::new())),
+            quota_mutex: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -378,8 +405,8 @@ impl Storage {
     /// let the client retry rather than silently accepting a truncated or
     /// overlong file.
     /// Validate `chunk_files` against `dest` and assemble them into a temp
-    /// file next to it, without touching `dest` itself. Every failure mode
-    /// that depends on the state of `dest` or the chunks (an `Overwrite: F`
+    /// file, without touching `dest` itself. Every failure mode that
+    /// depends on the state of `dest` or the chunks (an `Overwrite: F`
     /// conflict, an `OC-Total-Length` mismatch, a chunk that vanished mid-
     /// assembly) surfaces here, before any caller-visible content is
     /// replaced.
@@ -389,6 +416,20 @@ impl Storage {
     /// taking a version snapshot (CLOUD-4) -- strictly between this call
     /// succeeding and [`Storage::commit_assemble`]. Call [`PreparedAssembly::discard`]
     /// instead of committing if that intervening step fails.
+    ///
+    /// The assembled content is staged in `self.staging_root` (a sibling
+    /// of `self.root`, see [`sibling_staging_root`]), not inside `self.root`
+    /// next to `dest`'s parent. CLOUD-11 round 3: staging it inside `root`
+    /// meant a quota check that ran between this call and
+    /// [`Storage::commit_assemble`] (necessarily after this call, since
+    /// the assembled size is only known once assembly is done) would walk
+    /// right over the still-staged temp file via `used_bytes`'s recursive
+    /// tally, counting the about-to-be-committed bytes once as "already on
+    /// disk" and a second time as the incoming write, and wrongly reject
+    /// uploads at roughly half their real allowed size. Staging outside
+    /// `root` entirely removes that double count structurally, with no
+    /// exclusion-list logic for `tally` to get wrong or fall out of sync
+    /// with a future staging-file naming change.
     pub async fn prepare_assemble(
         &self,
         dest: &DavPath,
@@ -419,7 +460,10 @@ impl Storage {
             return Err(StorageError::AlreadyExists);
         }
 
-        let tmp_path = parent_fs.join(format!(".breadcloud-tmp-{}", tmp_suffix()));
+        fs::create_dir_all(&self.staging_root).await?;
+        let tmp_path = self
+            .staging_root
+            .join(format!(".breadcloud-tmp-{}", tmp_suffix()));
         let result = assemble_into(&tmp_path, chunk_files, expected_total).await;
         let (total, hash) = match result {
             Ok(v) => v,
@@ -618,7 +662,11 @@ impl Storage {
         })
     }
 
-    /// Disk usage of the volume backing the storage root.
+    /// Disk usage of the volume backing the storage root. Filesystem-level,
+    /// not user-level: this is what a `Storage` with no configured
+    /// per-user quota limit reports (a single-account deployment, or a
+    /// standalone test/dev instance -- see `Storage::quota_report`, which
+    /// is what CLOUD-11's multi-user handlers actually call).
     pub fn quota(&self) -> Result<Quota, StorageError> {
         let total = fs2::total_space(&self.root)?;
         let available = fs2::available_space(&self.root)?;
@@ -627,7 +675,154 @@ impl Storage {
             available_bytes: available,
         })
     }
+
+    /// Total bytes of every file under this root, recursively. This is
+    /// "how much of this user's own quota has this Storage instance's
+    /// tree consumed" (CLOUD-11): since each account gets its own
+    /// root-sandboxed `Storage`, walking the whole tree is walking exactly
+    /// that account's live data, nothing else. Deliberately does not
+    /// include this instance's own version history or trash (those are
+    /// separate `VersionStore`/`TrashStore` roots with their own,
+    /// independent retention caps already bounding their size -- see the
+    /// README's "Multi-user accounts" section for why quota is scoped to
+    /// the live served tree, not those too).
+    ///
+    /// Reuses the same recursive walk [`copy_verified`]'s size check
+    /// already needed (`tally`), rather than a second directory-walking
+    /// implementation: this and that call are answering the same
+    /// question ("how many bytes live under this path"), just for
+    /// different roots.
+    ///
+    /// A chunked upload's in-flight assembly (`Storage::prepare_assemble`)
+    /// never appears in this walk: it stages content in
+    /// `self.staging_root`, a sibling of `root` rather than anything
+    /// under it (CLOUD-11 round 3 rework -- see [`sibling_staging_root`]).
+    /// This call needs no awareness of that staging area at all, which is
+    /// the point: nothing here has to stay in sync with wherever
+    /// `prepare_assemble` happens to put its temp files.
+    pub async fn used_bytes(&self) -> Result<u64, StorageError> {
+        let (_count, bytes) = tally(&self.root).await?;
+        Ok(bytes)
+    }
+
+    /// The quota this Storage instance should report on a PROPFIND
+    /// (CLOUD-11): given a per-user limit, `used_bytes` against it rather
+    /// than the whole-volume figure [`Storage::quota`] reports. `None`
+    /// (no configured limit -- a single-account or standalone/test
+    /// instance) falls back to that whole-volume figure exactly as
+    /// before CLOUD-11, so a deployment that never opts into per-user
+    /// quotas keeps reporting the same thing it always did.
+    pub async fn quota_report(&self, limit_bytes: Option<u64>) -> Result<Quota, StorageError> {
+        match limit_bytes {
+            Some(limit) => {
+                let used = self.used_bytes().await?;
+                Ok(Quota {
+                    used_bytes: used,
+                    available_bytes: limit.saturating_sub(used),
+                })
+            }
+            None => self.quota(),
+        }
+    }
+
+    /// Whether writing `incoming_len` bytes to `path` would push this
+    /// account's live tree over `limit_bytes` (CLOUD-11). Nets out
+    /// `path`'s own current size first when it already exists -- an
+    /// overwrite replaces those bytes, it does not add to them on top of
+    /// what is already counted in `used_bytes`, so a same-size or smaller
+    /// overwrite of an existing file is never incorrectly rejected once
+    /// a user is already right at their limit.
+    ///
+    /// Callers must run this, and act on `Err(StorageError::QuotaExceeded)`,
+    /// strictly *before* any write that would mutate `path` or commit new
+    /// content (`write_bytes`, `commit_assemble`): everything this method
+    /// touches is read-only (a metadata stat and a recursive size walk),
+    /// so a rejection here is guaranteed to leave `path` and every other
+    /// resource in this tree completely untouched -- no partial write, no
+    /// corrupted existing content, exactly the property a quota-rejected
+    /// write must have.
+    ///
+    /// This alone is not safe under concurrency: two callers can both call
+    /// this, both see room, and both then write, together blowing past
+    /// the limit (a plain TOCTOU race -- see CLOUD-11's rework history).
+    /// A caller that is actually about to write, rather than just report a
+    /// number (e.g. a PROPFIND's `quota-used-bytes`), must go through
+    /// [`Storage::quota_gate`] instead, which wraps this exact check in
+    /// the serialization needed to close that window.
+    pub async fn check_quota(
+        &self,
+        limit_bytes: u64,
+        path: &DavPath,
+        incoming_len: u64,
+    ) -> Result<(), StorageError> {
+        let existing_len = match self.metadata(path).await {
+            Ok(meta) if !meta.is_dir() => meta.len,
+            _ => 0,
+        };
+        let used = self.used_bytes().await?;
+        let used_after = used
+            .saturating_sub(existing_len)
+            .saturating_add(incoming_len);
+        if used_after > limit_bytes {
+            return Err(StorageError::QuotaExceeded {
+                limit: limit_bytes,
+                used_after,
+            });
+        }
+        Ok(())
+    }
+
+    /// The safe entry point for a quota-gated write (CLOUD-11): closes the
+    /// TOCTOU window a bare [`Storage::check_quota`] call leaves open by
+    /// acquiring this account's own async mutex first, then running
+    /// `check_quota` while holding it, and handing the caller back a
+    /// [`QuotaGuard`] that keeps the lock held until the caller drops it.
+    /// A second concurrent call against this same `Storage` instance
+    /// blocks on the mutex until the first caller's guard is dropped --
+    /// which callers must not do until the write `check_quota` just
+    /// approved has actually landed (or been abandoned) -- so the second
+    /// call's own `check_quota` always sees the first write's bytes
+    /// already counted in `used_bytes`, and the two can never both
+    /// observe "room available" for overlapping capacity.
+    ///
+    /// On `Err` (quota exceeded, or `check_quota`'s own I/O failure) the
+    /// lock is released immediately: the guard is only ever constructed
+    /// on success, so a rejected caller never has to remember to drop
+    /// anything.
+    ///
+    /// This is the one implementation both the plain PUT path
+    /// (`breadcloud-webdav::handlers::put`) and the chunked-upload
+    /// finalize path (`breadcloud-webdav::handlers::uploads::finalize`)
+    /// go through, rather than two independent ad-hoc locks that could
+    /// drift out of sync with each other -- see the `move_path` docs
+    /// above for what that pattern has cost this codebase before
+    /// (CLOUD-5's five rework rounds over duplicated cross-root move
+    /// logic).
+    ///
+    /// Different accounts never contend on this: each account gets its
+    /// own `Storage` instance (its own root, its own `quota_mutex`), so
+    /// concurrent writes to *different* accounts still proceed fully in
+    /// parallel. Only concurrent quota-gated writes to the *same* account
+    /// serialize.
+    pub async fn quota_gate(
+        &self,
+        limit_bytes: u64,
+        path: &DavPath,
+        incoming_len: u64,
+    ) -> Result<QuotaGuard, StorageError> {
+        let guard = self.quota_mutex.clone().lock_owned().await;
+        self.check_quota(limit_bytes, path, incoming_len).await?;
+        Ok(QuotaGuard(guard))
+    }
 }
+
+/// RAII guard returned by [`Storage::quota_gate`] on success. Holds this
+/// account's quota mutex; the caller must keep it alive (bind it to a
+/// named variable, not `_`) until the write it was granted for has
+/// completed or been abandoned, then let it drop (explicitly, or by
+/// falling out of scope). Dropping it any earlier re-opens the exact
+/// TOCTOU window `quota_gate` exists to close.
+pub struct QuotaGuard(#[allow(dead_code)] tokio::sync::OwnedMutexGuard<()>);
 
 fn to_metadata(meta: &std::fs::Metadata) -> Metadata {
     Metadata {
@@ -727,6 +922,41 @@ fn tmp_suffix() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{:x}-{:x}", nanos, std::process::id())
+}
+
+/// Where [`Storage::prepare_assemble`] stages a chunked upload's fully
+/// assembled content before [`Storage::commit_assemble`] lands it in the
+/// live tree (CLOUD-11 round 3 rework).
+///
+/// Deliberately a *sibling* of `root` (same parent directory, different
+/// path), not a subdirectory of it:
+///
+/// - Structurally outside `used_bytes`'s recursive walk of `root`, so an
+///   in-flight assembly can never be counted as "already on disk" quota
+///   usage. This needs no exclusion list inside `tally` (which also backs
+///   `copy_verified`'s cross-root copy check, CLOUD-5, and stays
+///   unaware of this reserved name entirely) that a future rename or
+///   staging-name change could silently stop matching.
+/// - Unreachable through [`Storage::resolve`], which only ever builds
+///   paths under `root`: no `DavPath` a client sends, however it is
+///   percent-encoded or cased, can ever land here, unlike a same-tree
+///   dotfile/dot-directory naming convention a client could in principle
+///   collide with by naming a real resource the same thing.
+/// - On the same filesystem as `root` (same parent directory), so
+///   `commit_assemble`'s `fs::rename` into the live tree stays a single
+///   atomic filesystem-local rename. This staging area is intentionally
+///   *not* `AppState::uploads`'s already-separate chunk-staging root:
+///   that root is independently configured (`BREADCLOUD_UPLOADS_ROOT`,
+///   defaulting to the system temp dir) and not guaranteed to share a
+///   filesystem with `root`. Renaming across a filesystem boundary either
+///   fails outright (`EXDEV`) or forces a non-atomic copy-then-delete,
+///   which would reopen exactly the "`dest` is never observed partially
+///   written" guarantee `commit_assemble`'s docs promise.
+fn sibling_staging_root(root: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(root.file_name().unwrap_or_default());
+    name.push("-assembly-staging");
+    root.with_file_name(name)
 }
 
 /// # Cross-root move safety
@@ -1719,5 +1949,212 @@ mod tests {
             !dest.exists(),
             "dest was never actually restored, so it must not appear to exist"
         );
+    }
+
+    #[tokio::test]
+    async fn used_bytes_sums_every_file_recursively() {
+        let (_dir, storage) = storage().await;
+        storage
+            .write_bytes(&DavPath::parse("/a.txt").unwrap(), b"12345")
+            .await
+            .unwrap();
+        storage
+            .mkcol(&DavPath::parse("/sub").unwrap())
+            .await
+            .unwrap();
+        storage
+            .write_bytes(&DavPath::parse("/sub/b.txt").unwrap(), b"1234567890")
+            .await
+            .unwrap();
+
+        assert_eq!(storage.used_bytes().await.unwrap(), 15);
+    }
+
+    #[tokio::test]
+    async fn check_quota_rejects_a_write_over_the_limit() {
+        let (_dir, storage) = storage().await;
+        storage
+            .write_bytes(&DavPath::parse("/existing.txt").unwrap(), b"12345")
+            .await
+            .unwrap();
+
+        let err = storage
+            .check_quota(10, &DavPath::parse("/new.txt").unwrap(), 10)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::QuotaExceeded { .. }));
+        // The rejected write must never have touched disk.
+        assert!(!storage.exists(&DavPath::parse("/new.txt").unwrap()).await);
+    }
+
+    #[tokio::test]
+    async fn check_quota_allows_a_write_within_the_limit() {
+        let (_dir, storage) = storage().await;
+        storage
+            .check_quota(10, &DavPath::parse("/new.txt").unwrap(), 10)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn check_quota_nets_out_the_target_s_own_existing_size_on_overwrite() {
+        let (_dir, storage) = storage().await;
+        let path = DavPath::parse("/f.txt").unwrap();
+        storage.write_bytes(&path, b"1234567890").await.unwrap(); // 10 bytes, right at the limit
+
+        // Overwriting the same file with content the same size must not
+        // be rejected as if the new bytes were added on top of the old
+        // ones still counted in `used_bytes`.
+        storage.check_quota(10, &path, 10).await.unwrap();
+
+        // But a genuinely larger overwrite still gets rejected.
+        let err = storage.check_quota(10, &path, 11).await.unwrap_err();
+        assert!(matches!(err, StorageError::QuotaExceeded { .. }));
+    }
+
+    /// The bug this whole CLOUD-11 rework closes, exercised directly
+    /// against the serialization primitive rather than through HTTP: a
+    /// bare `check_quota` call has no way to stop two concurrent callers
+    /// each individually well under a limit from both proceeding and
+    /// together blowing past it. `quota_gate` must close that window by
+    /// serializing the check-then-write sequence per `Storage` instance.
+    ///
+    /// Uses a real multi-threaded runtime and holds each guard across a
+    /// short sleep (standing in for the write itself taking a moment) so
+    /// the two tasks are genuinely overlapping in time, not just racing
+    /// the test executor's scheduling order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quota_gate_prevents_two_concurrent_writes_from_together_exceeding_the_limit() {
+        let (_dir, storage) = storage().await;
+        let limit = 1000u64;
+
+        let storage_a = storage.clone();
+        let storage_b = storage.clone();
+
+        let task_a = tokio::spawn(async move {
+            let path = DavPath::parse("/a.bin").unwrap();
+            match storage_a.quota_gate(limit, &path, 700).await {
+                Ok(guard) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    storage_a.write_bytes(&path, &vec![0u8; 700]).await.unwrap();
+                    drop(guard);
+                    true
+                }
+                Err(_) => false,
+            }
+        });
+        let task_b = tokio::spawn(async move {
+            let path = DavPath::parse("/b.bin").unwrap();
+            match storage_b.quota_gate(limit, &path, 700).await {
+                Ok(guard) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    storage_b.write_bytes(&path, &vec![0u8; 700]).await.unwrap();
+                    drop(guard);
+                    true
+                }
+                Err(_) => false,
+            }
+        });
+
+        let (a_ok, b_ok) = tokio::join!(task_a, task_b);
+        let a_ok = a_ok.unwrap();
+        let b_ok = b_ok.unwrap();
+
+        // Each write (700 bytes) is individually well under the
+        // 1000-byte limit; only their sum (1400) exceeds it. Both
+        // succeeding is exactly the race this test guards against.
+        assert_ne!(
+            a_ok, b_ok,
+            "exactly one of the two concurrent 700-byte writes against a 1000-byte quota \
+             must be accepted, the other rejected"
+        );
+
+        let used = storage.used_bytes().await.unwrap();
+        assert!(
+            used <= limit,
+            "final on-disk usage {used} must never exceed the {limit}-byte quota"
+        );
+    }
+
+    /// CLOUD-11 round 3: a real bug distinct from the round-2 TOCTOU race
+    /// above, found with zero concurrency involved. `prepare_assemble`
+    /// stages a chunked upload's fully assembled content into a temp file
+    /// before its caller can run `quota_gate` (the exact size is only
+    /// known once assembly finishes). If that temp file were staged
+    /// anywhere `used_bytes`'s recursive walk of `self.root` could see
+    /// it, `quota_gate`'s `check_quota` would count it once as
+    /// "already on disk" and a second time as the incoming write,
+    /// wrongly rejecting an upload at roughly half its real allowed
+    /// size. Sized just over half of the quota so the bug, if
+    /// reintroduced, trips this assertion rather than passing by luck.
+    #[tokio::test]
+    async fn prepare_assemble_then_quota_gate_does_not_double_count_the_staged_temp_file() {
+        let (_dir, storage) = storage().await;
+        // A separate TempDir, not a subdirectory of `storage`'s own root:
+        // in production, chunks live in `AppState::uploads`, a wholly
+        // separate `Storage` instance from the account's main tree
+        // (`AppState::storage`) that `used_bytes` never walks. Sourcing
+        // the chunk from inside `storage`'s own root here would make this
+        // test's "incoming" bytes indistinguishable from genuine
+        // pre-existing usage, defeating the point of isolating the bug
+        // this test guards against.
+        let chunks_dir = TempDir::new().unwrap();
+        let chunk = chunks_dir.path().join("0");
+        tokio::fs::write(&chunk, vec![7u8; 600]).await.unwrap();
+
+        let dest = DavPath::parse("/big.bin").unwrap();
+        let prepared = storage
+            .prepare_assemble(&dest, &[chunk], false, None)
+            .await
+            .unwrap();
+        assert_eq!(prepared.total(), 600);
+
+        let limit = 1000u64;
+        let guard = match storage.quota_gate(limit, &dest, prepared.total()).await {
+            Ok(guard) => guard,
+            Err(err) => panic!(
+                "a 600-byte chunked upload against a 1000-byte quota on a completely \
+                 empty account must not be rejected: {err:?}"
+            ),
+        };
+        storage.commit_assemble(prepared).await.unwrap();
+        drop(guard);
+
+        let used = storage.used_bytes().await.unwrap();
+        assert_eq!(
+            used, 600,
+            "final usage must be exactly the assembled size, not double-counted"
+        );
+    }
+
+    /// The fix for the double-count above must not overcorrect: a
+    /// chunked upload that is genuinely over quota must still be
+    /// rejected, and the rejection must leave nothing committed.
+    #[tokio::test]
+    async fn prepare_assemble_then_quota_gate_still_rejects_a_genuinely_over_quota_upload() {
+        let (_dir, storage) = storage().await;
+        // Same reasoning as the test above: chunk source lives outside
+        // `storage`'s own root, matching `AppState::uploads` in production.
+        let chunks_dir = TempDir::new().unwrap();
+        let chunk = chunks_dir.path().join("0");
+        tokio::fs::write(&chunk, vec![7u8; 1100]).await.unwrap();
+
+        let dest = DavPath::parse("/too-big.bin").unwrap();
+        let prepared = storage
+            .prepare_assemble(&dest, &[chunk], false, None)
+            .await
+            .unwrap();
+        assert_eq!(prepared.total(), 1100);
+
+        let limit = 1000u64;
+        let result = storage.quota_gate(limit, &dest, prepared.total()).await;
+        match result {
+            Err(err) => assert!(matches!(err, StorageError::QuotaExceeded { .. })),
+            Ok(_) => panic!("a 1100-byte upload against a 1000-byte quota must be rejected"),
+        }
+        prepared.discard().await;
+
+        assert!(!storage.exists(&dest).await);
+        assert_eq!(storage.used_bytes().await.unwrap(), 0);
     }
 }

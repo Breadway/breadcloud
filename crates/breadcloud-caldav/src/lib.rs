@@ -51,7 +51,7 @@ pub mod path;
 pub mod state;
 pub mod xml;
 
-pub use state::AppState;
+pub use state::{AppState, AuthenticatedUser};
 
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -77,9 +77,20 @@ pub fn principal_href(state: &AppState) -> String {
     let username = state
         .auth
         .as_ref()
-        .map(|a| a.username.clone())
-        .unwrap_or_else(|| "anonymous".to_string());
-    format!("/remote.php/dav/principals/{username}/")
+        .map(|a| a.username.as_str())
+        .unwrap_or("anonymous");
+    principal_href_for(username)
+}
+
+/// Same as [`principal_href`], for a caller that already knows the
+/// authenticated username directly rather than reading it off
+/// `AppState.auth` (CLOUD-11: the real combined server resolves the
+/// authenticated identity once, centrally, ahead of dispatch, so it has
+/// this in hand without going through a fixed, per-`AppState` credential
+/// -- see `breadcloud-server::combined`, which calls this instead of
+/// [`principal_href`] for exactly that reason).
+pub fn principal_href_for(user: &str) -> String {
+    format!("/remote.php/dav/principals/{user}/")
 }
 
 /// Whether `path` (the raw, still percent-encoded request path) belongs
@@ -110,7 +121,17 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn dispatch_handler(State(state): State<AppState>, req: Request) -> Response {
-    dispatch(state, req).await
+    // Standalone use (this crate's own tests, or any caller mounting
+    // `router()` directly): `crate::auth::require_auth` is the only auth
+    // gate in front of this handler, and it stashes the authenticated
+    // username the same way the combined server's shared gate does (see
+    // `crate::auth`) -- extract it here so `dispatch` behaves identically
+    // either way.
+    let user = req
+        .extensions()
+        .get::<AuthenticatedUser>()
+        .map(|u| u.0.clone());
+    dispatch(state, user.as_deref(), req).await
 }
 
 /// The CalDAV request dispatcher, exposed directly (not just through
@@ -118,7 +139,17 @@ async fn dispatch_handler(State(state): State<AppState>, req: Request) -> Respon
 /// combined server calls this and `breadcloud_webdav::dispatch` from one
 /// shared top-level fallback, under one shared auth layer, rather than
 /// running two HTTP servers.
-pub async fn dispatch(state: AppState, req: Request) -> Response {
+///
+/// `authenticated_user`, when given, is who actually authenticated this
+/// request (CLOUD-11) -- used only for `current-user-principal`
+/// discovery at the bare DAV root (`handlers::discovery::current_user_principal`),
+/// which otherwise has no per-request identity to answer with. Every
+/// other handler here takes its `user` straight from the URL
+/// (`CalPath`'s parsed segments): `breadcloud-server::combined` validates
+/// that segment against `authenticated_user` itself, before ever calling
+/// this function, so by the time a handler reads it off the URL it is
+/// already known to match -- see that module's `url_scoped_user` check.
+pub async fn dispatch(state: AppState, authenticated_user: Option<&str>, req: Request) -> Response {
     let method = req.method().clone();
     let raw_path = req.uri().path().to_string();
 
@@ -137,7 +168,7 @@ pub async fn dispatch(state: AppState, req: Request) -> Response {
 
     match (&parsed, method.as_str()) {
         (CalPath::Root, "PROPFIND") => {
-            handlers::discovery::current_user_principal(&state, req).await
+            handlers::discovery::current_user_principal(&state, authenticated_user, req).await
         }
         (CalPath::Principal(user), "PROPFIND") => {
             handlers::discovery::principal(&state, user, req).await

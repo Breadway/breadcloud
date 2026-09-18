@@ -47,14 +47,25 @@ pub fn options() -> Response {
 }
 
 /// PROPFIND on the bare DAV root (`/remote.php/dav` or
-/// `/remote.php/dav/`), answering `current-user-principal`. This server
-/// has one owner-equivalent user until CLOUD-11 adds real multi-user
-/// accounts (the same placeholder-auth stance `breadcloud_webdav::auth`
-/// takes), so "the current user" is simply the configured Basic-auth
-/// username, not derived per-request from any session/token.
-pub async fn current_user_principal(state: &AppState, req: Request) -> Response {
+/// `/remote.php/dav/`), answering `current-user-principal`.
+///
+/// `authenticated_user`, when given (the real combined server always
+/// gives it -- see `crate::dispatch`'s own doc comment), is who actually
+/// authenticated this request (CLOUD-11): "the current user" is genuinely
+/// per-request now, not a single fixed account. Falls back to this
+/// crate's own standalone `AppState.auth` (or "anonymous") only when
+/// nothing authenticated at all, which happens for this crate's own
+/// open-mode tests/standalone use.
+pub async fn current_user_principal(
+    state: &AppState,
+    authenticated_user: Option<&str>,
+    req: Request,
+) -> Response {
     let mode = read_propfind_mode(req).await;
-    let principal_href = crate::principal_href(state);
+    let principal_href = match authenticated_user {
+        Some(user) => crate::principal_href_for(user),
+        None => crate::principal_href(state),
+    };
     let xml =
         response::current_user_principal_multistatus("/remote.php/dav/", &principal_href, &mode);
     xml_response(xml)
@@ -66,10 +77,15 @@ pub async fn current_user_principal(state: &AppState, req: Request) -> Response 
 /// principal-identity properties real clients also request alongside it.
 ///
 /// `user` is taken from the URL as-is rather than cross-checked against
-/// the authenticated identity: there is only one real account until
-/// CLOUD-11, so there is nothing meaningful to mismatch yet (matching
-/// `breadcloud_webdav`'s own single-user stance -- see that crate's
-/// `handlers::propfind` permissions doc comment).
+/// the authenticated identity here -- but by the time a request reaches
+/// this handler in the real server, it already has been: CLOUD-11's
+/// `breadcloud-server::combined` validates every `principals`/`calendars`
+/// URL segment against whoever actually authenticated before dispatching
+/// into this crate at all (`url_scoped_user`, 403 on a mismatch), so
+/// `user` here is guaranteed to already equal the authenticated identity.
+/// This crate's own standalone router (its test suite, or any caller that
+/// mounts it alone) has no such second identity to cross-check against --
+/// see `crate::auth`'s doc comment.
 pub async fn principal(state: &AppState, user: &str, req: Request) -> Response {
     let _ = state; // no calendar lookup needed to answer a principal's own identity
     let mode = read_propfind_mode(req).await;

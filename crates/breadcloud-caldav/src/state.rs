@@ -36,3 +36,14 @@ impl AppState {
         self
     }
 }
+
+/// The authenticated username for the current request, stashed into the
+/// request's extensions by an auth gate (this crate's own [`crate::auth`]
+/// for standalone use, or `breadcloud-server::combined`'s shared gate for
+/// the real multi-user server) so a handler downstream of dispatch can
+/// answer "who is asking" without re-deriving it from headers or trusting
+/// a URL path segment (CLOUD-11). See `crate::principal_href_for` and
+/// `handlers::discovery::current_user_principal`, the one place in this
+/// crate that currently needs it.
+#[derive(Clone)]
+pub struct AuthenticatedUser(pub String);

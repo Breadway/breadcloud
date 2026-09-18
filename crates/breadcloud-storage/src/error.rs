@@ -68,4 +68,19 @@ pub enum StorageError {
         /// instead sitting at this path.
         stranded_dest: Option<PathBuf>,
     },
+
+    /// A write would push this user's live storage tree past their
+    /// configured quota (CLOUD-11). Maps to 507 Insufficient Storage (RFC
+    /// 4918 11.5), the WebDAV-correct status for exactly this condition --
+    /// unlike a 4xx client error, the request itself is well-formed, the
+    /// server just cannot allocate the space. Callers must check for this
+    /// *before* mutating the destination (see
+    /// `Storage::check_quota`'s doc comment): nothing on disk changes as a
+    /// result of this error, so a rejected write never corrupts or
+    /// partially replaces existing content.
+    #[error(
+        "quota exceeded: this write would bring usage to {used_after} bytes, over the \
+         {limit}-byte limit"
+    )]
+    QuotaExceeded { limit: u64, used_after: u64 },
 }

@@ -32,6 +32,7 @@
 //! Scope note: this does not do WebDAV locking (LOCK/UNLOCK) -- a
 //! separate, later issue in the breadcloud epic.
 
+pub mod accounts;
 pub mod auth;
 pub mod error;
 pub mod fileid;
@@ -43,6 +44,7 @@ pub mod trash;
 pub mod versioning;
 pub mod xml;
 
+pub use accounts::{Account, AccountStore};
 pub use state::{AppState, BasicAuthConfig};
 
 use axum::extract::{Request, State};
@@ -128,10 +130,18 @@ pub async fn dispatch(state: AppState, req: Request) -> Response {
         if raw_path.contains("/ocs/v1.php/cloud/user")
             || raw_path.contains("/ocs/v2.php/cloud/user")
         {
+            // `owner` (CLOUD-11: which account this already-resolved
+            // `AppState` belongs to) takes priority over `auth`'s
+            // configured username: in the real combined server, auth
+            // happens once centrally and `AppState` arrives here already
+            // resolved to the authenticated account, with `auth` left
+            // `None` (see `breadcloud-server::combined`). `auth`'s
+            // username is the fallback for this crate's own standalone
+            // router/tests, where `owner` is never set.
             let username = state
-                .auth
-                .as_ref()
-                .map(|a| a.username.as_str())
+                .owner
+                .as_deref()
+                .or_else(|| state.auth.as_ref().map(|a| a.username.as_str()))
                 .unwrap_or("anonymous");
             return handlers::discovery::user(username);
         }

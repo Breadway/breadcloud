@@ -38,6 +38,25 @@ pub async fn handle(state: &AppState, path: &DavPath, req: Request) -> Response 
         Err(_) => return (StatusCode::BAD_REQUEST, "could not read request body").into_response(),
     };
 
+    // CLOUD-11: reject a write that would exceed this account's quota
+    // before it touches disk at all. `quota_gate` also closes the TOCTOU
+    // window a bare `check_quota` call would leave open: it holds this
+    // account's quota mutex from here until `_quota_guard` drops (end of
+    // this function), so a concurrent PUT/chunked-finalize against the
+    // same account cannot observe "room available" for bytes this write
+    // already claimed.
+    let _quota_guard = match state.quota_limit_bytes {
+        Some(limit) => match state
+            .storage
+            .quota_gate(limit, path, bytes.len() as u64)
+            .await
+        {
+            Ok(guard) => Some(guard),
+            Err(err) => return storage_error_response(err),
+        },
+        None => None,
+    };
+
     // RFC 4918 9.7.1: PUT creates the resource if it does not exist and
     // overwrites it if it does; the parent collection must already
     // exist, which `write_bytes` enforces (409 Conflict otherwise).

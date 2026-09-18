@@ -26,9 +26,9 @@
 //! made for its own versions surface).
 //!
 //! The `<user>` path segment mirrors `handlers::uploads`/`handlers::versions`'s
-//! layout but, like both of those, is not validated against the
-//! authenticated user -- this server has one placeholder account until
-//! CLOUD-11.
+//! layout, and is validated the same way theirs is (CLOUD-11: see
+//! `handlers::versions`'s own doc comment for where and how -- the
+//! combined server's `url_scoped_user` check, not this handler itself).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

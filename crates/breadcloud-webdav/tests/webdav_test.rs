@@ -428,6 +428,128 @@ async fn chunked_finalize_with_stale_if_match_is_412_and_leaves_destination_unto
     assert_eq!(body, "original content");
 }
 
+fn test_app_with_quota(limit_bytes: u64) -> (TempDir, TempDir, TempDir, TempDir, axum::Router) {
+    let dir = TempDir::new().unwrap();
+    let uploads_dir = TempDir::new().unwrap();
+    let versions_dir = TempDir::new().unwrap();
+    let trash_dir = TempDir::new().unwrap();
+    let storage = Storage::new(dir.path());
+    let uploads = Storage::new(uploads_dir.path());
+    let versions = VersionStore::new(versions_dir.path());
+    let trash = TrashStore::new(trash_dir.path());
+    let state = AppState::new(storage, uploads, versions, trash).with_quota_limit(limit_bytes);
+    (dir, uploads_dir, versions_dir, trash_dir, router(state))
+}
+
+/// CLOUD-11 round 3: `prepare_assemble` used to stage the fully assembled
+/// content inside the account's live storage root before the quota check
+/// ran, so `used_bytes`'s recursive walk counted those staged bytes once
+/// as "already on disk" and the quota check counted them again as the
+/// incoming write -- rejecting a chunked upload at roughly half its real
+/// allowed size. This is the reviewer's exact repro, isolated from
+/// concurrency entirely: one finalize, nothing racing it, a size chosen
+/// to be comfortably within quota but that would look over quota if
+/// double-counted (just over half of the limit).
+#[tokio::test]
+async fn chunked_finalize_within_quota_is_not_wrongly_rejected_by_double_counting() {
+    let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app_with_quota(1000);
+
+    let mkcol = Request::builder()
+        .method("MKCOL")
+        .uri("/remote.php/dav/uploads/testuser/txn1")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(mkcol).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    // 600 bytes against a 1000-byte quota on a completely empty account:
+    // genuinely well within quota, but if the staged assembly were
+    // double-counted (600 "already on disk" + 600 incoming = 1200) this
+    // would be wrongly rejected as over quota.
+    let chunk_body = vec![b'x'; 600];
+    let put_chunk = Request::builder()
+        .method("PUT")
+        .uri("/remote.php/dav/uploads/testuser/txn1/1")
+        .body(Body::from(chunk_body.clone()))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(put_chunk).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    let finalize = Request::builder()
+        .method("MOVE")
+        .uri("/remote.php/dav/uploads/testuser/txn1/.file")
+        .header("Destination", "/big.bin")
+        .header("OC-Total-Length", chunk_body.len().to_string())
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(finalize).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "a 600-byte chunked upload against a 1000-byte quota on an empty account must succeed"
+    );
+
+    let get_dest = Request::builder()
+        .method("GET")
+        .uri("/big.bin")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(get_dest).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_string(response).await.len(), 600);
+}
+
+/// The fix above must not overcorrect: a chunked upload that is
+/// genuinely over quota must still be rejected, and must not leave
+/// anything behind at the destination.
+#[tokio::test]
+async fn chunked_finalize_over_quota_is_still_rejected() {
+    let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app_with_quota(1000);
+
+    let mkcol = Request::builder()
+        .method("MKCOL")
+        .uri("/remote.php/dav/uploads/testuser/txn1")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(mkcol).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    let chunk_body = vec![b'x'; 1100];
+    let put_chunk = Request::builder()
+        .method("PUT")
+        .uri("/remote.php/dav/uploads/testuser/txn1/1")
+        .body(Body::from(chunk_body.clone()))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(put_chunk).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    let finalize = Request::builder()
+        .method("MOVE")
+        .uri("/remote.php/dav/uploads/testuser/txn1/.file")
+        .header("Destination", "/too-big.bin")
+        .header("OC-Total-Length", chunk_body.len().to_string())
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(finalize).await.unwrap();
+    assert_eq!(response.status(), StatusCode::from_u16(507).unwrap());
+
+    let get_dest = Request::builder()
+        .method("GET")
+        .uri("/too-big.bin")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(get_dest).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn basic_auth_rejects_missing_and_wrong_credentials() {
     let dir = TempDir::new().unwrap();

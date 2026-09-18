@@ -8,9 +8,13 @@ real Nextcloud desktop client (mirall) sync backend; CLOUD-4 added capped
 per-file version history; CLOUD-5 added soft-delete trash with an explicit
 age and size retention cap; CLOUD-6 added a CalDAV server (calendar
 collections, multi-calendar per user, sync-collection/ctag) that runs on the
-same HTTP server as WebDAV rather than as a second process; CLOUD-7 (this
-one) added a CardDAV server (a single addressbook, contact groups as vCard
-`KIND:group` resources, sync-collection/ctag) on that same shared server.
+same HTTP server as WebDAV rather than as a second process; CLOUD-7 added a
+CardDAV server (a single addressbook, contact groups as vCard `KIND:group`
+resources, sync-collection/ctag) on that same shared server; CLOUD-11 (this
+one) replaced the single placeholder account every prior issue ran against
+with a real, small multi-user account model: independently authenticated,
+independently quota'd, independently storage-isolated accounts, see "Multi-
+user accounts (CLOUD-11)" under `breadcloud-server` below.
 
 ## Workspace layout
 
@@ -437,9 +441,11 @@ Notable pieces:
   against a conflicting change the client has not seen yet, `If-None-Match: *`
   protects a create against a race with another client. Both 412 on
   violation.
-- `auth` is a placeholder HTTP Basic auth gate (single user/pass, or none at
-  all if unconfigured). CLOUD-11 replaces this with real multi-user accounts
-  and per-user quotas.
+- `auth` is a single-credential HTTP Basic auth gate (or none at all if
+  unconfigured), still used by this crate's own standalone router/tests.
+  The real server's multi-user accounts and per-user quotas (CLOUD-11) are
+  a `breadcloud-server`-level concern layered on top -- see that crate's
+  section below and "Multi-user accounts (CLOUD-11)".
 - `versioning` snapshots a file's current content into version history
   (`AppState::versions`, `breadcloud_storage::VersionStore`) immediately
   before an overwrite. Shared between `handlers::put` and
@@ -552,8 +558,11 @@ protocols into one axum app on one port: a single top-level fallback asks
 (`/remote.php/dav/{principals,calendars}`, `/.well-known/caldav`, and the
 bare DAV root are CalDAV's; everything else is WebDAV's -- the two never
 overlap) and calls that crate's plain `dispatch(state, req)` function
-directly, under one shared `middleware::from_fn` auth layer built from the
-same `BREADCLOUD_USER`/`BREADCLOUD_PASS` credentials. Both crates still
+directly, under one shared `middleware::from_fn` auth layer checking one
+shared account store (CLOUD-11: `breadcloud_webdav::AccountStore`, see
+"Multi-user accounts (CLOUD-11)" below -- originally a single
+`BREADCLOUD_USER`/`BREADCLOUD_PASS` credential pair, before that issue).
+Both crates still
 expose their own standalone `router()` (used by each crate's own test
 suite, and available to a caller that only wants one protocol), each with
 its own independent auth layer -- `combined.rs` deliberately does not call
@@ -759,19 +768,131 @@ Thin binary. Configuration is environment variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `BREADCLOUD_ROOT` | `./data` | Directory to serve (created if missing) |
+| `BREADCLOUD_ROOT` | `./data` | Directory to serve (created if missing). Each account's own storage root (or `BREADCLOUD_ROOT` itself in single-account mode) also gets an automatic, non-configurable sibling directory named `.<dirname>-assembly-staging`, used only to stage a chunked upload's assembled content before it is quota-checked and committed (CLOUD-11); it never appears in a PROPFIND and is not meant to be browsed or backed up |
 | `BREADCLOUD_UPLOADS_ROOT` | system temp dir + `breadcloud-uploads` | Staging area for in-progress chunked uploads (created if missing). Deliberately outside `BREADCLOUD_ROOT`, not just dot-hidden inside it, so it can never appear in a PROPFIND of the served tree |
 | `BREADCLOUD_VERSIONS_ROOT` | `./breadcloud-versions` | Per-file version history root (created if missing), outside `BREADCLOUD_ROOT` for the same reason as uploads staging. Unlike uploads staging this needs to persist across restarts, so it defaults to a sibling directory rather than the system temp dir |
 | `BREADCLOUD_TRASH_ROOT` | `./breadcloud-trash` | Soft-delete trash root (created if missing), outside `BREADCLOUD_ROOT` for the same reason as uploads staging and version history, and (like version history) needs to persist across restarts, so it also defaults to a sibling directory rather than the system temp dir |
 | `BREADCLOUD_CALENDARS_ROOT` | `./breadcloud-calendars` | Calendar storage root (created if missing), outside `BREADCLOUD_ROOT` for the same reason as uploads/versions/trash, and (like versions/trash) needs to persist across restarts, so it also defaults to a sibling directory rather than the system temp dir |
 | `BREADCLOUD_ADDRESSBOOKS_ROOT` | `./breadcloud-addressbooks` | Addressbook storage root (created if missing), outside `BREADCLOUD_ROOT` for the same reason as uploads/versions/trash/calendars, and (like them) needs to persist across restarts, so it also defaults to a sibling directory rather than the system temp dir |
 | `BREADCLOUD_BIND` | `127.0.0.1:8080` | Address to listen on |
-| `BREADCLOUD_USER` / `BREADCLOUD_PASS` | unset | HTTP Basic auth credentials, shared by the WebDAV, CalDAV, and CardDAV surfaces (one shared auth gate -- see `combined.rs` above). If either is unset, the server runs open (fine for `127.0.0.1`, never for anything reachable off localhost) |
+| `BREADCLOUD_ACCOUNT_<n>_USER` / `BREADCLOUD_ACCOUNT_<n>_PASS` / `BREADCLOUD_ACCOUNT_<n>_QUOTA_GB` | unset | Multi-user accounts (CLOUD-11), `<n>` = `1`, `2`, ... See "Multi-user accounts (CLOUD-11)" below |
+| `BREADCLOUD_USER` / `BREADCLOUD_PASS` | unset | Legacy single-account fallback, used only when no `BREADCLOUD_ACCOUNT_1_USER` is set. See "Multi-user accounts (CLOUD-11)" below |
 
-`BREADCLOUD_USER` (or `dev` if unset) also names the owner the baseline
+### Multi-user accounts (CLOUD-11)
+
+Before CLOUD-11 this server had exactly one, placeholder account: a single
+`BREADCLOUD_USER`/`BREADCLOUD_PASS` pair checked by a shared HTTP Basic auth
+gate, with every store (`Storage`, `VersionStore`, `TrashStore`) rooted once
+for the whole server. The URL already carried a `<user>` path segment
+everywhere a real Nextcloud client puts one
+(`/remote.php/dav/files/<user>/...`, `.../calendars/<user>/...`, and so on --
+CLOUD-3's real-client-compatibility work), but nothing checked it against
+anything: it was accepted as a label, not an identity, which was harmless
+only because there was ever one real account to begin with.
+
+CLOUD-11 replaces that with a real, intentionally small account model: a
+fixed set of independently authenticated, independently quota'd,
+independently storage-isolated accounts, configured once at startup and never
+mutated while running. Per the issue's own ask, this stays simple on
+purpose -- no roles or permissions, no sharing between accounts, no
+self-service account creation, no admin UI.
+
+**Configuration.** `breadcloud-server` tries three shapes, in order (see
+`main.rs`'s `load_accounts`):
+
+1. **Multi-account** -- `BREADCLOUD_ACCOUNT_<n>_USER` /
+   `BREADCLOUD_ACCOUNT_<n>_PASS` / `BREADCLOUD_ACCOUNT_<n>_QUOTA_GB`, scanned
+   from `n = 1` until the first missing `_USER`. This is the real shape: e.g.
+   five accounts (matching the issue's "5 existing accounts and their quotas
+   (100/100/50/10/100GB)", using generic `user1`..`user5` identifiers since
+   the issue names no real usernames and none turned up elsewhere in this
+   codebase's real-data context) would be `BREADCLOUD_ACCOUNT_1_USER=user1`
+   / `..._PASS=...` / `..._QUOTA_GB=100`, `BREADCLOUD_ACCOUNT_2_...` for the
+   second 100GB account, `BREADCLOUD_ACCOUNT_3_QUOTA_GB=50`,
+   `BREADCLOUD_ACCOUNT_4_QUOTA_GB=10`, `BREADCLOUD_ACCOUNT_5_QUOTA_GB=100`.
+   Quota is in whole GiB (binary gibibytes, matching this codebase's other
+   size constants like `DEFAULT_TRASH_MAX_TOTAL_BYTES`), not decimal GB --
+   close enough to the issue's "100/100/50/10/100GB" figures that the
+   difference does not matter at this scale, and consistent with everything
+   else in this codebase. Each account's file/upload/version/trash storage
+   gets its own subdirectory of the configured base roots
+   (`BREADCLOUD_ROOT/<username>`, etc.).
+2. **Legacy single-account** -- the pre-CLOUD-11 `BREADCLOUD_USER`/
+   `BREADCLOUD_PASS` pair, used only when no `BREADCLOUD_ACCOUNT_1_USER` is
+   set. Keeps this README's own "Running locally" quickstart, and any
+   existing single-user deployment's on-disk layout (data directly under
+   `BREADCLOUD_ROOT`, not a per-user subdirectory of it), working with zero
+   migration -- exactly the "only one account is actually active today"
+   deployment the issue describes. Gets a default 100 GiB quota (the most
+   common tier among the five-account mapping above).
+3. **Open** -- neither of the above set at all: the server runs
+   unauthenticated, exactly as it always could, as a single implicit `"dev"`
+   account with no quota limit.
+
+**Per-user storage isolation.** `Storage`, `VersionStore`, and `TrashStore`
+are each root-sandboxed via `DavPath` (no `..`, cannot escape the root by
+construction -- see `breadcloud-storage`'s own section above). CLOUD-11
+gives each account its own instance of each, rooted at its own subdirectory,
+rather than one shared instance namespaced by a URL segment: this means one
+account's requests are *structurally* incapable of reaching another's files,
+version history, or trash, regardless of what any request claims, the same
+rigor CLOUD-2/4/5 already had to get right for path traversal within one
+account's tree. `CalendarStore`/`AddressbookStore` (CLOUD-6/CLOUD-7) do not
+need this treatment: they already namespace every operation by a `user`
+argument internally (`<root>/<user>/<calendar-or-addressbook-id>/`,
+validated the same way a file path is), so a single shared instance per
+store, fed the *validated* authenticated username, is already real
+per-account isolation.
+
+**Authenticated identity, not a URL label.** `breadcloud-server::combined`'s
+`auth_gate` checks `Authorization` against the account store exactly once
+per request and resolves an authenticated username; `dispatch` then rejects
+outright (403) any request whose URL names a *different* account than the
+one that actually authenticated (`url_scoped_user`, covering every
+`<user>`-carrying prefix across all three protocols), instead of silently
+substituting one for the other. This closes the exact gap CLOUD-11 set out
+to close: before it, `/remote.php/dav/files/<user>/...` accepted `<user>` as
+a matching label, not a real per-request identity check.
+
+**Quota.** Enforced on write (`PUT`, and chunked-upload finalize) via
+`Storage::quota_gate`, which wraps the read-only `Storage::check_quota`
+check in this account's own async mutex, held from the check through to
+the write it gates (`write_bytes`/`commit_assemble`). A rejected write
+(507 Insufficient Storage, the RFC 4918-correct status for "well-formed
+request, no room") never touches disk -- no partial write, no corrupted
+existing content -- and the mutex closes the check-then-write TOCTOU
+window a bare `check_quota` call would otherwise leave open: two
+concurrent writes against the same account can never both observe "room
+available" for overlapping capacity. Different accounts never contend on
+this, each gets its own `Storage` instance and its own mutex. Scoped to
+the live served tree only, deliberately not also counting each account's
+version history or trash: those already have their own independent,
+already-bounded retention caps (CLOUD-4/CLOUD-5), so folding them into
+quota too would be double-accounting against a number that is not what a
+user thinks of as "my files" anyway.
+`quota-used-bytes`/`quota-available-bytes` (already present per CLOUD-2)
+report this same per-account figure on PROPFIND now, not a filesystem-wide
+one.
+
+A chunked upload's finalize assembles its chunks into a temp file before
+`quota_gate` can know the exact size to check (`Storage::prepare_assemble`).
+That temp file is staged in a reserved directory that sits beside the
+account's storage root rather than inside it, specifically so the
+account's own quota-usage tally (a recursive walk of the served tree)
+never counts an in-flight assembly as already-on-disk usage on top of
+counting it again as the incoming write -- a real bug in an earlier round
+of this feature that silently rejected large chunked uploads at roughly
+half their real allowed size. See `Storage::prepare_assemble`'s doc
+comment in `breadcloud-storage` for the full reasoning, including why
+that staging directory is not simply the existing chunked-upload staging
+area (`BREADCLOUD_UPLOADS_ROOT`).
+
+`BREADCLOUD_USER` (or `dev` in open mode) also names the owner the baseline
 personal/family/school calendars and the default `contacts` addressbook are
-bootstrapped under on startup -- see `breadcloud-caldav`'s and
-`breadcloud-carddav`'s sections above.
+bootstrapped under on startup in single-account/open mode; in multi-account
+mode, every configured account gets its own personal/family/school
+calendars and its own `contacts` addressbook -- see `breadcloud-caldav`'s
+and `breadcloud-carddav`'s sections above.
 
 ## Running locally
 

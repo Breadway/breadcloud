@@ -25,9 +25,16 @@
 //! other overwrite -- adding a second, redundant "restore" verb here
 //! would just be two ways to do the same write.
 //!
-//! The `<user>` path segment mirrors `handlers::uploads`'s layout but,
-//! like that one, is not validated against the authenticated user --
-//! this server has one placeholder account until CLOUD-11.
+//! The `<user>` path segment mirrors `handlers::uploads`'s layout. This
+//! handler itself still does not cross-check it against the authenticated
+//! identity (by the time a request reaches here, `state.storage`/
+//! `state.versions` are already the authenticated account's own,
+//! root-sandboxed instances -- see `breadcloud_webdav::AppState`), but
+//! the real combined server does validate this segment before ever
+//! dispatching here (CLOUD-11: `breadcloud-server::combined`'s
+//! `url_scoped_user` check, covering this prefix alongside `files`,
+//! `uploads`, `trashbin`, and every CalDAV/CardDAV per-user prefix),
+//! rejecting a mismatch with 403 rather than letting it through.
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, StatusCode};

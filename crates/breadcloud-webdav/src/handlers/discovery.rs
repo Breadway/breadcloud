@@ -52,10 +52,10 @@ pub fn capabilities() -> Response {
         .into_response()
 }
 
-/// `GET /ocs/v1.php/cloud/user`. `id` matches the single placeholder
-/// Basic-auth username this server is configured with (see
-/// `crate::auth`); this endpoint has no concept of other users until
-/// CLOUD-11.
+/// `GET /ocs/v1.php/cloud/user`. `id` is the real authenticated account
+/// (CLOUD-11: `AppState.owner` in the combined server, falling back to
+/// `crate::auth`'s single configured username for this crate's own
+/// standalone use -- see `crate::dispatch`'s OCS-user branch).
 pub fn user(username: &str) -> Response {
     let body = format!(
         r#"{{"ocs":{{"meta":{{"status":"ok","statuscode":100,"message":"OK"}},"data":{{"id":"{username}","display-name":"{username}","displayname":"{username}","email":null}}}}}}"#

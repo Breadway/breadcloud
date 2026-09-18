@@ -26,6 +26,13 @@ fn default_status(err: &StorageError) -> StatusCode {
         // on. This is a server-side problem, same bucket as `Io`, not
         // something a client retry can fix.
         StorageError::RecoveryFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        // CLOUD-11: this write would exceed the authenticated user's
+        // quota. 507 Insufficient Storage (RFC 4918 11.5) is the
+        // WebDAV-correct status for "the request is well-formed, the
+        // server just cannot allocate the space" -- distinct from a 4xx
+        // client error (the client did nothing wrong) and from 500 (the
+        // server isn't broken, the account is just full).
+        StorageError::QuotaExceeded { .. } => insufficient_storage(),
     }
 }
 
@@ -34,4 +41,10 @@ fn default_status(err: &StorageError) -> StatusCode {
 /// build it from the raw number instead of relying on one.
 pub fn multi_status() -> StatusCode {
     StatusCode::from_u16(207).expect("207 is a valid HTTP status code")
+}
+
+/// 507-status helper, same reasoning as [`multi_status`]: `StatusCode`
+/// has no named constant for it.
+pub fn insufficient_storage() -> StatusCode {
+    StatusCode::from_u16(507).expect("507 is a valid HTTP status code")
 }

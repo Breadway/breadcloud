@@ -55,11 +55,17 @@ pub async fn handle(
         Err(err) => return storage_error_response(err),
     };
 
-    // Quota is filesystem-level (see breadcloud_storage::Storage::quota),
-    // so it is only meaningful to report on the collection being
-    // queried, not on every file inside it.
+    // Per-user quota (CLOUD-11) when this account has one configured,
+    // filesystem-level otherwise (see
+    // breadcloud_storage::Storage::quota_report) -- only meaningful to
+    // report on the collection being queried, not on every file inside
+    // it.
     let quota = if self_metadata.is_dir() {
-        state.storage.quota().ok()
+        state
+            .storage
+            .quota_report(state.quota_limit_bytes)
+            .await
+            .ok()
     } else {
         None
     };

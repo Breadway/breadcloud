@@ -293,6 +293,35 @@ async fn finalize(state: &AppState, transfer_dir: &DavPath, headers: &HeaderMap)
         Err(err) => return storage_error_response(err),
     };
 
+    // CLOUD-11: same quota gate plain PUT gets (`Storage::quota_gate`,
+    // shared between both paths rather than two independent ad-hoc
+    // locks), run here rather than earlier because `prepared.total()`
+    // (the exact assembled size) is only known once `prepare_assemble`
+    // has actually assembled the chunks into a staged temp file --
+    // nothing has touched `dest` yet at this point, so discarding
+    // `prepared` on a rejection leaves it (and everything else)
+    // untouched, same guarantee plain PUT's pre-write check gets.
+    //
+    // `_quota_guard` holds this account's quota mutex until it drops at
+    // the end of this function, closing the same TOCTOU window plain PUT
+    // closes: a concurrent PUT or chunked finalize against this account
+    // cannot observe "room available" for bytes this finalize already
+    // claimed.
+    let _quota_guard = match state.quota_limit_bytes {
+        Some(limit) => match state
+            .storage
+            .quota_gate(limit, &dest, prepared.total())
+            .await
+        {
+            Ok(guard) => Some(guard),
+            Err(err) => {
+                prepared.discard().await;
+                return storage_error_response(err);
+            }
+        },
+        None => None,
+    };
+
     // Same version-history snapshot plain PUT gets (CLOUD-4). By this
     // point the finalize is known to actually replace `dest`'s content
     // once committed, so this can no longer fire for a finalize the
