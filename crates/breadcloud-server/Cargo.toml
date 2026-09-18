@@ -12,6 +12,7 @@ path = "src/main.rs"
 breadcloud-storage = { path = "../breadcloud-storage" }
 breadcloud-webdav = { path = "../breadcloud-webdav" }
 breadcloud-caldav = { path = "../breadcloud-caldav" }
+breadcloud-carddav = { path = "../breadcloud-carddav" }
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

@@ -1,14 +1,15 @@
-//! breadcloud WebDAV + CalDAV server: wires up `breadcloud-storage`,
-//! `breadcloud-webdav`, and `breadcloud-caldav` into a runnable binary,
-//! all served on one port (see `combined`). See the workspace README for
-//! configuration and how to point it at a real file tree / calendar set.
+//! breadcloud WebDAV + CalDAV + CardDAV server: wires up
+//! `breadcloud-storage`, `breadcloud-webdav`, `breadcloud-caldav`, and
+//! `breadcloud-carddav` into a runnable binary, all served on one port
+//! (see `combined`). See the workspace README for configuration and how
+//! to point it at a real file tree / calendar / addressbook set.
 
 mod combined;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use breadcloud_storage::{CalendarStore, Storage, TrashStore, VersionStore};
+use breadcloud_storage::{AddressbookStore, CalendarStore, Storage, TrashStore, VersionStore};
 use breadcloud_webdav::AppState;
 
 #[tokio::main]
@@ -81,6 +82,21 @@ async fn main() {
         .canonicalize()
         .expect("failed to resolve calendars root");
 
+    // Addressbook storage (CLOUD-7). Its own root, same reasoning as
+    // uploads/versions/trash/calendars: outside BREADCLOUD_ROOT so a
+    // PROPFIND of the file tree can never see it, and (like
+    // versions/trash/calendars) a sibling directory by default since it
+    // needs to persist across restarts.
+    let addressbooks_root = std::env::var("BREADCLOUD_ADDRESSBOOKS_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./breadcloud-addressbooks"));
+    if !addressbooks_root.exists() {
+        std::fs::create_dir_all(&addressbooks_root).expect("failed to create addressbooks root");
+    }
+    let addressbooks_root = addressbooks_root
+        .canonicalize()
+        .expect("failed to resolve addressbooks root");
+
     let bind = std::env::var("BREADCLOUD_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     let addr: SocketAddr = bind
         .parse()
@@ -95,22 +111,26 @@ async fn main() {
     let calendars = CalendarStore::new(calendars_root.clone());
     let mut caldav_state = breadcloud_caldav::AppState::new(calendars.clone());
 
-    // The calendar owner: there is only one real, placeholder
+    let addressbooks = AddressbookStore::new(addressbooks_root.clone());
+    let mut carddav_state = breadcloud_carddav::AppState::new(addressbooks.clone());
+
+    // The calendar/addressbook owner: there is only one real, placeholder
     // owner-equivalent user until CLOUD-11 (same stance
     // breadcloud_webdav::auth takes), so this is also the name calendars
-    // get bootstrapped under below, not derived per-request from
-    // anything. Falls back to "dev" (matching the workspace README's own
-    // local-dev examples) rather than refusing to start when
-    // BREADCLOUD_USER is unset, since an open local server still needs
-    // some directory name to create calendars under.
+    // and addressbooks get bootstrapped under below, not derived
+    // per-request from anything. Falls back to "dev" (matching the
+    // workspace README's own local-dev examples) rather than refusing to
+    // start when BREADCLOUD_USER is unset, since an open local server
+    // still needs some directory name to create them under.
     let user = std::env::var("BREADCLOUD_USER").ok();
-    let calendar_owner = user.clone().unwrap_or_else(|| "dev".to_string());
+    let owner = user.clone().unwrap_or_else(|| "dev".to_string());
     let pass = std::env::var("BREADCLOUD_PASS").ok();
     match (user, pass) {
         (Some(u), Some(p)) => {
             tracing::info!("basic auth enabled for user {u}");
             webdav_state = webdav_state.with_auth(u.clone(), p.clone());
-            caldav_state = caldav_state.with_auth(u, p);
+            caldav_state = caldav_state.with_auth(u.clone(), p.clone());
+            carddav_state = carddav_state.with_auth(u, p);
         }
         _ => {
             tracing::warn!(
@@ -129,22 +149,33 @@ async fn main() {
         ("school", "School", Some("#c9622a")),
     ] {
         calendars
-            .ensure_calendar(&calendar_owner, id, name, color)
+            .ensure_calendar(&owner, id, name, color)
             .await
             .unwrap_or_else(|e| panic!("failed to bootstrap calendar {id}: {e}"));
     }
 
+    // Bootstrap a single default addressbook (CLOUD-7). Unlike calendars,
+    // the issue's real data (76 contacts split across groups, not
+    // separate addressbooks) does not call for more than one -- see
+    // `breadcloud_storage::addressbook`'s module doc comment. Further
+    // addressbooks can still be created at any time via MKCOL.
+    addressbooks
+        .ensure_addressbook(&owner, "contacts", "Contacts")
+        .await
+        .unwrap_or_else(|e| panic!("failed to bootstrap addressbook contacts: {e}"));
+
     tracing::info!(
-        "serving {} on {} (chunked-upload staging: {}, version history: {}, trash: {}, calendars: {})",
+        "serving {} on {} (chunked-upload staging: {}, version history: {}, trash: {}, calendars: {}, addressbooks: {})",
         root.display(),
         addr,
         uploads_root.display(),
         versions_root.display(),
         trash_root.display(),
-        calendars_root.display()
+        calendars_root.display(),
+        addressbooks_root.display()
     );
 
-    let app = combined::router(webdav_state, caldav_state);
+    let app = combined::router(webdav_state, caldav_state, carddav_state);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));

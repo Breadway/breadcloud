@@ -4,6 +4,7 @@ members = [
     "crates/breadcloud-storage",
     "crates/breadcloud-webdav",
     "crates/breadcloud-caldav",
+    "crates/breadcloud-carddav",
     "crates/breadcloud-server",
 ]
 

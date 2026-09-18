@@ -6,18 +6,21 @@
 //! overwritten, conflict vs. not-found) that RFC 4918 needs to pick the
 //! right status code. Anything built on top (WebDAV, CalDAV, CardDAV
 //! later) talks to storage only through this API. `calendar` (CLOUD-6)
-//! is the one exception to "sandboxed to a root via `DavPath`": a
-//! calendar event is not addressed by a served-tree path the way a file
-//! is, so [`CalendarStore`] builds its own small root-sandboxed layout
-//! instead, reusing [`Storage`] itself for each calendar's actual `.ics`
-//! files -- see `calendar`'s module doc comment.
+//! and `addressbook` (CLOUD-7) are the exceptions to "sandboxed to a root
+//! via `DavPath`": a calendar event or a contact is not addressed by a
+//! served-tree path the way a file is, so [`CalendarStore`] and
+//! [`AddressbookStore`] each build their own small root-sandboxed layout
+//! instead, reusing [`Storage`] itself for each collection's actual
+//! `.ics`/`.vcf` files -- see those modules' own doc comments.
 
+pub mod addressbook;
 pub mod calendar;
 pub mod error;
 pub mod path;
 pub mod trash;
 pub mod versions;
 
+pub use addressbook::{AddressbookInfo, AddressbookStore};
 pub use calendar::{CalendarInfo, CalendarStore, ChangeEntry};
 pub use error::StorageError;
 pub use path::DavPath;

@@ -6,21 +6,24 @@ minimal web UI, built as a series of breadboard issues (CLOUD-2 through
 CLOUD-14). CLOUD-2 built the WebDAV core; CLOUD-3 made it actually work as a
 real Nextcloud desktop client (mirall) sync backend; CLOUD-4 added capped
 per-file version history; CLOUD-5 added soft-delete trash with an explicit
-age and size retention cap; CLOUD-6 (this one) added a CalDAV server
-(calendar collections, multi-calendar per user, sync-collection/ctag) that
-runs on the same HTTP server as WebDAV rather than as a second process.
+age and size retention cap; CLOUD-6 added a CalDAV server (calendar
+collections, multi-calendar per user, sync-collection/ctag) that runs on the
+same HTTP server as WebDAV rather than as a second process; CLOUD-7 (this
+one) added a CardDAV server (a single addressbook, contact groups as vCard
+`KIND:group` resources, sync-collection/ctag) on that same shared server.
 
 ## Workspace layout
 
-A Cargo workspace, not a single binary, so later issues (CardDAV, the web UI)
-can add crates that reuse the storage and HTTP layers without a rewrite.
+A Cargo workspace, not a single binary, so later issues (the web UI) can add
+crates that reuse the storage and HTTP layers without a rewrite.
 
 ```
 crates/
   breadcloud-storage/   filesystem-backed storage primitives, no HTTP knowledge
   breadcloud-webdav/    WebDAV (RFC 4918) HTTP layer, built on axum
   breadcloud-caldav/    CalDAV (RFC 4791) HTTP layer, built on axum
-  breadcloud-server/    binary: wires storage + webdav + caldav into one server
+  breadcloud-carddav/   CardDAV (RFC 6352) HTTP layer, built on axum
+  breadcloud-server/    binary: wires storage + webdav + caldav + carddav into one server
 ```
 
 ### breadcloud-storage
@@ -352,6 +355,41 @@ sequence-number races a per-calendar lock map would need careful design to
 rule out (two events landing in the same calendar at once must never be
 assigned the same ctag bump).
 
+#### Addressbook storage (`addressbook` module, CLOUD-7)
+
+`AddressbookStore` is `breadcloud-storage`'s fifth root-sandboxed store, and a
+close structural mirror of `CalendarStore` (see that module's own doc
+comment): one directory per `(user, addressbook id)` pair, a `contacts/`
+subdirectory that is itself an ordinary `Storage` root (one `.vcf` file per
+contact, named `<uid>.vcf`), and the same sidecar bookkeeping
+(`display-name`, `ctag`, `changelog`) outside `contacts/`. `getctag` and
+`sync-collection` work identically to the calendar case -- same O(1) ctag
+read, same append-only changelog deduped to each uid's latest entry -- since
+"a collection of UID-addressed opaque text objects with change tracking" is
+exactly the same shape for a vCard as for an iCalendar object. The one
+storage-layer difference from `CalendarInfo` is that `AddressbookInfo` has no
+`color` field -- vCard/CardDAV has no equivalent of `calendar-color`.
+
+**One addressbook is what this deployment actually needs.** The issue's real
+data is 76 contacts split across groups (Friends/ICE/starred/Family team),
+not across several independent addressbooks the way the calendar issue's
+personal/family/school data genuinely was. `breadcloud-server` bootstraps a
+single `contacts` addressbook per user. The store itself still supports more
+than one per user (`create_addressbook`/`list_addressbooks` are not
+hardcoded to one), the same way `CalendarStore` does, since that costs
+almost nothing on top of the structural mirror this module already is, and
+`MKCOL` (see `breadcloud-carddav`'s section below) needs somewhere to create
+a second addressbook if a client or a human ever asks for one.
+
+**Contact groups are not a separate storage concept.** The real data's four
+groups map onto ordinary vCard resources with `KIND:group` and
+`MEMBER:urn:uuid:<uid>` properties -- the standard CardDAV representation
+both DAVx5 and iOS Contacts understand -- stored as just another `.vcf` file
+in the same `contacts/` directory as the people it lists. This store has no
+separate path, API, table, or index for "this one is a group"; see
+`breadcloud-carddav::vcard`'s doc comment for the client-facing side of this
+decision.
+
 ### breadcloud-webdav
 
 Turns a `Storage` into an `axum::Router` implementing RFC 4918: `PROPFIND`,
@@ -633,6 +671,88 @@ parameter) -- this server now supports enumeration via either Depth 1
 PROPFIND or `REPORT`, since real clients are not consistent about which they
 prefer.
 
+### breadcloud-carddav (CLOUD-7)
+
+Turns a `breadcloud_storage::AddressbookStore` into an `axum::Router`
+implementing the CardDAV surface real clients (DAVx5 on Android, iOS's
+native Contacts account type) actually drive: `PROPFIND` on addressbook
+collections and addressbook-home-set discovery, `MKCOL` (with an addressbook
+`resourcetype` -- CardDAV has no `MKCALENDAR`-equivalent verb of its own),
+`PUT`/`GET`/`DELETE` on individual `.vcf` contact resources, and `REPORT`
+with `addressbook-query`, `addressbook-multiget`, and `sync-collection` (RFC
+6578).
+
+**Structural mirror of `breadcloud-caldav`, deliberately, not a fresh
+design.** CardDAV (RFC 6352) and CalDAV (RFC 4791) are both WebDAV
+extensions for exactly the same shape -- a collection of typed, UID-addressed
+text objects with sync-collection/ctag change tracking and a
+PROPFIND/REPORT-based discovery and query surface -- so this crate's storage
+pattern (`AddressbookStore`, mirroring `CalendarStore`), discovery pattern,
+and REPORT handling are all directly carried over from `breadcloud-caldav`'s
+CLOUD-6 implementation rather than redesigned from first principles. It
+reuses concretely from `breadcloud-webdav` the same three things
+`breadcloud-caldav` does (`check_basic_auth`, `parse_propfind_body`,
+`storage_error_response`), plus `breadcloud_storage::calendar::ChangeEntry`
+directly from `breadcloud-caldav`'s own storage module for its sync diff --
+that type is just "a uid, and whether it was deleted", with nothing
+calendar-specific about its shape despite living in the `calendar` module.
+Everything else (path parsing, XML property sets, REPORT bodies, the
+storage layout) is its own copy, structurally parallel but independently
+owned, deliberately not factored into a shared generic
+"collection-of-typed-objects" layer: iCalendar's time-range filtering and
+`RRULE` handling have no vCard analog, and vCard's `KIND:group`/`MEMBER`
+group model has no iCalendar analog, so a shared abstraction built from only
+two data points would either save nothing or grow speculative hooks neither
+format needs yet.
+
+**Contact groups are ordinary vCards, not a protocol-level concept.** The
+real data this issue targets (76 contacts split across "Friends"/"ICE"/
+"starred"/"Family team" groups) is represented the standard CardDAV way, per
+RFC 6350 sections 6.1.4 and 6.6.5: a group is a vCard like any other, with
+`KIND:group` and one `MEMBER:urn:uuid:<uid>` line per member. Both DAVx5 and
+iOS Contacts read and write groups in exactly this shape, so `PUT`/`GET`/
+`DELETE`/`REPORT` treat a group vCard exactly like a person vCard -- the
+addressbook storage layer has no notion of "kind" at all. `vcard.rs`'s
+`extract_kind`/`has_kind` exist only so `addressbook-query`'s optional
+`CARD:group` component filter can distinguish the two if a client ever sends
+one.
+
+**Does not own the principal resource or the bare DAV root.** Unlike
+`breadcloud-caldav`, this crate has no `Root`/`Principal` path variant: there
+is exactly one principal per user regardless of how many DAV extensions it
+has home-sets for, and `breadcloud-caldav` already owns
+`/remote.php/dav/principals`. `breadcloud-server::combined` splices
+`card:addressbook-home-set` onto `breadcloud-caldav`'s existing principal
+PROPFIND response, the same additive-splice technique already used to put
+`current-user-principal` onto a bare-root WebDAV PROPFIND (see
+`breadcloud-server`'s "Bare-root discovery" section above) -- discovering the
+addressbook the same way DAVx5/iOS already discover a calendar, not
+bypassing that hop.
+
+**One HTTP server, not three.** Same reasoning and same mechanism as
+`breadcloud-caldav`'s own section above: `breadcloud-server::combined` calls
+this crate's plain `dispatch` alongside `breadcloud_webdav::dispatch` and
+`breadcloud_caldav::dispatch`, from one shared top-level fallback under one
+shared auth layer, rather than standing up a third HTTP server.
+
+**One addressbook is what this deployment actually needs.** See
+`breadcloud-storage`'s "Addressbook storage" section above -- a single
+`contacts` addressbook is bootstrapped per user, with groups living inside
+it rather than as separate addressbooks, since that is what the real 76-
+contact/four-group data actually looks like. The store and `MKCOL` both
+still support creating more than one addressbook if ever needed.
+
+**MKCOL, not MKCALENDAR-equivalent.** RFC 6352 does not define its own
+collection-creation verb the way RFC 4791 defines `MKCALENDAR`: an
+addressbook is created with a plain `MKCOL`, optionally carrying an RFC 5689
+extended-MKCOL body that also sets `resourcetype` (to include
+`<card:addressbook/>`) and `displayname`. This server does not require or
+validate the extended body -- every `MKCOL` under
+`/remote.php/dav/addressbooks/<user>/` unambiguously means "create an
+addressbook" regardless of body shape, since nothing else lives under that
+path -- it just reads `displayname` out of the body if present, falling back
+to the addressbook id if the body is absent or has none.
+
 ### breadcloud-server
 
 Thin binary. Configuration is environment variables:
@@ -644,12 +764,14 @@ Thin binary. Configuration is environment variables:
 | `BREADCLOUD_VERSIONS_ROOT` | `./breadcloud-versions` | Per-file version history root (created if missing), outside `BREADCLOUD_ROOT` for the same reason as uploads staging. Unlike uploads staging this needs to persist across restarts, so it defaults to a sibling directory rather than the system temp dir |
 | `BREADCLOUD_TRASH_ROOT` | `./breadcloud-trash` | Soft-delete trash root (created if missing), outside `BREADCLOUD_ROOT` for the same reason as uploads staging and version history, and (like version history) needs to persist across restarts, so it also defaults to a sibling directory rather than the system temp dir |
 | `BREADCLOUD_CALENDARS_ROOT` | `./breadcloud-calendars` | Calendar storage root (created if missing), outside `BREADCLOUD_ROOT` for the same reason as uploads/versions/trash, and (like versions/trash) needs to persist across restarts, so it also defaults to a sibling directory rather than the system temp dir |
+| `BREADCLOUD_ADDRESSBOOKS_ROOT` | `./breadcloud-addressbooks` | Addressbook storage root (created if missing), outside `BREADCLOUD_ROOT` for the same reason as uploads/versions/trash/calendars, and (like them) needs to persist across restarts, so it also defaults to a sibling directory rather than the system temp dir |
 | `BREADCLOUD_BIND` | `127.0.0.1:8080` | Address to listen on |
-| `BREADCLOUD_USER` / `BREADCLOUD_PASS` | unset | HTTP Basic auth credentials, shared by both the WebDAV and CalDAV surfaces (one shared auth gate -- see `combined.rs` above). If either is unset, the server runs open (fine for `127.0.0.1`, never for anything reachable off localhost) |
+| `BREADCLOUD_USER` / `BREADCLOUD_PASS` | unset | HTTP Basic auth credentials, shared by the WebDAV, CalDAV, and CardDAV surfaces (one shared auth gate -- see `combined.rs` above). If either is unset, the server runs open (fine for `127.0.0.1`, never for anything reachable off localhost) |
 
 `BREADCLOUD_USER` (or `dev` if unset) also names the owner the baseline
-personal/family/school calendars are bootstrapped under on startup -- see
-`breadcloud-caldav`'s section above.
+personal/family/school calendars and the default `contacts` addressbook are
+bootstrapped under on startup -- see `breadcloud-caldav`'s and
+`breadcloud-carddav`'s sections above.
 
 ## Running locally
 
@@ -768,6 +890,71 @@ discover the calendars automatically, via `current-user-principal` answered
 right at that bare root (see "Bare-root discovery" above for why this needed
 its own fix beyond the basic discovery chain). The full `/remote.php/dav/`
 URL works too, and both are covered in "Real-client verification" below.
+
+CardDAV (CLOUD-7) runs on the same server and port too. The startup log
+lists the addressbooks root; a single `contacts` addressbook is bootstrapped
+automatically:
+
+```bash
+# discover addressbook-home-set from the principal (spliced onto the same
+# response calendar-home-set already answers -- see breadcloud-carddav's
+# section above)
+curl -u dev:dev -X PROPFIND -H "Depth: 0" http://127.0.0.1:8080/remote.php/dav/principals/dev/
+
+# list the addressbook (Depth 1) with getctag
+curl -u dev:dev -X PROPFIND -H "Depth: 1" http://127.0.0.1:8080/remote.php/dav/addressbooks/dev/
+
+# create a contact
+curl -u dev:dev -X PUT --data-binary @- \
+  http://127.0.0.1:8080/remote.php/dav/addressbooks/dev/contacts/example-1.vcf <<'EOF'
+BEGIN:VCARD
+VERSION:4.0
+UID:example-1
+FN:Ada Lovelace
+EMAIL:ada@example.com
+END:VCARD
+EOF
+
+# create a group that references it (KIND:group + MEMBER, the standard
+# CardDAV representation DAVx5 and iOS Contacts both understand)
+curl -u dev:dev -X PUT --data-binary @- \
+  http://127.0.0.1:8080/remote.php/dav/addressbooks/dev/contacts/friends.vcf <<'EOF'
+BEGIN:VCARD
+VERSION:4.0
+UID:friends
+FN:Friends
+KIND:group
+MEMBER:urn:uuid:example-1
+END:VCARD
+EOF
+
+# list an addressbook's contacts directly (Depth 1 PROPFIND on the addressbook itself)
+curl -u dev:dev -X PROPFIND -H "Depth: 1" \
+  http://127.0.0.1:8080/remote.php/dav/addressbooks/dev/contacts/
+
+# ...or fetch matching contacts via REPORT addressbook-query (a property text-match)
+curl -u dev:dev -X REPORT --data '<?xml version="1.0"?>
+<c:addressbook-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav">
+  <d:prop><d:getetag/><c:address-data/></d:prop>
+  <c:filter><c:prop-filter name="FN"><c:text-match>Ada</c:text-match></c:prop-filter></c:filter>
+</c:addressbook-query>' http://127.0.0.1:8080/remote.php/dav/addressbooks/dev/contacts/
+
+# incremental sync (RFC 6578), identical shape to CalDAV's above
+curl -u dev:dev -X REPORT --data '<?xml version="1.0"?>
+<d:sync-collection xmlns:d="DAV:">
+  <d:sync-token/><d:prop><d:getetag/></d:prop>
+</d:sync-collection>' http://127.0.0.1:8080/remote.php/dav/addressbooks/dev/contacts/
+
+# delete it
+curl -u dev:dev -X DELETE \
+  http://127.0.0.1:8080/remote.php/dav/addressbooks/dev/contacts/example-1.vcf
+```
+
+Or point a real CardDAV client at the server: DAVx5 (Android) and iOS's
+native Contacts account type both take just the bare server address plus the
+same Basic-auth credentials and discover the addressbook automatically, via
+the same `current-user-principal` -> principal -> `addressbook-home-set`
+chain CalDAV discovery uses. Covered in "Real-client verification" below.
 
 ## Testing
 
@@ -1078,15 +1265,118 @@ protocol surface, but a real DAVx5/iOS pass has not happened. Flagged here
 explicitly per the issue's own ask to be clear about what was and wasn't
 live-verified.
 
+### CardDAV coverage (CLOUD-7)
+
+`breadcloud-carddav`'s own unit tests (`vcard.rs`, `path.rs`,
+`xml/request.rs`, `xml/response.rs`) cover: UID extraction and
+line-unfolding, `KIND:group` detection, property text-match (case-insensitive
+substring, including the "property absent" and "empty needle always
+matches" edge cases), CardDAV path parsing for every resource shape and its
+rejections, REPORT body parsing for all three shapes
+(`addressbook-multiget`, `addressbook-query` with and without a
+`prop-filter`/`text-match`, `sync-collection` with and without a token) plus
+an unrecognized REPORT type, extended-MKCOL body parsing for `displayname`,
+and multistatus response building for every resource kind.
+
+`tests/carddav_test.rs` drives the real `axum::Router` end to end via
+`tower::ServiceExt::oneshot`, simulating the request sequence a real client
+actually issues: addressbook-home-set listing at Depth 0 and 1, MKCOL
+(including rejecting a duplicate id with 405), PUT/GET/DELETE on contacts
+(including a missing-UID body rejected with 400 and a PUT into a
+nonexistent addressbook rejected with 409), a group vCard (`KIND:group` +
+`MEMBER`) round-tripping through PUT/GET exactly like a person vCard,
+`getctag` bumping on every contact create/update/delete, `REPORT
+addressbook-query` filtering by property text-match, `REPORT
+addressbook-multiget` fetching only the explicit hrefs given, `REPORT
+sync-collection` doing a correct initial sync (live resources only, no
+tombstones) followed by a correct incremental sync (only what changed,
+deletions reported as 404, a new sync-token), Basic auth rejecting missing
+and wrong credentials, `.well-known/carddav`'s redirect, `OPTIONS`
+advertising the `addressbook` DAV class, a Depth 1 PROPFIND on an
+addressbook collection listing its contact children, and a
+`full_discovery_to_sync_sequence` test chaining
+MKCOL -> multiple PUTs (including a group) -> `addressbook-query` ->
+`sync-collection` in one sequence, mirroring a real client's actual flow end
+to end.
+
+`breadcloud-storage`'s own unit tests cover `AddressbookStore` directly:
+create/list/get roundtrips, duplicate-id rejection, idempotent bootstrap
+(`ensure_addressbook`), addressbook-id traversal rejection,
+`contacts_storage` requiring an existing addressbook, ctag bumping on every
+recorded change, and `changes_since` both deduping to each uid's latest
+state and correctly filtering to only entries newer than a given token.
+
+`breadcloud-server`'s `combined.rs` test suite additionally covers the
+principal-splice mechanism itself: `card:addressbook-home-set` appearing
+alongside (not replacing) `cal:calendar-home-set` on the principal PROPFIND
+response, that splice not leaking onto a non-principal CalDAV PROPFIND,
+CardDAV requests dispatching correctly under the shared auth gate, and
+`.well-known/carddav`'s auth exemption.
+
+### Real-client verification (CLOUD-7)
+
+DAVx5 and iOS were not available on this machine, so as with CLOUD-6 this
+was verified against `vdirsyncer`, pointed at a disposable local server
+instance with disposable local storage -- never at any real contact data.
+Covered end to end, with `vdirsyncer` pointed at the **bare server root**
+(`http://127.0.0.1:8099/`, the same address DAVx5's/iOS's "just enter a
+server address" setup actually uses): `vdirsyncer discover` finding the
+`contacts` addressbook purely through this server's
+`current-user-principal` -> principal (`addressbook-home-set`) ->
+addressbook-listing discovery chain starting from that bare address, with no
+manual DAV path needed and no code changes required to make it work (unlike
+CLOUD-6, which needed two live-verification-driven fixes -- the
+addressbook-home-set splice and the Depth 1 PROPFIND enumeration were both
+already in place going into this pass, having been built as direct mirrors
+of the CLOUD-6 code those fixes landed in); two synthetic vCards (one
+person, one `KIND:group` group referencing it) created directly on the
+server via `curl PUT` and correctly downloaded to the local side on
+`vdirsyncer sync`; a new synthetic contact created locally and correctly
+uploaded to the server on the next sync, confirmed present via a
+server-side `GET`; `vdirsyncer` correctly recognizing identical content on
+both sides as "nothing to do" (a false-conflict check) rather than
+re-uploading or re-downloading; and a local deletion propagating to the
+server as a real `DELETE` that a subsequent `GET` then correctly 404s.
+
+Also manually verified via `curl` against that same disposable instance,
+independent of vdirsyncer's own sync logic: the full discovery chain
+(bare-root `current-user-principal`, principal PROPFIND carrying both
+`cal:calendar-home-set` and `card:addressbook-home-set` side by side,
+addressbook-home-set Depth 1 listing the bootstrapped `contacts`
+addressbook with `getctag`); PUT/GET round-tripping both a person vCard and
+a `KIND:group`/`MEMBER` group vCard; Depth 1 PROPFIND on the addressbook
+correctly listing both as children with `getctag` bumped to `2`; and
+`REPORT addressbook-query` with an `FN` `text-match` filter correctly
+returning only the matching contact's `address-data`.
+
+This did not use real contact data -- synthetic vCards only, on disposable
+scratch directories removed afterward -- since importing the real 76-contact
+address book with its Friends/ICE/starred/Family team groups into a running
+instance was not something this task was asked to do, and touching real
+personal contact content without being asked would be scope creep beyond
+implementing and verifying the protocol.
+
+**Not live-verified**: DAVx5 (Android) and iOS's native Contacts account
+type specifically -- neither device/emulator was available on this machine.
+Both are implemented against the documented RFC 6352/6578 protocol and the
+specific request shapes those two clients are known to send (the same
+`prop-filter`/`text-match` and `sync-collection` shapes CLOUD-6 already
+verified those clients use for CalDAV, plus the standard `KIND:group`/
+`MEMBER` group representation both clients are documented to read and
+write), and `vdirsyncer`'s own CardDAV storage backend exercises a
+materially similar protocol surface, but a real DAVx5/iOS pass has not
+happened. Flagged here explicitly per the issue's own ask to be clear about
+what was and wasn't live-verified.
+
 ## What's next in the epic
 
 See the CLOUD project on breadboard for the full epic. In rough order after
-CLOUD-6: CardDAV, notes, multi-user auth + per-user quotas (replacing
-the placeholder Basic auth here, and giving `fileid.rs` a real persistent id
-to hand out instead of a path-derived one -- which would also let the
-versions and trashbin DAV surfaces move to a real `<fileid>`-keyed layout
-instead of the path-/opaque-id-keyed ones they use today), a minimal web UI,
-and bread-ecosystem event integration. Each of those should be a new crate
-under `crates/` that depends on `breadcloud-storage` and, where it needs
-HTTP, nests alongside or reuses `breadcloud-webdav`'s router rather than
+CLOUD-7: notes, multi-user auth + per-user quotas (replacing the placeholder
+Basic auth here, and giving `fileid.rs` a real persistent id to hand out
+instead of a path-derived one -- which would also let the versions and
+trashbin DAV surfaces move to a real `<fileid>`-keyed layout instead of the
+path-/opaque-id-keyed ones they use today), a minimal web UI, and
+bread-ecosystem event integration. Each of those should be a new crate under
+`crates/` that depends on `breadcloud-storage` and, where it needs HTTP,
+nests alongside or reuses `breadcloud-webdav`'s router rather than
 duplicating it.

@@ -1,0 +1,22 @@
+[package]
+name = "breadcloud-carddav"
+version = "0.1.0"
+edition = "2021"
+description = "CardDAV (RFC 6352) HTTP layer for breadcloud, built on axum"
+
+[dependencies]
+breadcloud-storage = { path = "../breadcloud-storage" }
+breadcloud-webdav = { path = "../breadcloud-webdav" }
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tracing = "0.1"
+quick-xml = "0.36"
+percent-encoding = "2"
+httpdate = "1"
+bytes = "1"
+
+[dev-dependencies]
+tempfile = "3"
+http-body-util = "0.1"
+tower = { version = "0.4", features = ["util"] }

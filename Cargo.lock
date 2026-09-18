@@ -133,11 +133,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "breadcloud-carddav"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "breadcloud-storage",
+ "breadcloud-webdav",
+ "bytes",
+ "http-body-util",
+ "httpdate",
+ "percent-encoding",
+ "quick-xml",
+ "tempfile",
+ "tokio",
+ "tower 0.4.13",
+ "tracing",
+]
+
+[[package]]
 name = "breadcloud-server"
 version = "0.1.0"
 dependencies = [
  "axum",
  "breadcloud-caldav",
+ "breadcloud-carddav",
  "breadcloud-storage",
  "breadcloud-webdav",
  "http-body-util",
