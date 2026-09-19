@@ -14,10 +14,12 @@ resources, sync-collection/ctag) on that same shared server; CLOUD-11
 replaced the single placeholder account every prior issue ran against with a
 real, small multi-user account model: independently authenticated,
 independently quota'd, independently storage-isolated accounts, see "Multi-
-user accounts (CLOUD-11)" under `breadcloud-server` below; CLOUD-12 (this
-one) added a minimal server-rendered web UI (file browser + read-only
-calendar month view) on that same combined server and the same account
-model, see "Web UI (CLOUD-12)" under `breadcloud-server` below.
+user accounts (CLOUD-11)" under `breadcloud-server` below; CLOUD-12 added a
+minimal server-rendered web UI (file browser + read-only calendar month
+view) on that same combined server and the same account model, see "Web UI
+(CLOUD-12)" under `breadcloud-server` below; CLOUD-8 added the Nextcloud
+Notes OCS API (`breadcloud-notes`) as a JSON view over the same `Notes/`
+markdown files WebDAV already served, for the official Notes mobile app.
 
 ## Workspace layout
 
@@ -31,7 +33,8 @@ crates/
   breadcloud-caldav/    CalDAV (RFC 4791) HTTP layer, built on axum
   breadcloud-carddav/   CardDAV (RFC 6352) HTTP layer, built on axum
   breadcloud-webui/     minimal server-rendered web UI (file browser + calendar view), built on axum
-  breadcloud-server/    binary: wires storage + webdav + caldav + carddav + webui into one server
+  breadcloud-notes/     Nextcloud Notes OCS API (JSON view over the Notes/ file tree), built on axum
+  breadcloud-server/    binary: wires storage + webdav + caldav + carddav + webui + notes into one server
 ```
 
 ### breadcloud-storage
@@ -827,6 +830,62 @@ exist for this deployment to have events at all -- a write path here would
 mean either a second, form-shaped entry point into
 `breadcloud-caldav`'s PUT logic or a second event-authoring implementation,
 more surface than a "minimal" calendar *view* needs.
+
+### breadcloud-notes (CLOUD-8)
+
+The Nextcloud Notes OCS API: `/index.php/apps/notes/api/v1/{notes,settings,attachment}`,
+for the official Nextcloud Notes mobile app (confirmed in use for this
+deployment; see the CLOUD-8 card's investigation comment) rather than the
+plain WebDAV `Notes/` folder access every desktop client already gets for
+free with zero notes-specific code. The endpoint contract (routes, JSON
+field names, ETag/`If-Match` semantics, the `.attachments.<id>/` folder
+convention) is read directly off `nextcloud/notes`'s own source
+(`appinfo/routes.php`, `NotesApiController.php`, `Helper.php`, `Note.php`,
+`NoteUtil.php`, `Capabilities.php`), not guessed.
+
+**A JSON view over the same files, not a second store.** A note *is* a
+markdown file under an account's `Notes/` tree, addressed by a
+deterministically-derived id (`breadcloud_webdav::fileid::for_path`, the
+same scheme CLOUD-3 already uses for `OC-FileId`) instead of a path. Every
+write goes through the same `Storage::write_bytes` /
+`versioning::snapshot_before_overwrite` / `Storage::quota_gate` /
+`breadcloud_events::file_synced` sequence a plain WebDAV `PUT` runs (the
+same pattern `breadcloud-webui`'s own `files::upload` already established
+for a different wire format), and delete goes through
+`breadcloud_webdav::handlers::delete::handle` directly -- so a note
+created or edited through this API gets version history (CLOUD-4), goes
+through trash on delete (CLOUD-5), is quota-checked (CLOUD-11), and is
+immediately visible and editable through the file browser (CLOUD-12) or
+any WebDAV/desktop-sync client, with no divergent internal
+representation. Renaming a note (a `title`/`category` change) moves the
+underlying file and carries its version history along, the same two-step
+sequence `MOVE` runs; the one known gap this carries over from
+`breadcloud_webdav::fileid`'s own documented limitation is that a rename
+also changes the note's derived id, where real Nextcloud's database-row
+id would not.
+
+**Known, deliberate gaps**, called out here rather than left silent:
+`favorite`/`readonly` are accepted on create/update (matching the real
+request shape) but never persisted -- real Nextcloud stores `favorite` as
+a tag external to the file and `readonly` from filesystem permissions,
+neither of which this server has a per-file equivalent of, and adding a
+sidecar-metadata mechanism for one cosmetic flag was judged more scope
+than the issue asks for. `internalPath`/`shareTypes`/`isShared` (real
+Nextcloud's sharing metadata) are omitted entirely -- breadcloud has no
+sharing subsystem. Chunked/paginated listing (`chunkSize`/`chunkCursor`)
+and `pruneBefore` are not implemented; `category` filtering, `exclude`
+field-dropping, and the collection-level `If-None-Match` "has anything
+changed" shortcut are.
+
+**Wired in the same way as CalDAV/CardDAV/the web UI**: a plain
+`owns_path`/`dispatch` pair `breadcloud-server::combined` routes to from
+its one shared fallback, against the authenticated account's own already-
+resolved `breadcloud_webdav::AppState` (CLOUD-11) -- there is no `<user>`
+segment in this crate's URL space for a request to spoof. The OCS
+capabilities probe a real Notes client makes before calling its API at
+all (`GET /ocs/v1.php/cloud/capabilities`) now advertises a `notes` key
+(`breadcloud-webdav`'s `discovery.rs`), matching real Nextcloud's own
+`Capabilities.php` shape (`api_version`, `version`, `notes_path`).
 
 ### breadcloud-server
 
@@ -1658,11 +1717,12 @@ on it landing.
 ## What's next in the epic
 
 See the CLOUD project on breadboard for the full epic. CLOUD-11 (multi-user
-auth + per-user quotas), CLOUD-12 (the minimal web UI), and CLOUD-13
-(bread-ecosystem event integration, above) are all done, per their own
-sections above. CLOUD-8 (notes) remains parked in todo pending user input,
-including the open question of giving `fileid.rs` a real persistent id to
-hand out instead of a path-derived one (which would also let the versions
-and trashbin DAV surfaces move to a real `<fileid>`-keyed layout instead of
-the path-/opaque-id-keyed ones they use today). The rest of the epic is
+auth + per-user quotas), CLOUD-12 (the minimal web UI), CLOUD-13
+(bread-ecosystem event integration, above), and CLOUD-8 (the Notes OCS API,
+above) are all done, per their own sections above. An open question CLOUD-8
+leaves for a future issue: giving `fileid.rs` a real persistent id to hand
+out instead of a path-derived one (which would also let the versions,
+trashbin, and notes surfaces move to a real `<fileid>`-keyed layout instead
+of the path-/opaque-id-keyed ones they use today, and would let a note's id
+survive a rename the way real Nextcloud's does). The rest of the epic is
 intentionally held back for the user to pick up.

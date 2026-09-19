@@ -172,6 +172,15 @@ pub struct Storage {
     /// serializes anything across accounts, only concurrent quota-gated
     /// writes to this one account's tree.
     quota_mutex: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes "is this name free, then create it" sequences for this
+    /// account (CLOUD-8 rework): see [`Storage::create_gate`]. A separate
+    /// lock from `quota_mutex` on purpose -- a caller holding
+    /// `create_gate` typically also calls something that itself takes
+    /// `quota_gate` for the actual write (e.g.
+    /// `breadcloud-notes::handlers::write_note_content`), and
+    /// `tokio::sync::Mutex` is not reentrant, so reusing the same lock for
+    /// both would deadlock a single request against itself.
+    create_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Storage {
@@ -183,6 +192,7 @@ impl Storage {
             staging_root,
             etag_cache: Arc::new(Mutex::new(HashMap::new())),
             quota_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            create_mutex: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -818,6 +828,26 @@ impl Storage {
         let guard = self.quota_mutex.clone().lock_owned().await;
         let check = self.check_quota(limit_bytes, path, incoming_len).await?;
         Ok(QuotaGuard { lock: guard, check })
+    }
+
+    /// Serializes a whole "check whether some name is free, then create
+    /// it" sequence for this account (CLOUD-8 rework), the same TOCTOU fix
+    /// as [`Storage::quota_gate`] applied to a different race: a caller
+    /// like `breadcloud-notes::handlers::create` picks a dedup-suffixed
+    /// filename by probing for an unused one, then writes it; without a
+    /// lock held across both steps, two concurrent callers can each probe
+    /// while the other's write has not landed yet, both pick the same
+    /// "free" name, and the second write silently destroys the first
+    /// caller's content (confirmed live against the real server, see
+    /// CLOUD-8's review history).
+    ///
+    /// Held across the whole probe-then-write sequence, not just the
+    /// write, so the second caller's own probe only starts once the first
+    /// caller's file already exists on disk. Per-account granularity: each
+    /// account gets its own `Storage` instance and its own clone of this
+    /// `Arc`, so this never serializes create sequences across accounts.
+    pub async fn create_gate(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.create_mutex.clone().lock_owned().await
     }
 }
 

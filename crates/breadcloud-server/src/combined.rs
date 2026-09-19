@@ -187,6 +187,19 @@ async fn dispatch(State(state): State<CombinedState>, req: Request) -> Response 
             .into_response();
     };
 
+    if breadcloud_notes::owns_path(&path) {
+        // CLOUD-8: the Notes OCS API. Runs against `authed_user`'s own
+        // already-resolved `webdav_state` exactly like the web UI branch
+        // below -- a note is a real file in that account's own `Notes/`
+        // tree, so it needs that account's own `Storage`/`VersionStore`,
+        // not a separate store of its own. Checked before
+        // `breadcloud_webui::owns_path` since neither claims the other's
+        // URL space, so the order between them doesn't matter; this one
+        // is listed first only because CLOUD-8 was implemented after
+        // CLOUD-12.
+        return breadcloud_notes::dispatch(webdav_state, req).await;
+    }
+
     if breadcloud_webui::owns_path(&path) {
         // CLOUD-12: the minimal web UI. Runs against `authed_user`'s own
         // already-resolved `webdav_state` and the shared `caldav` state,

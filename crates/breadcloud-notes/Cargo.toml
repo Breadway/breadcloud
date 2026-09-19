@@ -1,0 +1,21 @@
+[package]
+name = "breadcloud-notes"
+version = "0.1.0"
+edition = "2021"
+description = "Nextcloud Notes OCS API (CLOUD-8): a JSON REST view over markdown files already served by breadcloud-webdav's Notes/ tree"
+
+[dependencies]
+breadcloud-storage = { path = "../breadcloud-storage" }
+breadcloud-webdav = { path = "../breadcloud-webdav" }
+breadcloud-events = { path = "../breadcloud-events" }
+axum = { version = "0.7", features = ["multipart"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+percent-encoding = "2"
+blake3 = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+http-body-util = "0.1"

@@ -220,6 +220,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "breadcloud-notes"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "blake3",
+ "breadcloud-events",
+ "breadcloud-storage",
+ "breadcloud-webdav",
+ "http-body-util",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "breadcloud-server"
 version = "0.1.0"
 dependencies = [
@@ -227,6 +245,7 @@ dependencies = [
  "base64",
  "breadcloud-caldav",
  "breadcloud-carddav",
+ "breadcloud-notes",
  "breadcloud-storage",
  "breadcloud-webdav",
  "breadcloud-webui",

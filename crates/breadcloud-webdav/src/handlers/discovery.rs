@@ -21,7 +21,17 @@ use axum::response::{IntoResponse, Response};
 
 const STATUS_JSON: &str = r#"{"installed":true,"maintenance":false,"needsDbUpgrade":false,"version":"28.0.0.0","versionstring":"28.0.0","edition":"","productname":"breadcloud","extendedSupport":false}"#;
 
-const CAPABILITIES_JSON: &str = r#"{"ocs":{"meta":{"status":"ok","statuscode":100,"message":"OK"},"data":{"version":{"major":28,"minor":0,"micro":0,"string":"28.0.0","edition":"","extended_support":false},"capabilities":{"core":{"pollinterval":60,"webdav-root":"remote.php/webdav"},"dav":{"chunking":"1.0"},"files":{"bigfileupload":true,"blacklisted_files":[],"chunking":"1.0","comments":false,"undelete":false,"versioning":true}}}}}"#;
+// CLOUD-8: the "notes" key is what the real Nextcloud Notes app's own
+// capability probe looks for before it will call its API at all --
+// confirmed against `nextcloud/notes`'s own `lib/AppInfo/Capabilities.php`
+// (`Application::APP_ID => ['api_version' => ..., 'version' => ...,
+// 'notes_path' => ...]`), not guessed. `api_version` matches the exact
+// list that upstream's `Application::$API_VERSIONS` advertises
+// (`breadcloud-notes` implements the plain `v1` routes those versions
+// cover); `notes_path` names the fixed folder `breadcloud-notes` actually
+// uses (see that crate's own `settings` handler for why it is fixed
+// rather than configurable).
+const CAPABILITIES_JSON: &str = r#"{"ocs":{"meta":{"status":"ok","statuscode":100,"message":"OK"},"data":{"version":{"major":28,"minor":0,"micro":0,"string":"28.0.0","edition":"","extended_support":false},"capabilities":{"core":{"pollinterval":60,"webdav-root":"remote.php/webdav"},"dav":{"chunking":"1.0"},"files":{"bigfileupload":true,"blacklisted_files":[],"chunking":"1.0","comments":false,"undelete":false,"versioning":true},"notes":{"api_version":["0.2","1.3","1.4"],"version":"4.7.0","notes_path":"Notes"}}}}}"#;
 
 /// `GET /status.php`. Deliberately does not require authentication (the
 /// auth middleware exempts it): real Nextcloud serves this endpoint
