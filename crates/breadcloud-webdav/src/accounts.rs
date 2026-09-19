@@ -108,6 +108,30 @@ impl AccountStore {
         self.accounts.keys().map(String::as_str)
     }
 
+    /// Check a plain username/password pair against this account set,
+    /// returning the authenticated username on success. This is the one
+    /// place credential checking actually happens; [`authenticate_request`]
+    /// (Basic auth) and `breadcloud-login`'s browser-facing form (CLOUD-28,
+    /// login flow v2) both funnel through this instead of each re-deriving
+    /// their own check, so there is exactly one credential path for the
+    /// whole server regardless of which surface a client authenticates
+    /// through (per CLOUD-28's own scoping note: login flow v2 must
+    /// integrate with this account model, not stand up a parallel one).
+    /// Username and password are checked together (`self.accounts.get(user)`
+    /// then verified against *that* account's own hash): this is not "does
+    /// this password match any configured account", which would let one
+    /// account's credentials authenticate as a different username.
+    ///
+    /// [`authenticate_request`]: AccountStore::authenticate_request
+    pub fn authenticate(&self, username: &str, password: &str) -> Option<String> {
+        let account = self.accounts.get(username)?;
+        if account.verify(password) {
+            Some(account.username.clone())
+        } else {
+            None
+        }
+    }
+
     /// Parse HTTP Basic credentials off `headers` and check them against
     /// this account set, returning the authenticated username on success.
     ///
@@ -118,10 +142,6 @@ impl AccountStore {
     /// account authenticated -- that identity is what selects the right
     /// per-user storage roots and is what every per-user isolation check
     /// this issue adds is built on (see `breadcloud-server::combined`).
-    /// Username and password are checked together (`self.accounts.get(user)`
-    /// then verified against *that* account's own hash): this is not "does
-    /// this password match any configured account", which would let one
-    /// account's credentials authenticate as a different username.
     pub fn authenticate_request(&self, headers: &HeaderMap) -> Option<String> {
         let value = headers.get("Authorization")?.to_str().ok()?;
         let encoded = value.strip_prefix("Basic ")?;
@@ -130,12 +150,7 @@ impl AccountStore {
             .ok()?;
         let text = String::from_utf8(decoded).ok()?;
         let (user, pass) = text.split_once(':')?;
-        let account = self.accounts.get(user)?;
-        if account.verify(pass) {
-            Some(account.username.clone())
-        } else {
-            None
-        }
+        self.authenticate(user, pass)
     }
 }
 

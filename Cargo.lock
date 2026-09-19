@@ -220,6 +220,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "breadcloud-login"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64",
+ "blake3",
+ "breadcloud-webdav",
+ "http-body-util",
+ "percent-encoding",
+ "rand_core",
+ "serde_json",
+ "tokio",
+ "tower 0.4.13",
+ "tracing",
+]
+
+[[package]]
 name = "breadcloud-notes"
 version = "0.1.0"
 dependencies = [
@@ -245,11 +262,13 @@ dependencies = [
  "base64",
  "breadcloud-caldav",
  "breadcloud-carddav",
+ "breadcloud-login",
  "breadcloud-notes",
  "breadcloud-storage",
  "breadcloud-webdav",
  "breadcloud-webui",
  "http-body-util",
+ "serde_json",
  "tempfile",
  "tokio",
  "tower 0.4.13",

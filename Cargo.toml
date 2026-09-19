@@ -7,6 +7,7 @@ members = [
     "crates/breadcloud-carddav",
     "crates/breadcloud-webui",
     "crates/breadcloud-notes",
+    "crates/breadcloud-login",
     "crates/breadcloud-server",
     "crates/breadcloud-events",
 ]
