@@ -96,4 +96,19 @@ impl AppState {
         self.owner = Some(username.into());
         self
     }
+
+    /// The account this `AppState` belongs to, for attaching an `owner`
+    /// field to a `bread.cloud.*` event (CLOUD-13): `owner` if this
+    /// instance is already resolved to one account (the real combined
+    /// server, CLOUD-11), falling back to `auth`'s configured username
+    /// for a standalone/test instance where `owner` is never set. `None`
+    /// (rather than a placeholder string) when neither is available, so
+    /// an event's `owner` field is honestly absent instead of a made-up
+    /// value. Same fallback `dispatch`'s own OCS `cloud/user` handler
+    /// uses (see this crate's `lib.rs`).
+    pub fn owner_label(&self) -> Option<&str> {
+        self.owner
+            .as_deref()
+            .or_else(|| self.auth.as_ref().map(|a| a.username.as_str()))
+    }
 }

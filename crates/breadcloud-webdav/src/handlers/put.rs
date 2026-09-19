@@ -41,11 +41,12 @@ pub async fn handle(state: &AppState, path: &DavPath, req: Request) -> Response 
     // CLOUD-11: reject a write that would exceed this account's quota
     // before it touches disk at all. `quota_gate` also closes the TOCTOU
     // window a bare `check_quota` call would leave open: it holds this
-    // account's quota mutex from here until `_quota_guard` drops (end of
+    // account's quota mutex from here until `quota_guard` drops (end of
     // this function), so a concurrent PUT/chunked-finalize against the
     // same account cannot observe "room available" for bytes this write
-    // already claimed.
-    let _quota_guard = match state.quota_limit_bytes {
+    // already claimed. Also carries the before/after usage this call
+    // computed (CLOUD-13's `bread.cloud.quota.warning`, emitted below).
+    let quota_guard = match state.quota_limit_bytes {
         Some(limit) => match state
             .storage
             .quota_gate(limit, path, bytes.len() as u64)
@@ -64,6 +65,29 @@ pub async fn handle(state: &AppState, path: &DavPath, req: Request) -> Response 
         Ok(v) => v,
         Err(err) => return storage_error_response(err),
     };
+
+    // CLOUD-13: this write landed, so it counts as a sync. Best-effort,
+    // see `breadcloud_events` module docs.
+    breadcloud_events::file_synced(
+        state.owner_label(),
+        &path.to_request_path(),
+        breadcloud_events::FileOp::Put,
+        Some(bytes.len() as u64),
+    );
+    if let Some(guard) = &quota_guard {
+        if let Some(percent) = breadcloud_events::crossed_threshold(
+            guard.check.used_before,
+            guard.check.used_after,
+            guard.check.limit_bytes,
+        ) {
+            breadcloud_events::quota_warning(
+                state.owner_label(),
+                guard.check.used_after,
+                guard.check.limit_bytes,
+                percent,
+            );
+        }
+    }
 
     let mtime_accepted = match crate::mtime::parse_oc_mtime(&headers) {
         Some(mtime) => crate::mtime::apply(state.storage.resolve(path), mtime),

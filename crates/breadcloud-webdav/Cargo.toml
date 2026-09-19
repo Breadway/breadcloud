@@ -6,6 +6,7 @@ description = "WebDAV (RFC 4918) HTTP layer for breadcloud, built on axum"
 
 [dependencies]
 breadcloud-storage = { path = "../breadcloud-storage" }
+breadcloud-events = { path = "../breadcloud-events" }
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 tower = "0.4"

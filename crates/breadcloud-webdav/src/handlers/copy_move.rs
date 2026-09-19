@@ -60,6 +60,19 @@ pub async fn handle(
                         "failed to carry version history from {source} to {destination}: {err}"
                     );
                 }
+                // CLOUD-13: a MOVE is a sync (a rename); a COPY produces
+                // an independent new resource and is deliberately not
+                // reported (see `breadcloud_events::FileOp`). `bytes` is
+                // omitted: unlike PUT/chunked-upload finalize, nothing on
+                // this path already knows the resulting size, and `source`
+                // may itself have been a directory. Best-effort, see
+                // `breadcloud_events` module docs.
+                breadcloud_events::file_synced(
+                    state.owner_label(),
+                    &destination.to_request_path(),
+                    breadcloud_events::FileOp::Move,
+                    None,
+                );
             }
             let status = match outcome {
                 WriteOutcome::Created => StatusCode::CREATED,

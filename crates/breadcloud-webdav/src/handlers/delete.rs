@@ -14,7 +14,20 @@ pub async fn handle(state: &AppState, path: &DavPath) -> Response {
     // `crate::trash::move_to_trash` and the workspace README for the
     // retention-cap and version-history interaction decisions.
     match crate::trash::move_to_trash(state, path).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // CLOUD-13: best-effort, see `breadcloud_events` module docs.
+            // `bytes` is omitted: `path` may name a directory, and unlike
+            // the file-op paths there is no size already in hand here
+            // (only `move_to_trash`'s own recursive walk would have it,
+            // not worth paying for again just for this).
+            breadcloud_events::file_synced(
+                state.owner_label(),
+                &path.to_request_path(),
+                breadcloud_events::FileOp::Delete,
+                None,
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(resp) => resp,
     }
 }

@@ -754,22 +754,27 @@ impl Storage {
         limit_bytes: u64,
         path: &DavPath,
         incoming_len: u64,
-    ) -> Result<(), StorageError> {
+    ) -> Result<QuotaCheck, StorageError> {
         let existing_len = match self.metadata(path).await {
             Ok(meta) if !meta.is_dir() => meta.len,
             _ => 0,
         };
-        let used = self.used_bytes().await?;
-        let used_after = used
+        let used_before = self.used_bytes().await?;
+        let used_after = used_before
             .saturating_sub(existing_len)
             .saturating_add(incoming_len);
         if used_after > limit_bytes {
             return Err(StorageError::QuotaExceeded {
                 limit: limit_bytes,
                 used_after,
+                used_before,
             });
         }
-        Ok(())
+        Ok(QuotaCheck {
+            limit_bytes,
+            used_before,
+            used_after,
+        })
     }
 
     /// The safe entry point for a quota-gated write (CLOUD-11): closes the
@@ -811,9 +816,21 @@ impl Storage {
         incoming_len: u64,
     ) -> Result<QuotaGuard, StorageError> {
         let guard = self.quota_mutex.clone().lock_owned().await;
-        self.check_quota(limit_bytes, path, incoming_len).await?;
-        Ok(QuotaGuard(guard))
+        let check = self.check_quota(limit_bytes, path, incoming_len).await?;
+        Ok(QuotaGuard { lock: guard, check })
     }
+}
+
+/// The before/after usage a successful [`Storage::check_quota`] or
+/// [`Storage::quota_gate`] call computed (CLOUD-11), exposed so a caller
+/// can detect a threshold crossing (CLOUD-13's `bread.cloud.quota.warning`,
+/// see `breadcloud-events::crossed_threshold`) without a second,
+/// redundant usage walk.
+#[derive(Debug, Clone, Copy)]
+pub struct QuotaCheck {
+    pub limit_bytes: u64,
+    pub used_before: u64,
+    pub used_after: u64,
 }
 
 /// RAII guard returned by [`Storage::quota_gate`] on success. Holds this
@@ -822,7 +839,12 @@ impl Storage {
 /// completed or been abandoned, then let it drop (explicitly, or by
 /// falling out of scope). Dropping it any earlier re-opens the exact
 /// TOCTOU window `quota_gate` exists to close.
-pub struct QuotaGuard(#[allow(dead_code)] tokio::sync::OwnedMutexGuard<()>);
+pub struct QuotaGuard {
+    #[allow(dead_code)]
+    lock: tokio::sync::OwnedMutexGuard<()>,
+    /// The usage this call's `check_quota` computed. See [`QuotaCheck`].
+    pub check: QuotaCheck,
+}
 
 fn to_metadata(meta: &std::fs::Metadata) -> Metadata {
     Metadata {

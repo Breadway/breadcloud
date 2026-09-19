@@ -10,6 +10,7 @@
 
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
+use breadcloud_events::ConflictReason;
 use breadcloud_storage::{DavPath, StorageError};
 
 use crate::error::storage_error_response;
@@ -41,12 +42,18 @@ pub async fn check(state: &AppState, path: &DavPath, headers: &HeaderMap) -> Opt
         if value.trim() == "*" {
             if current_etag.is_some() {
                 return Some(precondition_failed(
+                    state,
+                    path,
+                    ConflictReason::IfNoneMatch,
                     "If-None-Match: * but the resource already exists",
                 ));
             }
         } else if let Some(etag) = &current_etag {
             if etag_list_contains(value, etag) {
                 return Some(precondition_failed(
+                    state,
+                    path,
+                    ConflictReason::IfNoneMatch,
                     "If-None-Match matched the resource's current etag",
                 ));
             }
@@ -57,12 +64,18 @@ pub async fn check(state: &AppState, path: &DavPath, headers: &HeaderMap) -> Opt
         match &current_etag {
             None => {
                 return Some(precondition_failed(
+                    state,
+                    path,
+                    ConflictReason::IfMatch,
                     "If-Match sent but the resource does not exist",
                 ))
             }
             Some(etag) => {
                 if value.trim() != "*" && !etag_list_contains(value, etag) {
                     return Some(precondition_failed(
+                        state,
+                        path,
+                        ConflictReason::IfMatch,
                         "If-Match did not match: the resource changed since it was last read",
                     ));
                 }
@@ -81,10 +94,22 @@ fn etag_list_contains(header_value: &str, etag: &str) -> bool {
     header_value.split(',').map(str::trim).any(|v| v == etag)
 }
 
-fn precondition_failed(reason: &str) -> Response {
+/// Builds the 412 response and, alongside it, publishes
+/// `bread.cloud.sync.conflict` (CLOUD-13): this precondition failure is
+/// exactly the case a real sync client turns into a "conflicted copy"
+/// instead of silently overwriting or losing a change, so it is the one
+/// place both PUT and chunked-upload finalize share to detect a conflict
+/// (see this module's doc comment).
+fn precondition_failed(
+    state: &AppState,
+    path: &DavPath,
+    reason: ConflictReason,
+    message: &str,
+) -> Response {
+    breadcloud_events::sync_conflict(state.owner_label(), &path.to_request_path(), reason);
     (
         axum::http::StatusCode::PRECONDITION_FAILED,
-        reason.to_string(),
+        message.to_string(),
     )
         .into_response()
 }

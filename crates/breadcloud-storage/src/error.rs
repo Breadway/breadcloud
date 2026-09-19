@@ -82,5 +82,14 @@ pub enum StorageError {
         "quota exceeded: this write would bring usage to {used_after} bytes, over the \
          {limit}-byte limit"
     )]
-    QuotaExceeded { limit: u64, used_after: u64 },
+    QuotaExceeded {
+        limit: u64,
+        used_after: u64,
+        /// Usage immediately before this write was attempted. Carried
+        /// alongside `used_after` so a caller (breadcloud-events'
+        /// `crossed_threshold`, CLOUD-13) can tell a rejection that was
+        /// already over quota before this write even started apart from
+        /// the write that newly pushed it over, without a second query.
+        used_before: u64,
+    },
 }

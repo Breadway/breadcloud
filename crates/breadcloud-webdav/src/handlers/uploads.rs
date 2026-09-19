@@ -302,12 +302,13 @@ async fn finalize(state: &AppState, transfer_dir: &DavPath, headers: &HeaderMap)
     // `prepared` on a rejection leaves it (and everything else)
     // untouched, same guarantee plain PUT's pre-write check gets.
     //
-    // `_quota_guard` holds this account's quota mutex until it drops at
+    // `quota_guard` holds this account's quota mutex until it drops at
     // the end of this function, closing the same TOCTOU window plain PUT
     // closes: a concurrent PUT or chunked finalize against this account
     // cannot observe "room available" for bytes this finalize already
-    // claimed.
-    let _quota_guard = match state.quota_limit_bytes {
+    // claimed. Also carries the before/after usage this call computed
+    // (CLOUD-13's `bread.cloud.quota.warning`, emitted below).
+    let quota_guard = match state.quota_limit_bytes {
         Some(limit) => match state
             .storage
             .quota_gate(limit, &dest, prepared.total())
@@ -335,7 +336,7 @@ async fn finalize(state: &AppState, transfer_dir: &DavPath, headers: &HeaderMap)
     }
 
     match state.storage.commit_assemble(prepared).await {
-        Ok((outcome, _total, etag)) => {
+        Ok((outcome, total, etag)) => {
             let mtime_accepted = match crate::mtime::parse_oc_mtime(headers) {
                 Some(mtime) => crate::mtime::apply(state.storage.resolve(&dest), mtime),
                 None => false,
@@ -344,6 +345,30 @@ async fn finalize(state: &AppState, transfer_dir: &DavPath, headers: &HeaderMap)
             // point, so a failure to clean up the staging directory is
             // not worth failing the request over.
             let _ = state.uploads.delete(transfer_dir).await;
+
+            // CLOUD-13: this finalize committed the assembled file, so it
+            // counts as a sync. Best-effort, see `breadcloud_events`
+            // module docs.
+            breadcloud_events::file_synced(
+                state.owner_label(),
+                &dest.to_request_path(),
+                breadcloud_events::FileOp::ChunkedUpload,
+                Some(total),
+            );
+            if let Some(guard) = &quota_guard {
+                if let Some(percent) = breadcloud_events::crossed_threshold(
+                    guard.check.used_before,
+                    guard.check.used_after,
+                    guard.check.limit_bytes,
+                ) {
+                    breadcloud_events::quota_warning(
+                        state.owner_label(),
+                        guard.check.used_after,
+                        guard.check.limit_bytes,
+                        percent,
+                    );
+                }
+            }
 
             let status = match outcome {
                 WriteOutcome::Created => StatusCode::CREATED,

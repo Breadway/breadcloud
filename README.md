@@ -1611,15 +1611,58 @@ materially similar protocol surface, but a real DAVx5/iOS pass has not
 happened. Flagged here explicitly per the issue's own ask to be clear about
 what was and wasn't live-verified.
 
+## bread ecosystem integration
+
+`crates/breadcloud-events` (CLOUD-13) publishes `bread.cloud.*` events into
+the bread automation fabric, following the `AdapterSource::App` registry /
+command-as-event convention documented in the `bread` repo's
+`Documentation.md` ("Namespaces" and "Integrating a bread\* app") and worked
+out as breadclip's reference implementation (see its own `EVENTS.md`).
+breadcloud registers app id `cloud`; see this repo's own `EVENTS.md` for the
+full event catalogue.
+
+This is explicitly optional: breadcloud behaves identically whether or not
+`breadd` is installed or running. Every publish goes through `BreadClient`'s
+already fail-silent `emit` (no socket, no reply, no error, just dropped) and
+is additionally dispatched onto a blocking-thread-pool task rather than run
+inline on the request-handling async task, so a slow or wedged `breadd` can
+never add latency to the WebDAV request that triggered the event, and a
+failure to notify it never fails that request.
+
+Three events, each tied to already-implemented server behavior: a completed
+write or removal (`bread.cloud.file.synced`, covering plain PUT,
+chunked-upload finalize, DELETE, and MOVE -- not COPY, which produces an
+independent resource with no prior state to "sync"), a rejected
+`If-Match`/`If-None-Match` precondition (`bread.cloud.sync.conflict`, the
+exact case a real sync client turns into a "conflicted copy" instead of
+silently overwriting or losing a change, CLOUD-3's conflict detection), and
+usage crossing an 80/90/100 percent-of-quota threshold on a write
+(`bread.cloud.quota.warning`, CLOUD-11's per-account quota).
+
+**Live-verified**: the wire protocol against the real `breadd` running on
+this machine (`bread ping`, and a raw socket write reproducing exactly what
+`BreadClient::emit` sends) -- confirmed the request/response shape matches,
+and confirmed `breadd`'s registered-app-id gate (`bread_shared::apps::is_known_app`)
+rejects an unregistered `cloud` source with a plain error string that
+`BreadClient::emit` never even reads, i.e. a rejection at that layer is
+already invisible to breadcloud today, before `cloud` is even registered.
+**Not live-verified**: `cloud` accepted end to end and observed via
+`bread events`/`bread.on("bread.cloud.**", ...)` -- `cloud` is not yet in
+`bread`'s `KNOWN_APPS`; registering it is a companion one-line change to the
+`bread` repo (see `Documentation.md`'s integration checklist, step 1), opened
+as `Breadway/bread` PR #5 (`feature/register-breadcloud-app`), not yet
+merged. Once that merges and a `breadd` build that includes it is installed,
+these events flow through unchanged; nothing on breadcloud's side is gated
+on it landing.
+
 ## What's next in the epic
 
 See the CLOUD project on breadboard for the full epic. CLOUD-11 (multi-user
-auth + per-user quotas) and CLOUD-12 (the minimal web UI) are both done, per
-their own sections above. Remaining, in rough order: notes (CLOUD-8, left in
-todo pending user input), giving `fileid.rs` a real persistent id to hand
-out instead of a path-derived one (which would also let the versions and
-trashbin DAV surfaces move to a real `<fileid>`-keyed layout instead of the
-path-/opaque-id-keyed ones they use today), and bread-ecosystem event
-integration. Each of those should be a new crate under `crates/` that
-depends on `breadcloud-storage` and, where it needs HTTP, nests alongside or
-reuses `breadcloud-webdav`'s router rather than duplicating it.
+auth + per-user quotas), CLOUD-12 (the minimal web UI), and CLOUD-13
+(bread-ecosystem event integration, above) are all done, per their own
+sections above. CLOUD-8 (notes) remains parked in todo pending user input,
+including the open question of giving `fileid.rs` a real persistent id to
+hand out instead of a path-derived one (which would also let the versions
+and trashbin DAV surfaces move to a real `<fileid>`-keyed layout instead of
+the path-/opaque-id-keyed ones they use today). The rest of the epic is
+intentionally held back for the user to pick up.
