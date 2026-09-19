@@ -23,7 +23,10 @@ use breadcloud_storage::{DavPath, StorageError};
 use breadcloud_webdav::AppState;
 
 use crate::form::parse_urlencoded;
-use crate::template::{breadcrumbs, encode_ui_path, html_escape, html_response, human_bytes, page};
+use crate::template::{
+    breadcrumbs, encode_ui_path, html_escape, html_response, human_bytes, page, FILE_ICON,
+    FOLDER_ICON,
+};
 
 /// Safety cap on a UI-uploaded file, matching the plain PUT path's own
 /// buffered-body cap (`breadcloud_webdav::handlers::put::MAX_BODY_BYTES`,
@@ -78,13 +81,25 @@ pub async fn browse(state: &AppState, user: &str, path: &DavPath) -> Response {
         let used = human_bytes(quota.used_bytes);
         body.push_str(&format!(r#"<div class="quota">{used} used"#));
         if let Some(limit) = state.quota_limit_bytes {
-            let pct = if limit == 0 {
+            let raw_pct = if limit == 0 {
                 100.0
             } else {
-                (quota.used_bytes as f64 / limit as f64 * 100.0).min(100.0)
+                quota.used_bytes as f64 / limit as f64 * 100.0
+            };
+            let pct = raw_pct.min(100.0);
+            // Same 80/90/100 percent-of-quota bands `breadcloud-events`'
+            // `crossed_threshold` (CLOUD-13) already warns on, reused here
+            // purely for the bar's color -- no event is emitted by
+            // rendering a page, this is presentation only.
+            let bar_class = if raw_pct >= 100.0 {
+                " critical"
+            } else if raw_pct >= 80.0 {
+                " warn"
+            } else {
+                ""
             };
             body.push_str(&format!(
-                " of {}<div class=\"quota-bar\"><div style=\"width:{pct:.1}%\"></div></div>",
+                " of {}<div class=\"quota-bar{bar_class}\"><div style=\"width:{pct:.1}%\"></div></div>",
                 human_bytes(limit)
             ));
         }
@@ -143,6 +158,12 @@ pub async fn browse(state: &AppState, user: &str, path: &DavPath) -> Response {
             // attribute. Both encodings are needed, one does not
             // substitute for the other.
             let row_href = html_escape(&row_href);
+            let icon = if is_dir { FOLDER_ICON } else { FILE_ICON };
+            let link_class = if is_dir {
+                "entry-link is-dir"
+            } else {
+                "entry-link"
+            };
             // The confirm() prompt deliberately does not interpolate the
             // file name into the inline JS: an attribute-escaped name is
             // still decoded back to raw text before the browser compiles
@@ -151,7 +172,7 @@ pub async fn browse(state: &AppState, user: &str, path: &DavPath) -> Response {
             // prompt sidesteps that entirely rather than trying to get a
             // second, JS-flavored escaping right for one confirm dialog.
             body.push_str(&format!(
-                r#"<tr><td><a href="{row_href}">{escaped_label}</a></td><td class="size">{size}</td><td class="modified">{modified}</td><td class="actions">
+                r#"<tr><td><a href="{row_href}" class="{link_class}">{icon}<span class="entry-name">{escaped_label}</span></a></td><td class="size">{size}</td><td class="modified">{modified}</td><td class="actions">
 <form method="post" action="/ui/delete" onsubmit="return confirm('Delete this item?');">
   <input type="hidden" name="path" value="{full_path}">
   <button class="btn danger" type="submit">Delete</button>

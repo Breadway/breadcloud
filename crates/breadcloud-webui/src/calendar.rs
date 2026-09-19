@@ -26,7 +26,10 @@ use axum::response::Response;
 use breadcloud_caldav::{ical, AppState as CaldavState};
 use breadcloud_storage::{CalendarInfo, DavPath};
 
-use crate::datetime::{current_year_month, day_of_week, days_in_month, MONTH_NAMES, WEEKDAY_NAMES};
+use crate::datetime::{
+    civil_from_system_time, current_year_month, day_of_week, days_in_month, MONTH_NAMES,
+    WEEKDAY_NAMES,
+};
 use crate::form::parse_urlencoded;
 use crate::template::{html_escape, html_response, page};
 
@@ -65,8 +68,16 @@ pub async fn month_view(caldav: &CaldavState, user: &str, query: &str) -> Respon
         }
     }
 
+    let (today_year, today_month, today_day, ..) =
+        civil_from_system_time(std::time::SystemTime::now());
     let title = format!("{} {year}", MONTH_NAMES[(month - 1) as usize]);
-    let body = render_month(year, month, &calendars, &events_by_day);
+    let body = render_month(
+        year,
+        month,
+        &calendars,
+        &events_by_day,
+        (today_year, today_month, today_day),
+    );
     html_response(page(&title, user, "calendar", &body))
 }
 
@@ -94,6 +105,7 @@ fn render_month(
     month: u32,
     calendars: &[CalendarInfo],
     events_by_day: &BTreeMap<u32, Vec<(String, ical::EventSummary)>>,
+    today: (i64, u32, u32),
 ) -> String {
     let (prev_year, prev_month) = adjacent_month(year, month, -1);
     let (next_year, next_month) = adjacent_month(year, month, 1);
@@ -130,7 +142,9 @@ fn render_month(
         ));
     }
     for day in 1..=total_days {
-        let mut cell = format!(r#"<td><div class="daynum">{day}</div>"#);
+        let is_today = today == (year, month, day);
+        let cell_class = if is_today { r#" class="today""# } else { "" };
+        let mut cell = format!(r#"<td{cell_class}><div class="daynum">{day}</div>"#);
         if let Some(events) = events_by_day.get(&day) {
             let mut sorted: Vec<&(String, ical::EventSummary)> = events.iter().collect();
             sorted.sort_by_key(|entry| (entry.1.hour, entry.1.minute));
@@ -196,6 +210,18 @@ mod tests {
         assert_eq!(parse_year_month("year=2026&month=13"), None);
         assert_eq!(parse_year_month("year=2026&month=0"), None);
         assert_eq!(parse_year_month("year=2026&month=6"), Some((2026, 6)));
+    }
+
+    #[test]
+    fn render_month_marks_todays_cell_only_when_it_falls_in_the_rendered_month() {
+        let empty = BTreeMap::new();
+        let in_month = render_month(2026, 6, &[], &empty, (2026, 6, 15));
+        assert!(in_month.contains(r#"<td class="today"><div class="daynum">15</div>"#));
+
+        // A different month never marks any cell as today, even though
+        // day 15 still exists in it.
+        let other_month = render_month(2026, 7, &[], &empty, (2026, 6, 15));
+        assert!(!other_month.contains("class=\"today\""));
     }
 
     #[test]

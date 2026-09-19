@@ -24,6 +24,9 @@ pub enum UiRoute {
     Download(DavPath),
     /// `/ui/calendar`: the month view.
     Calendar,
+    /// `/ui/style.css`: the shared stylesheet (CLOUD-24) every page links
+    /// to.
+    Style,
     /// `/ui/upload` (POST): a multipart file upload.
     Upload,
     /// `/ui/mkdir` (POST): create a folder.
@@ -59,6 +62,9 @@ impl UiRoute {
 
         if rest == "/calendar" || rest == "/calendar/" {
             return Some(UiRoute::Calendar);
+        }
+        if rest == "/style.css" {
+            return Some(UiRoute::Style);
         }
         if rest == "/upload" {
             return Some(UiRoute::Upload);
@@ -126,6 +132,11 @@ mod tests {
         assert_eq!(UiRoute::parse("/ui/upload"), Some(UiRoute::Upload));
         assert_eq!(UiRoute::parse("/ui/mkdir"), Some(UiRoute::Mkdir));
         assert_eq!(UiRoute::parse("/ui/delete"), Some(UiRoute::Delete));
+    }
+
+    #[test]
+    fn parses_stylesheet() {
+        assert_eq!(UiRoute::parse("/ui/style.css"), Some(UiRoute::Style));
     }
 
     #[test]

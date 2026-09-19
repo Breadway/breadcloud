@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::{Method, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
@@ -150,6 +150,39 @@ fn url_scoped_user(path: &str) -> Option<&str> {
     None
 }
 
+/// True only for the one request shape that means "a browser navigated to
+/// the bare server root", never for anything a WebDAV/CalDAV/CardDAV
+/// client sends there. Two conditions, both required:
+///
+/// - Method is exactly GET. PROPFIND, OPTIONS, PUT, DELETE, MKCOL, and
+///   every other verb this dispatcher's bare-root fallthrough answers are
+///   untouched by this check no matter what headers they carry --
+///   `dispatch` only ever calls this for the one fallthrough branch below,
+///   and even there the method guard here means non-GET requests always
+///   return `false` and keep going exactly as before.
+/// - The request's `Accept` header names `text/html`. This is the same
+///   "is this a browser, not a CLI/sync client" signal used elsewhere on
+///   the web: a real browser navigation always sends
+///   `Accept: text/html,...`, while every WebDAV/CalDAV/CardDAV client
+///   this codebase has been tested against (rclone, DAVx5, vdirsyncer,
+///   Cyberduck, the `breadcloud-webdav` test suite's own bare `curl`-style
+///   requests) either omits `Accept` entirely or sends `Accept: */*` --
+///   consistent with `breadcloud_webdav::handlers::get`'s own doc comment
+///   that real sync/file-manager clients never issue a bare GET on a
+///   collection at all (they discover via PROPFIND), so this header check
+///   is a second, belt-and-suspenders guard on top of an already-narrow
+///   method+path match, not the only thing standing between this and a
+///   real client's request.
+fn is_browser_root_navigation(method: &Method, path: &str, headers: &HeaderMap) -> bool {
+    if method != Method::GET || path != "/" {
+        return false;
+    }
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|accept| accept.contains("text/html"))
+}
+
 async fn dispatch(State(state): State<CombinedState>, req: Request) -> Response {
     let path = req.uri().path().to_string();
 
@@ -251,6 +284,25 @@ async fn dispatch(State(state): State<CombinedState>, req: Request) -> Response 
 
     if breadcloud_carddav::owns_path(&path) {
         return breadcloud_carddav::dispatch(state.carddav.clone(), req).await;
+    }
+
+    // CLOUD-24: a plain browser navigating to the bare server root gets
+    // sent to the web UI's file browser instead of falling through to
+    // `breadcloud_webdav`'s own bare directory-listing GET fallback (see
+    // `handlers::get::directory_listing`'s doc comment) -- that listing
+    // exists for `curl`/debugging, not as the thing a person expects to
+    // land on when they type the server's address into a browser.
+    // Checked ahead of (and does not touch) every WebDAV verb this same
+    // path already answers: PROPFIND (the CLOUD-6 discovery splice right
+    // below), OPTIONS, PUT, DELETE, and so on all keep falling through to
+    // `breadcloud_webdav::dispatch` exactly as before, since
+    // `is_browser_root_navigation` only ever returns `true` for GET.
+    if is_browser_root_navigation(req.method(), &path, req.headers()) {
+        return Response::builder()
+            .status(StatusCode::FOUND)
+            .header("Location", "/ui/files/")
+            .body(Body::empty())
+            .unwrap();
     }
 
     // A PROPFIND at the bare server root is exactly the request DAVx5's
@@ -2185,5 +2237,195 @@ mod tests {
         )
         .await;
         assert!(!body_string(bob_january).await.contains("Team standup"));
+    }
+
+    /// CLOUD-24: a plain browser GET at the bare root (the shape a real
+    /// browser navigation sends: method GET, `Accept: text/html`) redirects
+    /// straight to the file browser instead of falling through to
+    /// `breadcloud_webdav`'s bare directory-listing fallback.
+    #[tokio::test]
+    async fn browser_get_at_bare_root_redirects_to_the_file_browser() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
+
+        let response = request_as(
+            &app,
+            "GET",
+            "/",
+            "alice",
+            "secret1",
+            &[(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response.headers().get("Location").unwrap(),
+            "/ui/files/",
+            "a browser landing on the bare root must be sent to the file browser"
+        );
+    }
+
+    /// The same redirect must never fire for a request that does not look
+    /// like a browser navigation -- this is exactly the regression this
+    /// fix must not introduce: a WebDAV/sync client's bare GET (no
+    /// `Accept: text/html`, the shape every real client this codebase has
+    /// been tested against actually sends) keeps getting
+    /// `breadcloud_webdav`'s own bare directory-listing response.
+    #[tokio::test]
+    async fn non_browser_get_at_bare_root_is_not_redirected() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
+
+        let response = request_as(&app, "GET", "/", "alice", "secret1", &[], Vec::new()).await;
+        assert_ne!(
+            response.status(),
+            StatusCode::FOUND,
+            "a bare GET with no Accept: text/html must not be redirected"
+        );
+
+        let response = request_as(
+            &app,
+            "GET",
+            "/",
+            "alice",
+            "secret1",
+            &[("Accept", "*/*")],
+            Vec::new(),
+        )
+        .await;
+        assert_ne!(
+            response.status(),
+            StatusCode::FOUND,
+            "Accept: */* (what curl and most WebDAV clients send) must not be redirected"
+        );
+    }
+
+    /// CLOUD-24's whole point is that this redirect must never regress
+    /// PROPFIND discovery at the bare root (CLOUD-6/7): re-asserts the
+    /// existing `current-user-principal` splice still fires, this time
+    /// with a browser-shaped `Accept: text/html` header attached, to prove
+    /// the new check really does gate on method, not just on the header.
+    #[tokio::test]
+    async fn propfind_at_bare_root_is_unaffected_even_with_a_browser_accept_header() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
+
+        let response = request_as(
+            &app,
+            "PROPFIND",
+            "/",
+            "alice",
+            "secret1",
+            &[("Depth", "0"), ("Accept", "text/html")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::from_u16(207).unwrap());
+        let xml = body_string(response).await;
+        assert!(
+            xml.contains("<d:current-user-principal>"),
+            "expected current-user-principal in bare-root PROPFIND response even with a \
+             browser-shaped Accept header, got: {xml}"
+        );
+    }
+
+    /// OPTIONS at the bare root (a real WebDAV client's capability probe)
+    /// is also untouched: different method, so `is_browser_root_navigation`
+    /// never matches regardless of headers.
+    #[tokio::test]
+    async fn options_at_bare_root_is_unaffected() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
+
+        let response = request_as(
+            &app,
+            "OPTIONS",
+            "/",
+            "alice",
+            "secret1",
+            &[("Accept", "text/html")],
+            Vec::new(),
+        )
+        .await;
+        assert_ne!(response.status(), StatusCode::FOUND);
+    }
+
+    /// The web UI's shared stylesheet is served at `/ui/style.css`, and
+    /// every rendered page links to it (rather than repeating an inline
+    /// `<style>` block per response).
+    #[tokio::test]
+    async fn ui_stylesheet_is_served_and_linked_from_every_page() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
+
+        let css = request_as(
+            &app,
+            "GET",
+            "/ui/style.css",
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(css.status(), StatusCode::OK);
+        let content_type = css
+            .headers()
+            .get("Content-Type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(content_type.contains("text/css"));
+        let css_body = body_string(css).await;
+        assert!(!css_body.trim().is_empty());
+        assert!(css_body.contains("--bg"));
+
+        let home = request_as(&app, "GET", "/ui/", "alice", "secret1", &[], Vec::new()).await;
+        let home_html = body_string(home).await;
+        assert!(home_html.contains(r#"<link rel="stylesheet" href="/ui/style.css">"#));
+        assert!(!home_html.contains("<style>"));
+
+        let files = request_as(
+            &app,
+            "GET",
+            "/ui/files/",
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        let files_html = body_string(files).await;
+        assert!(files_html.contains(r#"<link rel="stylesheet" href="/ui/style.css">"#));
+    }
+
+    /// The quota bar's color reflects the same 80/90/100 percent bands
+    /// `breadcloud-events`' `crossed_threshold` (CLOUD-13) already warns
+    /// on -- presentation only, no event involved here, just proving the
+    /// file listing actually picks a `warn`/`critical` class rather than
+    /// always rendering a plain, uncolored bar.
+    #[tokio::test]
+    async fn ui_quota_bar_gets_a_warn_class_approaching_the_limit() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 100)]).await;
+
+        let upload =
+            upload_via_ui(&app, "alice", "secret1", "/", "eighty-five.bin", &[0u8; 85]).await;
+        assert_eq!(upload.status(), StatusCode::SEE_OTHER);
+
+        let listing = request_as(
+            &app,
+            "GET",
+            "/ui/files/",
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        let html = body_string(listing).await;
+        assert!(
+            html.contains(r#"class="quota-bar warn""#),
+            "expected the quota bar to carry the warn class at 85% of a 100-byte quota: {html}"
+        );
     }
 }

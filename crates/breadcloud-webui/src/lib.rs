@@ -90,6 +90,7 @@ pub async fn dispatch(
         (UiRoute::Files(path), "GET") => files::browse(&webdav, user, &path).await,
         (UiRoute::Download(path), "GET") => files::download(&webdav, &path).await,
         (UiRoute::Calendar, "GET") => calendar::month_view(&caldav, user, &query).await,
+        (UiRoute::Style, "GET") => template::style_response(),
         (UiRoute::Upload, "POST") => files::upload(&webdav, req).await,
         (UiRoute::Mkdir, "POST") => files::mkdir(&webdav, req).await,
         (UiRoute::Delete, "POST") => files::delete(&webdav, req).await,

@@ -1,4 +1,4 @@
-//! Shared page chrome (nav, minimal styling) and small HTML-rendering
+//! Shared page chrome (nav, breadcrumbs, icons) and small HTML-rendering
 //! helpers used by both the file browser and the calendar view.
 //!
 //! Plain `format!`-built HTML strings, not a templating crate (askama or
@@ -8,11 +8,23 @@
 //! text and the workspace README's dependency philosophy. Every value
 //! interpolated from user- or file-supplied data goes through
 //! [`html_escape`] first.
+//!
+//! **Styling (CLOUD-24).** One shared stylesheet, `style.css`, embedded at
+//! compile time via `include_str!` and served as a plain static response
+//! by [`style_response`] at `/ui/style.css` (see `lib.rs`'s route table) --
+//! a real `<link rel="stylesheet">` per page rather than an inline
+//! `<style>` block repeated in every response, while staying exactly as
+//! dependency-free as the rest of this crate (no static-file-serving
+//! crate, no build step: the CSS is just another `&'static str` baked into
+//! the binary, the same way `include_str!` would embed any other asset).
 
 use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::Response;
 use breadcloud_storage::DavPath;
+
+/// The shared stylesheet's source, served verbatim by [`style_response`].
+pub const STYLE_CSS: &str = include_str!("style.css");
 
 /// Wrap a rendered HTML string in a `200 OK` response with the right
 /// content type, so every handler that renders a page does not repeat
@@ -25,81 +37,28 @@ pub fn html_response(body: String) -> Response {
         .unwrap()
 }
 
-const CSS: &str = r#"
-:root { color-scheme: light dark; }
-* { box-sizing: border-box; }
-body {
-  margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  color: #1b1b1b;
-  background: #fafafa;
+/// `GET /ui/style.css`: the shared stylesheet every page links to. A
+/// short, cache-friendly max-age (not "forever" -- there is no
+/// content-hashed filename here to bust a stale cache after a redeploy,
+/// so an hour keeps a browser from re-fetching it on every single page
+/// load without also risking someone staring at last week's CSS for very
+/// long after this binary is updated).
+pub fn style_response() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/css; charset=utf-8")
+        .header("Cache-Control", "public, max-age=3600")
+        .body(Body::from(STYLE_CSS))
+        .unwrap()
 }
-@media (prefers-color-scheme: dark) {
-  body { color: #e8e8e8; background: #17181a; }
-  a { color: #7fb2ff; }
-  table, .card { background: #212327; border-color: #33353a; }
-  th { background: #26282c; }
-  tr:hover { background: #26282c; }
-  .btn { background: #2a2c30; border-color: #3a3c41; color: #e8e8e8; }
-  .btn.danger { color: #ff9b9b; }
-  header { background: #1e1f22; border-color: #33353a; }
-  input[type=text], input[type=file] { background: #1b1c1f; color: #e8e8e8; border-color: #3a3c41; }
-  .quota-bar { background: #33353a; }
-}
-a { color: #1d6fd6; text-decoration: none; }
-a:hover { text-decoration: underline; }
-header {
-  display: flex;
-  align-items: center;
-  gap: 1.5rem;
-  padding: 0.75rem 1.25rem;
-  background: #ffffff;
-  border-bottom: 1px solid #e2e2e2;
-}
-header .brand { font-weight: 600; }
-header nav { display: flex; gap: 1rem; flex: 1; }
-header nav a.active { font-weight: 600; text-decoration: underline; }
-header .user { color: #777; font-size: 0.9rem; }
-main { max-width: 960px; margin: 0 auto; padding: 1.25rem; }
-h1 { font-size: 1.25rem; }
-.breadcrumbs { margin-bottom: 1rem; font-size: 0.95rem; }
-.breadcrumbs a { margin-right: 0.15rem; }
-table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e2e2e2; }
-th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #eee; }
-th { background: #f4f4f4; font-weight: 600; font-size: 0.85rem; }
-tr:hover { background: #f7f9fc; }
-td.size, td.modified { white-space: nowrap; color: #666; font-size: 0.9rem; }
-.actions form { display: inline; }
-.btn {
-  display: inline-block;
-  padding: 0.3rem 0.7rem;
-  border: 1px solid #ccc;
-  border-radius: 4px;
-  background: #f4f4f4;
-  color: inherit;
-  cursor: pointer;
-  font-size: 0.85rem;
-}
-.btn.danger { color: #b3261e; }
-.toolbar { display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; margin: 1rem 0; }
-.toolbar form { display: flex; gap: 0.4rem; align-items: center; }
-input[type=text] { padding: 0.3rem 0.5rem; border: 1px solid #ccc; border-radius: 4px; }
-.quota { font-size: 0.85rem; color: #666; margin-bottom: 0.75rem; }
-.quota-bar { height: 6px; border-radius: 3px; background: #e2e2e2; overflow: hidden; margin-top: 0.2rem; }
-.quota-bar > div { height: 100%; background: #1d6fd6; }
-.month-nav { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem; }
-.month-nav h1 { margin: 0; flex: 1; text-align: center; }
-table.month { table-layout: fixed; }
-table.month th { text-align: center; }
-table.month td { vertical-align: top; height: 6rem; padding: 0.3rem; font-size: 0.8rem; }
-table.month td.outside { color: #bbb; }
-@media (prefers-color-scheme: dark) { table.month td.outside { color: #555; } }
-table.month .daynum { font-weight: 600; margin-bottom: 0.2rem; }
-.event { display: block; border-radius: 3px; padding: 0.05rem 0.3rem; margin-bottom: 0.15rem; background: #dbe9ff; color: #0b2e63; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cal-list { list-style: none; padding: 0; margin: 0 0 1rem 0; display: flex; gap: 0.75rem; flex-wrap: wrap; }
-.cal-list li { padding: 0.15rem 0.5rem; border-radius: 4px; background: #eef2f7; font-size: 0.85rem; }
-.empty { color: #888; font-style: italic; padding: 1rem 0; }
-"#;
+
+/// Inline SVG icons for the file listing (`files.rs`), distinguishing a
+/// folder row from a plain file row without pulling in an icon font or
+/// image assets -- just two small `<path>`s, colored via `currentColor` so
+/// `.entry-link.is-dir .entry-icon`'s CSS rule can recolor the folder icon
+/// without a second copy of it.
+pub const FOLDER_ICON: &str = r#"<svg class="entry-icon" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M1.5 3.5C1.5 2.94772 1.94772 2.5 2.5 2.5H6L7.5 4H13.5C14.0523 4 14.5 4.44772 14.5 5V12.5C14.5 13.0523 14.0523 13.5 13.5 13.5H2.5C1.94772 13.5 1.5 13.0523 1.5 12.5V3.5Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>"#;
+pub const FILE_ICON: &str = r#"<svg class="entry-icon" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M4 1.5H9.5L12.5 4.5V14C12.5 14.2761 12.2761 14.5 12 14.5H4C3.72386 14.5 3.5 14.2761 3.5 14V2C3.5 1.72386 3.72386 1.5 4 1.5Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><path d="M9.5 1.5V4C9.5 4.27614 9.72386 4.5 10 4.5H12.5" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>"#;
 
 pub fn html_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
@@ -162,12 +121,12 @@ pub fn encode_ui_path(prefix: &str, path: &DavPath) -> String {
 }
 
 pub fn breadcrumbs(path: &DavPath) -> String {
-    let mut out = String::from(r#"<div class="breadcrumbs">"#);
+    let mut out = String::from(r#"<nav class="breadcrumbs" aria-label="Breadcrumb">"#);
     out.push_str(r#"<a href="/ui/files/">files</a>"#);
     let mut built = DavPath::root();
     for seg in path.segments() {
         built = built.child(seg);
-        out.push_str(" / ");
+        out.push_str(r#"<span class="crumb-sep">/</span>"#);
         // Same two-step encoding `files.rs`'s row links need: percent-
         // encode for the URL, then HTML-attribute-escape the result
         // before interpolating it into `href="..."` -- percent-encoding
@@ -180,7 +139,7 @@ pub fn breadcrumbs(path: &DavPath) -> String {
             html_escape(seg)
         ));
     }
-    out.push_str("</div>");
+    out.push_str("</nav>");
     out
 }
 
@@ -206,10 +165,10 @@ pub fn page(title: &str, user: &str, active: &str, body: &str) -> String {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title} - breadcloud</title>
-<style>{CSS}</style>
+<link rel="stylesheet" href="/ui/style.css">
 </head>
 <body>
-<header>
+<header class="topbar">
   <div class="brand">breadcloud</div>
   <nav>
     <a href="/ui/files/"{files_class}>Files</a>
@@ -258,5 +217,32 @@ mod tests {
     #[test]
     fn encode_ui_path_root_keeps_trailing_slash() {
         assert_eq!(encode_ui_path("/ui/files", &DavPath::root()), "/ui/files/");
+    }
+
+    #[test]
+    fn style_response_serves_the_embedded_stylesheet_as_css() {
+        let response = style_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("Content-Type").unwrap(),
+            "text/css; charset=utf-8"
+        );
+    }
+
+    #[test]
+    fn page_links_the_shared_stylesheet_and_does_not_inline_one() {
+        let html = page("Files", "alice", "files", "<p>hi</p>");
+        assert!(html.contains(r#"<link rel="stylesheet" href="/ui/style.css">"#));
+        assert!(!html.contains("<style>"));
+    }
+
+    #[test]
+    fn breadcrumbs_separates_segments_with_a_styled_span_not_raw_text() {
+        let path = DavPath::parse("/Docs/2026").unwrap();
+        let html = breadcrumbs(&path);
+        assert!(html.contains(r#"<span class="crumb-sep">/</span>"#));
+        // The old plain-text " / " separator is gone -- every segment
+        // boundary now goes through the styled span above instead.
+        assert!(!html.contains(" / "));
     }
 }

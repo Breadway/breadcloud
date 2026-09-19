@@ -1,0 +1,419 @@
+/* breadcloud web UI: one shared, dark-themed stylesheet for every page
+   (CLOUD-24). Served as a static file at /ui/style.css (see
+   template::style_response), not an inline <style> block per response --
+   plain CSS, no build step, no framework, matching this crate's existing
+   "no new dependency-heavy toolchain" philosophy (see the workspace
+   README's CLOUD-12 section). A single dark palette on purpose: this is a
+   personal home-server tool for a family, not a product, so there is no
+   light/dark toggle to build or maintain. */
+
+:root {
+  color-scheme: dark;
+  --bg: #16171b;
+  --bg-elevated: #1e2025;
+  --bg-hover: #262930;
+  --border: #33363d;
+  --text: #e8e9eb;
+  --text-dim: #a1a5ad;
+  --text-faint: #6d7178;
+  --accent: #5b9dff;
+  --accent-hover: #7fb2ff;
+  --accent-bg: rgba(91, 157, 255, 0.16);
+  --danger: #ff6b6b;
+  --danger-bg: rgba(255, 107, 107, 0.14);
+  --warning: #e8b339;
+  --warning-bg: rgba(232, 179, 57, 0.16);
+  --critical: #ff5c5c;
+  --critical-bg: rgba(255, 92, 92, 0.16);
+  --radius: 8px;
+  --radius-sm: 5px;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  color: var(--accent-hover);
+  text-decoration: underline;
+}
+a:focus-visible,
+button:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Nav bar */
+header.topbar {
+  display: flex;
+  align-items: center;
+  gap: 1.75rem;
+  padding: 0.85rem 1.5rem;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+  box-shadow: var(--shadow);
+}
+header.topbar .brand {
+  font-weight: 700;
+  font-size: 1.05rem;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+header.topbar nav {
+  display: flex;
+  gap: 0.25rem;
+  flex: 1;
+}
+header.topbar nav a {
+  color: var(--text-dim);
+  padding: 0.4rem 0.75rem;
+  border-radius: var(--radius-sm);
+  font-weight: 500;
+  font-size: 0.92rem;
+}
+header.topbar nav a:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+  text-decoration: none;
+}
+header.topbar nav a.active {
+  color: var(--text);
+  background: var(--accent-bg);
+  font-weight: 600;
+}
+header.topbar .user {
+  color: var(--text-faint);
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+main {
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem 3rem;
+}
+
+h1 {
+  font-size: 1.4rem;
+  font-weight: 700;
+  margin: 0 0 1rem;
+  letter-spacing: -0.01em;
+}
+
+/* Breadcrumbs */
+.breadcrumbs {
+  margin-bottom: 1.25rem;
+  font-size: 0.9rem;
+  color: var(--text-faint);
+  display: flex;
+  align-items: center;
+  gap: 0.15rem;
+  flex-wrap: wrap;
+}
+.breadcrumbs a {
+  color: var(--text-dim);
+  padding: 0.15rem 0.4rem;
+  border-radius: var(--radius-sm);
+}
+.breadcrumbs a:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+  text-decoration: none;
+}
+.breadcrumbs .crumb-sep {
+  color: var(--text-faint);
+  padding: 0 0.1rem;
+}
+
+/* Quota indicator */
+.quota {
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  margin-bottom: 1.25rem;
+  max-width: 24rem;
+}
+.quota-bar {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--bg-hover);
+  overflow: hidden;
+  margin-top: 0.35rem;
+  border: 1px solid var(--border);
+}
+.quota-bar > div {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+}
+.quota-bar.warn > div {
+  background: var(--warning);
+}
+.quota-bar.critical > div {
+  background: var(--critical);
+}
+
+/* Toolbar, forms, buttons, inputs */
+.toolbar {
+  display: flex;
+  gap: 0.75rem 1.5rem;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-bottom: 1.5rem;
+  padding: 1rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.toolbar form {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+input[type="text"],
+input[type="file"] {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.45rem 0.7rem;
+}
+input[type="text"]:focus,
+input[type="file"]:focus {
+  border-color: var(--accent);
+}
+input[type="text"]::placeholder {
+  color: var(--text-faint);
+}
+
+input[type="file"] {
+  padding: 0.3rem 0.6rem 0.3rem 0.3rem;
+  max-width: 16rem;
+}
+input[type="file"]::file-selector-button {
+  font: inherit;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--bg-hover);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.4rem 0.8rem;
+  margin-right: 0.6rem;
+  cursor: pointer;
+}
+input[type="file"]::file-selector-button:hover {
+  background: var(--border);
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.45rem 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+  font-size: 0.88rem;
+  line-height: 1.2;
+}
+.btn:hover {
+  background: var(--border);
+  text-decoration: none;
+}
+.btn.danger {
+  color: var(--danger);
+}
+.btn.danger:hover {
+  background: var(--danger-bg);
+  border-color: var(--danger);
+}
+
+.actions form {
+  display: inline;
+}
+
+/* File listing */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+th,
+td {
+  text-align: left;
+  padding: 0.6rem 0.9rem;
+  border-bottom: 1px solid var(--border);
+}
+tbody tr:last-child td {
+  border-bottom: none;
+}
+th {
+  background: var(--bg);
+  font-weight: 600;
+  font-size: 0.76rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+tbody tr:hover {
+  background: var(--bg-hover);
+}
+td.size,
+td.modified {
+  white-space: nowrap;
+  color: var(--text-dim);
+  font-size: 0.87rem;
+  font-variant-numeric: tabular-nums;
+}
+td.actions {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.entry-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  color: var(--text);
+}
+.entry-link:hover {
+  color: var(--accent-hover);
+  text-decoration: none;
+}
+.entry-link:hover .entry-name {
+  text-decoration: underline;
+}
+.entry-icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--text-faint);
+}
+.entry-link.is-dir .entry-icon {
+  color: var(--accent);
+}
+.entry-link.is-dir .entry-name {
+  font-weight: 600;
+}
+
+.empty {
+  color: var(--text-faint);
+  font-style: italic;
+  padding: 2.5rem 0;
+  text-align: center;
+}
+
+/* Calendar */
+.month-nav {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+.month-nav h1 {
+  margin: 0;
+  flex: 1;
+  text-align: center;
+}
+
+.cal-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 1.25rem;
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.cal-list li {
+  padding: 0.25rem 0.65rem;
+  border-radius: 999px;
+  background: var(--bg-hover);
+  border: 1px solid var(--border);
+  font-size: 0.82rem;
+  color: var(--text-dim);
+}
+
+table.month {
+  table-layout: fixed;
+  border-collapse: separate;
+  border-spacing: 0;
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+table.month th {
+  text-align: center;
+  padding: 0.55rem;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+table.month td {
+  vertical-align: top;
+  height: 6.5rem;
+  padding: 0.4rem 0.45rem;
+  font-size: 0.8rem;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+table.month td.outside {
+  background: var(--bg);
+  color: var(--text-faint);
+}
+table.month td.today {
+  background: var(--accent-bg);
+  border-color: var(--accent);
+}
+table.month .daynum {
+  font-weight: 600;
+  margin-bottom: 0.3rem;
+  color: var(--text-dim);
+}
+table.month td.outside .daynum {
+  color: var(--text-faint);
+}
+table.month td.today .daynum {
+  color: var(--accent-hover);
+}
+
+.event {
+  display: block;
+  border-radius: var(--radius-sm);
+  padding: 0.1rem 0.4rem;
+  margin-bottom: 0.2rem;
+  background: var(--accent-bg);
+  color: var(--accent-hover);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.76rem;
+}

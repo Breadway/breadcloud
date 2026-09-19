@@ -831,6 +831,48 @@ mean either a second, form-shaped entry point into
 `breadcloud-caldav`'s PUT logic or a second event-authoring implementation,
 more surface than a "minimal" calendar *view* needs.
 
+**Styling and a root redirect (CLOUD-24).** Direct user feedback after
+using the live deployment: the bare server root showed nothing useful (no
+WebDAV directory listing is expected there, but a person navigating in a
+browser reasonably expects the web UI to be the front door), and the UI
+itself was unstyled browser-default form controls. Two independent fixes:
+
+- **Root redirect.** `breadcloud-server::combined::dispatch` now redirects
+  a plain browser GET at `/` (302, `Location: /ui/files/`) to the file
+  browser, ahead of the existing PROPFIND-at-root splice. "Plain browser
+  GET" means exactly: method GET, and an `Accept` header naming
+  `text/html` -- the same shape every real browser navigation sends and
+  no WebDAV/CalDAV/CardDAV client this codebase has been tested against
+  (rclone, DAVx5, vdirsyncer, Cyberduck) sends at `/`. PROPFIND, OPTIONS,
+  PUT, and every other verb WebDAV already answers at the bare root are
+  untouched (different method, so the new check never even reaches its
+  `Accept` check), and a non-browser GET (curl's default `Accept: */*`,
+  or no `Accept` at all) keeps getting `breadcloud_webdav`'s own bare
+  directory-listing fallback exactly as before. See
+  `combined::is_browser_root_navigation` and its test coverage.
+- **Real CSS.** One shared, dark-themed stylesheet (`breadcloud-webui/src/
+  style.css`, embedded via `include_str!`) served at `/ui/style.css`
+  (`template::style_response`) and linked from every page with a plain
+  `<link rel="stylesheet">`, replacing the old per-response inline
+  `<style>` block -- still no build step, no CSS/JS framework, no
+  light/dark toggle (this is a personal home-server tool for a family,
+  not a product). Covers real typography and spacing, styled buttons and
+  inputs (including the native file input's `::file-selector-button`,
+  which is the only way to style an upload control's Browse button
+  without JavaScript), a colored quota bar that picks up a `warn`/
+  `critical` class at the same 80/90/100 percent-of-quota bands
+  `breadcloud-events`'s `crossed_threshold` (CLOUD-13) already warns on
+  (presentation only -- no event is emitted by rendering a page), small
+  inline-SVG folder/file icons in the file listing
+  (`template::FOLDER_ICON`/`FILE_ICON`), a styled nav bar and
+  breadcrumbs, and a bordered calendar month grid that highlights today's
+  cell. The XSS-escaping discipline the CLOUD-12 review enforced
+  (`html_escape` on every user-controlled value interpolated into an
+  `href` or text node) is unchanged and still covered by its own
+  regression tests -- this issue only added static, trusted markup (SVG
+  icons, CSS classes), never a new site for user-controlled data to reach
+  the page unescaped.
+
 ### breadcloud-notes (CLOUD-8)
 
 The Nextcloud Notes OCS API: `/index.php/apps/notes/api/v1/{notes,settings,attachment}`,
