@@ -285,6 +285,7 @@ dependencies = [
  "percent-encoding",
  "quick-xml",
  "rand_core",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",

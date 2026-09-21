@@ -428,6 +428,17 @@ Notable pieces:
   refuses to even attempt the DAV tree without these; confirmed by running
   `nextcloudcmd` against this server without them ("Error connecting to
   server").
+  It also serves graceful stubs (CLOUD-29) for OCS endpoints clients probe
+  even when the feature is unused, so they degrade cleanly instead of
+  erroring on a 404: empty lists for `apps/notifications/api/v{1,2}/notifications`
+  and `apps/activity/api/v2/activity`, an empty editor/creator list for
+  `apps/files/api/v1/directEditing`, and `cloud/users/<id>` (own id: same as
+  `cloud/user`, including quota; any other id: 403). The capabilities
+  response says "off" explicitly for `files_sharing`, `notifications` and
+  `activity`, and carries a minimal `theming` entry (product name only, no
+  logo URLs). There is no real notification, activity, sharing or theming
+  system behind any of this. The OCS envelope's `statuscode` is 100 on `v1.php`
+  and 200 on `v2.php`, as in Nextcloud.
 - `handlers::uploads` implements Nextcloud's chunked upload protocol (NG
   chunking v2) at `/remote.php/dav/uploads/<user>/<transfer-id>/...`: MKCOL
   creates a transfer, PUT lands numbered chunks in a staging `Storage`
