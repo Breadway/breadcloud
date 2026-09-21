@@ -51,6 +51,8 @@ use breadcloud_webdav::AccountStore;
 use percent_encoding::percent_decode_str;
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 use crate::flow::{self, FlowStore, FormViewError, GrantOutcome};
 use crate::template;
@@ -212,12 +214,31 @@ pub fn flow_get(flows: &FlowStore, login_token: &str) -> Response {
 /// Credential checking happens *here*, via `AccountStore::authenticate`
 /// (CLOUD-11's real account model -- the one credential path every
 /// authentication surface in this server funnels through, see that
-/// method's own doc comment), inside the closure passed to
-/// `FlowStore::try_grant` -- `flow.rs` never sees `AccountStore` or a raw
-/// password outside of what that closure hands back on success.
+/// method's own doc comment) -- `flow.rs` never sees `AccountStore` or a
+/// raw password outside of what this hands back on success.
+///
+/// The check is an argon2id verification, deliberately slow and CPU/memory
+/// heavy, and this endpoint is reachable unauthenticated (anyone can start
+/// their own flow and submit wrong passwords), so *how* it runs matters:
+///
+/// - **Never under the flow-store lock.** [`FlowStore::begin_grant`] does
+///   the cheap checks under the lock and releases it; the verify runs with
+///   no lock held; [`FlowStore::finish_grant`] re-takes the lock and
+///   re-checks the flow is still pending before granting. A slow verify on
+///   one flow therefore cannot delay `init`, `poll`, or any other flow.
+/// - **Never on an async worker thread.** It runs via
+///   `tokio::task::spawn_blocking`, so a pile of verifications cannot park
+///   the runtime threads that serve every other route.
+/// - **Bounded concurrency.** Moving the verify off the lock would
+///   otherwise let an attacker start an unbounded number of them at once
+///   (each allocates argon2's memory block and occupies a blocking-pool
+///   thread, a pool that `tokio::fs`, used by the WebDAV routes, shares).
+///   `verify_permits` caps how many run at once; the rest wait as cheap
+///   async tasks holding no thread.
 pub async fn flow_post(
     flows: &FlowStore,
-    accounts: &AccountStore,
+    verify_permits: &Arc<Semaphore>,
+    accounts: Arc<AccountStore>,
     login_token: &str,
     req: Request,
 ) -> Response {
@@ -230,16 +251,19 @@ pub async fn flow_post(
     let password = form.get("password").cloned().unwrap_or_default();
     let submitted_csrf = form.get("csrf_token").cloned().unwrap_or_default();
 
-    let outcome = flows.try_grant(login_token, &submitted_csrf, || {
-        accounts
-            .authenticate(&username, &password)
-            .map(|login_name| (login_name, password.clone()))
-    });
+    let outcome = match flows.begin_grant(login_token, &submitted_csrf) {
+        Err(outcome) => outcome,
+        Ok(ticket) => {
+            let credentials =
+                verify_credentials(verify_permits, accounts, username.clone(), password).await;
+            flows.finish_grant(ticket, credentials)
+        }
+    };
 
     match outcome {
         GrantOutcome::Granted => {
             // The exact login_name a successful grant recorded is not
-            // threaded back out of `try_grant` (it only reports the
+            // threaded back out of `finish_grant` (it only reports the
             // outcome, not the credentials -- those are for `poll` alone
             // to hand out, see `flow.rs`'s doc comment on why `poll`
             // consumes the flow). The account model treats a username as
@@ -260,11 +284,112 @@ pub async fn flow_post(
                     &csrf,
                     Some("Incorrect username or password."),
                 ),
-                // The flow expired in the (tiny) window between try_grant
-                // and this re-render -- fall back to the same "no longer
-                // valid" page rather than a confusing partial form.
+                // The flow expired in the (tiny) window between the grant
+                // attempt and this re-render -- fall back to the same "no
+                // longer valid" page rather than a confusing partial form.
                 Err(FormViewError::NotFound) => template::expired_or_unknown_page(),
             }
         }
+    }
+}
+
+/// Run `AccountStore::authenticate` on a blocking thread, holding one of
+/// `verify_permits` for the duration. Returns `Some((login_name,
+/// app_password))` on success. Fails closed: if the blocking task panics or
+/// is cancelled, that is reported as a failed check, never a success.
+async fn verify_credentials(
+    verify_permits: &Arc<Semaphore>,
+    accounts: Arc<AccountStore>,
+    username: String,
+    password: String,
+) -> Option<(String, String)> {
+    let permit = verify_permits
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("the verify semaphore is never closed");
+    let joined = tokio::task::spawn_blocking(move || {
+        // Held until the verify finishes, so the cap covers the real work.
+        let _permit = permit;
+        accounts
+            .authenticate(&username, &password)
+            .map(|login_name| (login_name, password))
+    })
+    .await;
+    match joined {
+        Ok(credentials) => credentials,
+        Err(err) => {
+            tracing::error!("login flow v2: credential check task failed: {err}");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use breadcloud_webdav::Account;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    fn form_request(body: String) -> Request {
+        Request::builder()
+            .method("POST")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// The argon2 verify must not run on the async worker thread. On a
+    /// single-threaded runtime that is directly observable and needs no
+    /// wall-clock threshold: a ticker task that yields in a loop can only
+    /// make progress while `flow_post` is suspended at an await point. If
+    /// the verify ran inline (a synchronous call inside the async fn), the
+    /// one runtime thread would be stuck inside it until it returned, and
+    /// the ticker would never get a turn before `flow_post` completed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_verification_does_not_block_the_async_runtime() {
+        let flows = FlowStore::new();
+        let accounts = Arc::new(AccountStore::new(vec![Account::new("alice", "right", 1)]));
+        let permits = Arc::new(Semaphore::new(1));
+        let flow = flows.initiate().unwrap();
+        let csrf = flows.form_view(&flow.login_token).unwrap();
+
+        let done = AtomicBool::new(false);
+        let ticks = AtomicUsize::new(0);
+        let post = async {
+            let resp = flow_post(
+                &flows,
+                &permits,
+                accounts.clone(),
+                &flow.login_token,
+                form_request(format!("username=alice&password=wrong&csrf_token={csrf}")),
+            )
+            .await;
+            done.store(true, Ordering::SeqCst);
+            resp
+        };
+        let ticker = async {
+            while !done.load(Ordering::SeqCst) {
+                ticks.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        };
+        let (resp, ()) = tokio::join!(post, ticker);
+
+        assert_eq!(resp.status(), StatusCode::OK); // form re-rendered
+        assert!(
+            ticks.load(Ordering::SeqCst) > 1,
+            "the runtime made no progress while the password was verified"
+        );
+        // Wrong password: flow still pending, so the right one still works.
+        let resp = flow_post(
+            &flows,
+            &permits,
+            accounts,
+            &flow.login_token,
+            form_request(format!("username=alice&password=right&csrf_token={csrf}")),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(flows.poll(&flow.poll_token).is_some());
     }
 }

@@ -62,6 +62,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use breadcloud_webdav::AccountStore;
 use percent_encoding::percent_decode_str;
+use tokio::sync::Semaphore;
 
 pub use flow::FlowStore;
 
@@ -73,6 +74,20 @@ pub use flow::FlowStore;
 #[derive(Clone)]
 pub struct AppState {
     flows: Arc<FlowStore>,
+    /// Caps how many argon2 credential checks (`handlers::flow_post`) run
+    /// at once, see that function's doc comment for why.
+    verify_permits: Arc<Semaphore>,
+}
+
+/// Upper bound on concurrent password verifications: one per available CPU
+/// (a verify is CPU-bound, more in flight than cores only adds contention),
+/// clamped to 1..=8 so a many-core host does not also allow a large burst
+/// of argon2's per-verify memory allocation at once.
+fn max_concurrent_verifies() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(1, 8)
 }
 
 impl Default for AppState {
@@ -85,6 +100,7 @@ impl AppState {
     pub fn new() -> Self {
         AppState {
             flows: Arc::new(FlowStore::new()),
+            verify_permits: Arc::new(Semaphore::new(max_concurrent_verifies())),
         }
     }
 }
@@ -103,7 +119,7 @@ pub fn owns_path(path: &str) -> bool {
 /// `breadcloud_webdav::AccountStore` `combined::auth_gate` checks Basic
 /// auth against -- see this crate's module doc for why credential checking
 /// funnels through the same store rather than a parallel one.
-pub async fn dispatch(state: AppState, accounts: &AccountStore, req: Request) -> Response {
+pub async fn dispatch(state: AppState, accounts: Arc<AccountStore>, req: Request) -> Response {
     let method = req.method().clone();
     let raw_path = req.uri().path().to_string();
 
@@ -114,7 +130,7 @@ pub async fn dispatch(state: AppState, accounts: &AccountStore, req: Request) ->
 
     if decoded == "/index.php/login/v2" {
         return match method.as_str() {
-            "POST" => handlers::init(&state.flows, accounts, req.headers()),
+            "POST" => handlers::init(&state.flows, &accounts, req.headers()),
             _ => method_not_allowed(),
         };
     }
@@ -132,7 +148,9 @@ pub async fn dispatch(state: AppState, accounts: &AccountStore, req: Request) ->
         }
         return match method.as_str() {
             "GET" => handlers::flow_get(&state.flows, token),
-            "POST" => handlers::flow_post(&state.flows, accounts, token, req).await,
+            "POST" => {
+                handlers::flow_post(&state.flows, &state.verify_permits, accounts, token, req).await
+            }
             _ => method_not_allowed(),
         };
     }

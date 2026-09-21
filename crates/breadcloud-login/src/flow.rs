@@ -3,9 +3,11 @@
 //! or `breadcloud_webdav::AccountStore` -- see `handlers.rs` for the HTTP
 //! layer built on top of it, which is also the only place credential
 //! checking happens (this module is handed an already-decided
-//! username/app-password pair by its caller, via the `authenticate`
-//! closure on [`FlowStore::try_grant`], and never touches
-//! `breadcloud_webdav::AccountStore` itself).
+//! username/app-password pair by its caller, between
+//! [`FlowStore::begin_grant`] and [`FlowStore::finish_grant`], and never
+//! touches `breadcloud_webdav::AccountStore` itself). The credential check
+//! runs *between* those two calls, with the store lock released: see
+//! [`FlowStore::begin_grant`] for why it must never run under the lock.
 //!
 //! **Three tokens, three different audiences**, matching real Nextcloud's
 //! own login flow v2 (`nextcloud/server`'s
@@ -237,7 +239,8 @@ pub enum FormViewError {
 }
 
 /// The outcome of attempting to complete ("grant") a pending flow via
-/// [`FlowStore::try_grant`].
+/// [`FlowStore::begin_grant`] and [`FlowStore::finish_grant`] (or the
+/// synchronous [`FlowStore::try_grant`] wrapper over both).
 #[derive(Debug, PartialEq, Eq)]
 pub enum GrantOutcome {
     /// The flow was pending, the CSRF token matched, and `authenticate`
@@ -246,7 +249,9 @@ pub enum GrantOutcome {
     /// back.
     Granted,
     /// No pending flow for this `login_token` (unknown, expired, or
-    /// already granted) -- same collapsed signal as [`FormViewError`].
+    /// already granted) -- same collapsed signal as [`FormViewError`]. Also
+    /// what a submission gets when the flow was granted by a racing
+    /// submission, or expired, while its own credential check was running.
     NotFound,
     /// The flow exists and is pending, but the submitted CSRF token does
     /// not match. With a fixed, non-rotating token and no session/cookie
@@ -257,6 +262,16 @@ pub enum GrantOutcome {
     /// `authenticate` returned `None` (wrong username or password). The
     /// flow stays pending, so the same form can be resubmitted.
     InvalidCredentials,
+}
+
+/// Proof that [`FlowStore::begin_grant`] found a pending, unexpired flow
+/// whose CSRF token matched, to be handed back to
+/// [`FlowStore::finish_grant`] once the caller's credential check is done.
+/// Holds no lock and no secret, just the flow's internal id (monotonic,
+/// never reused, so it cannot end up naming a different flow later).
+#[derive(Debug)]
+pub struct GrantTicket {
+    id: u64,
 }
 
 struct Inner {
@@ -393,59 +408,124 @@ impl FlowStore {
         }
     }
 
-    /// Attempt to complete a pending flow, atomically: looks the flow up
-    /// by `login_token`, checks expiry, checks `submitted_csrf` against
-    /// the flow's own token, and -- only if all of that holds -- calls
-    /// `authenticate` exactly once to decide the actual credential check.
-    /// Everything happens under one lock acquisition, so there is no
-    /// window between "confirmed this flow is still pending" and "marked
-    /// it granted" for a second, concurrent request (another submission of
-    /// the same form, or a would-be racing poll) to observe or act on.
+    /// First half of completing a flow: under the store lock, looks the flow
+    /// up by `login_token`, checks expiry, checks it is still pending, and
+    /// checks `submitted_csrf` against the flow's own token. On success it
+    /// returns a [`GrantTicket`] and **releases the lock before returning**:
+    /// the caller then runs the (deliberately slow, argon2) credential check
+    /// with no lock held, and passes the result to [`finish_grant`].
+    ///
+    /// The credential check must never run while the store's single global
+    /// mutex is held. `POST /index.php/login/v2` is unauthenticated, so any
+    /// client can mint its own flow and submit wrong passwords against a
+    /// known username as fast as the server will verify them; with the lock
+    /// held across each verify, that one client would serialize every other
+    /// flow's init, poll, form render and grant behind it (and, since a
+    /// blocked `std::sync::Mutex::lock` parks its tokio worker thread, would
+    /// eventually park every worker and starve unrelated routes too).
+    ///
+    /// [`finish_grant`]: FlowStore::finish_grant
+    pub fn begin_grant(
+        &self,
+        login_token: &str,
+        submitted_csrf: &str,
+    ) -> Result<GrantTicket, GrantOutcome> {
+        let now = now_millis();
+        let mut inner = self.inner.lock().unwrap();
+        let Some(&id) = inner.by_login_hash.get(&hash_token(login_token)) else {
+            return Err(GrantOutcome::NotFound);
+        };
+        let flow = inner.flows.get(&id).expect("index and store out of sync");
+        if flow.is_expired(now, self.lifetime_secs) {
+            inner.remove_flow(id);
+            return Err(GrantOutcome::NotFound);
+        }
+        if !matches!(flow.state, FlowState::Pending) {
+            return Err(GrantOutcome::NotFound);
+        }
+        if !csrf_matches(&flow.csrf_token, submitted_csrf) {
+            return Err(GrantOutcome::CsrfMismatch);
+        }
+        Ok(GrantTicket { id })
+    }
+
+    /// Second half of completing a flow: `credentials` is the result of the
+    /// credential check the caller ran, lock-free, after [`begin_grant`]:
+    /// `Some((login_name, app_password))` on success, `None` for a wrong
+    /// username or password.
+    ///
+    /// Because the lock was released while that check ran, everything
+    /// [`begin_grant`] established may have changed in the meantime (another
+    /// submission of the same form may have been granted and even polled and
+    /// consumed; the flow may have expired or been reaped). So this
+    /// re-acquires the lock and re-checks that the very same flow (flow ids
+    /// are never reused) is still present, unexpired, and still
+    /// [`FlowState::Pending`] *before* writing anything. That re-check under
+    /// the lock is what keeps single-use and expiry intact: of any number of
+    /// racing submissions on one flow, exactly one sees `Pending` here and
+    /// becomes [`GrantOutcome::Granted`]; every other gets
+    /// [`GrantOutcome::NotFound`], and a credential check that merely
+    /// finished late cannot resurrect an expired or already-consumed flow.
+    ///
+    /// [`begin_grant`]: FlowStore::begin_grant
+    pub fn finish_grant(
+        &self,
+        ticket: GrantTicket,
+        credentials: Option<(String, String)>,
+    ) -> GrantOutcome {
+        let now = now_millis();
+        let mut inner = self.inner.lock().unwrap();
+        let Some(flow) = inner.flows.get(&ticket.id) else {
+            return GrantOutcome::NotFound;
+        };
+        if flow.is_expired(now, self.lifetime_secs) {
+            inner.remove_flow(ticket.id);
+            return GrantOutcome::NotFound;
+        }
+        if !matches!(flow.state, FlowState::Pending) {
+            return GrantOutcome::NotFound;
+        }
+        let Some((login_name, app_password)) = credentials else {
+            return GrantOutcome::InvalidCredentials;
+        };
+        let flow = inner
+            .flows
+            .get_mut(&ticket.id)
+            .expect("checked present above");
+        flow.state = FlowState::Granted(GrantedCredentials {
+            login_name,
+            app_password,
+        });
+        GrantOutcome::Granted
+    }
+
+    /// Synchronous convenience over [`begin_grant`] + `authenticate()` +
+    /// [`finish_grant`], with the same guarantee: `authenticate` runs
+    /// exactly once, only if the flow passed the lookup/expiry/pending/CSRF
+    /// checks, and **never while the store lock is held**. The async HTTP
+    /// handler does not use this (it has to run the check on a blocking
+    /// thread between the two halves, see `handlers.rs`); it exists for
+    /// callers with a cheap synchronous check, and for tests.
     ///
     /// `authenticate` takes no arguments and returns `Some((login_name,
-    /// app_password))` on success: the caller (`handlers.rs`) closes over
-    /// the submitted username/password and calls
+    /// app_password))` on success: the caller closes over the submitted
+    /// username/password and calls
     /// `breadcloud_webdav::AccountStore::authenticate` from inside it, so
     /// this module never needs to depend on that type or see a raw
     /// password itself outside of what the closure hands back on success.
+    ///
+    /// [`begin_grant`]: FlowStore::begin_grant
+    /// [`finish_grant`]: FlowStore::finish_grant
     pub fn try_grant(
         &self,
         login_token: &str,
         submitted_csrf: &str,
         authenticate: impl FnOnce() -> Option<(String, String)>,
     ) -> GrantOutcome {
-        let now = now_millis();
-        let mut inner = self.inner.lock().unwrap();
-        let Some(&id) = inner.by_login_hash.get(&hash_token(login_token)) else {
-            return GrantOutcome::NotFound;
-        };
-        {
-            let flow = inner.flows.get(&id).expect("index and store out of sync");
-            if flow.is_expired(now, self.lifetime_secs) {
-                inner.remove_flow(id);
-                return GrantOutcome::NotFound;
-            }
-            if !matches!(flow.state, FlowState::Pending) {
-                return GrantOutcome::NotFound;
-            }
-            if !csrf_matches(&flow.csrf_token, submitted_csrf) {
-                return GrantOutcome::CsrfMismatch;
-            }
+        match self.begin_grant(login_token, submitted_csrf) {
+            Ok(ticket) => self.finish_grant(ticket, authenticate()),
+            Err(outcome) => outcome,
         }
-
-        let Some((login_name, app_password)) = authenticate() else {
-            return GrantOutcome::InvalidCredentials;
-        };
-
-        let flow = inner
-            .flows
-            .get_mut(&id)
-            .expect("index and store out of sync");
-        flow.state = FlowState::Granted(GrantedCredentials {
-            login_name,
-            app_password,
-        });
-        GrantOutcome::Granted
     }
 
     /// Poll a flow by its `poll_token`. `None` covers "unknown", "expired",
@@ -593,7 +673,7 @@ mod tests {
         // else is not, regardless of where or how it differs) as a
         // regression guard against someone swapping the implementation
         // back to `==`/`!=` without changing what the function returns.
-        let token = "abcdefghijklmnopqrstuvwxyz0123456789ABCDE"; // 42 chars
+        let token = "abcdefghijklmnopqrstuvwxyz0123456789ABCDE"; // 41 chars
         assert!(csrf_matches(token, token));
         assert!(!csrf_matches(token, ""));
         // Same length, differs only in the last byte.
@@ -609,6 +689,245 @@ mod tests {
         // Shorter and longer than the real token.
         assert!(!csrf_matches(token, &token[..10]));
         assert!(!csrf_matches(token, &format!("{token}extra")));
+    }
+
+    // ---- credential check runs outside the store lock (CLOUD-28 round 3) --
+
+    use std::sync::mpsc;
+    use std::sync::{Arc, Condvar};
+    use std::time::Duration;
+
+    /// How long any of these tests will wait for something that should
+    /// happen immediately before declaring the code under test blocked.
+    /// Generous (nothing here is timing-sensitive, a healthy run never comes
+    /// near it) so a slow CI box cannot flake, while a regression that holds
+    /// the store lock across the credential check fails fast instead of
+    /// hanging the test binary.
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    /// Lets `n` threads meet: `arrive_and_wait` returns true once all `n`
+    /// have arrived, false if that did not happen within [`PATIENCE`].
+    struct Rendezvous {
+        arrived: Mutex<usize>,
+        cv: Condvar,
+        n: usize,
+    }
+
+    impl Rendezvous {
+        fn new(n: usize) -> Self {
+            Rendezvous {
+                arrived: Mutex::new(0),
+                cv: Condvar::new(),
+                n,
+            }
+        }
+
+        fn arrive_and_wait(&self) -> bool {
+            let mut arrived = self.arrived.lock().unwrap();
+            *arrived += 1;
+            self.cv.notify_all();
+            let (arrived, timeout) = self
+                .cv
+                .wait_timeout_while(arrived, PATIENCE, |a| *a < self.n)
+                .unwrap();
+            !timeout.timed_out() && *arrived >= self.n
+        }
+    }
+
+    /// Run `f` on its own thread and wait up to [`PATIENCE`] for its result,
+    /// so a call that (wrongly) blocks on the store lock fails the test
+    /// instead of hanging it.
+    fn within_patience<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(PATIENCE).ok()
+    }
+
+    #[test]
+    fn racing_submissions_on_one_flow_grant_exactly_one() {
+        let store = Arc::new(FlowStore::new());
+        let flow = store.initiate().unwrap();
+        let csrf = store.form_view(&flow.login_token).unwrap();
+        // Both submissions must be inside their credential check at the same
+        // moment (each waits for the other to arrive), so both passed the
+        // pending check before either could write: the worst-case
+        // interleaving, forced instead of hoped for. Reaching the meeting
+        // point at all also proves the check is not run under the lock (the
+        // second thread could never get in to arrive).
+        let meeting = Arc::new(Rendezvous::new(2));
+
+        let handles: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|who| {
+                let store = Arc::clone(&store);
+                let meeting = Arc::clone(&meeting);
+                let login_token = flow.login_token.clone();
+                let csrf = csrf.clone();
+                std::thread::spawn(move || {
+                    store.try_grant(&login_token, &csrf, || {
+                        assert!(meeting.arrive_and_wait(), "the two checks never overlapped");
+                        Some((who.to_string(), format!("{who}-password")))
+                    })
+                })
+            })
+            .collect();
+        let outcomes: Vec<GrantOutcome> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| **o == GrantOutcome::Granted)
+                .count(),
+            1,
+            "exactly one submission wins: {outcomes:?}"
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|o| **o == GrantOutcome::NotFound)
+                .count(),
+            1,
+            "the loser sees a flow that is no longer pending: {outcomes:?}"
+        );
+        // The credentials a poll hands out are the winner's, whole (never a
+        // mix), and are handed out once.
+        let creds = store.poll(&flow.poll_token).expect("one grant landed");
+        assert_eq!(creds.app_password, format!("{}-password", creds.login_name));
+        assert_eq!(store.poll(&flow.poll_token), None);
+    }
+
+    #[test]
+    fn a_slow_credential_check_does_not_block_other_flows() {
+        let store = Arc::new(FlowStore::new());
+        let slow = store.initiate().unwrap();
+        let slow_csrf = store.form_view(&slow.login_token).unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let slow_handle = {
+            let store = Arc::clone(&store);
+            let login_token = slow.login_token.clone();
+            std::thread::spawn(move || {
+                store.try_grant(&login_token, &slow_csrf, || {
+                    entered_tx.send(()).unwrap();
+                    // The "slow verify": parked here until the test says go.
+                    let _ = release_rx.recv_timeout(PATIENCE);
+                    None
+                })
+            })
+        };
+        entered_rx
+            .recv_timeout(PATIENCE)
+            .expect("slow check never started");
+
+        // The slow check is in flight right now. Every other operation, on
+        // this flow and on others, must still complete promptly.
+        let others = {
+            let store = Arc::clone(&store);
+            let slow_poll = slow.poll_token.clone();
+            let slow_login = slow.login_token.clone();
+            within_patience(move || {
+                let other = store.initiate().expect("initiate is not blocked");
+                let other_csrf = store.form_view(&other.login_token).unwrap();
+                assert_eq!(store.poll(&other.poll_token), None);
+                // Another flow can be granted and polled to completion.
+                let outcome = store.try_grant(
+                    &other.login_token,
+                    &other_csrf,
+                    always_grants("carol", "pw"),
+                );
+                let creds = store.poll(&other.poll_token);
+                // And the slow flow itself can still be polled and have its
+                // form rendered while its own check runs.
+                let slow_poll_result = store.poll(&slow_poll);
+                let slow_form = store.form_view(&slow_login);
+                (outcome, creds, slow_poll_result, slow_form.is_ok())
+            })
+        };
+
+        // Let the slow check finish whatever the verdict above, so a
+        // regression fails cleanly instead of leaving a thread parked.
+        release_tx.send(()).unwrap();
+        let slow_outcome = slow_handle.join().unwrap();
+
+        let (outcome, creds, slow_poll_result, slow_form_ok) = others
+            .expect("initiate/poll/grant on other flows blocked behind a slow credential check");
+        assert_eq!(outcome, GrantOutcome::Granted);
+        assert_eq!(creds.unwrap().login_name, "carol");
+        assert_eq!(slow_poll_result, None);
+        assert!(slow_form_ok);
+        // The slow check finally said "wrong password": flow stays pending.
+        assert_eq!(slow_outcome, GrantOutcome::InvalidCredentials);
+        assert!(store.form_view(&slow.login_token).is_ok());
+    }
+
+    #[test]
+    fn a_check_finishing_after_the_flow_was_consumed_cannot_grant_it_again() {
+        let store = Arc::new(FlowStore::new());
+        let flow = store.initiate().unwrap();
+        let csrf = store.form_view(&flow.login_token).unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let slow_handle = {
+            let store = Arc::clone(&store);
+            let login_token = flow.login_token.clone();
+            let csrf = csrf.clone();
+            std::thread::spawn(move || {
+                store.try_grant(&login_token, &csrf, || {
+                    entered_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(PATIENCE);
+                    Some(("slow".to_string(), "slow-pw".to_string()))
+                })
+            })
+        };
+        entered_rx
+            .recv_timeout(PATIENCE)
+            .expect("slow check never started");
+
+        // Meanwhile a faster submission wins the flow and the client polls
+        // the credentials away (which deletes the flow entirely).
+        let winner = {
+            let store = Arc::clone(&store);
+            let login_token = flow.login_token.clone();
+            let poll_token = flow.poll_token.clone();
+            within_patience(move || {
+                let outcome =
+                    store.try_grant(&login_token, &csrf, always_grants("fast", "fast-pw"));
+                (outcome, store.poll(&poll_token))
+            })
+        };
+        release_tx.send(()).unwrap();
+        let slow_outcome = slow_handle.join().unwrap();
+
+        let (outcome, creds) = winner.expect("grant blocked behind a slow credential check");
+        assert_eq!(outcome, GrantOutcome::Granted);
+        assert_eq!(creds.unwrap().login_name, "fast");
+        // The late finisher must not resurrect the consumed flow.
+        assert_eq!(slow_outcome, GrantOutcome::NotFound);
+        assert_eq!(store.poll(&flow.poll_token), None);
+        assert_eq!(
+            store.form_view(&flow.login_token),
+            Err(FormViewError::NotFound)
+        );
+    }
+
+    #[test]
+    fn a_check_finishing_after_the_flow_expired_cannot_grant_it() {
+        let store = FlowStore::with_lifetime(1);
+        let flow = store.initiate().unwrap();
+        let csrf = store.form_view(&flow.login_token).unwrap();
+
+        // The credential check itself outlasts the flow's lifetime.
+        let outcome = store.try_grant(&flow.login_token, &csrf, || {
+            std::thread::sleep(Duration::from_millis(1100));
+            Some(("alice".to_string(), "pw".to_string()))
+        });
+
+        assert_eq!(outcome, GrantOutcome::NotFound);
+        assert_eq!(store.poll(&flow.poll_token), None);
     }
 
     #[test]

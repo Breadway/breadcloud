@@ -204,7 +204,7 @@ async fn dispatch(State(state): State<CombinedState>, req: Request) -> Response 
     // without requiring `Authorization` (see its own matching exemption),
     // so this is reached unauthenticated exactly as it should be.
     if breadcloud_login::owns_path(&path) {
-        return breadcloud_login::dispatch(state.login.clone(), &state.accounts, req).await;
+        return breadcloud_login::dispatch(state.login.clone(), state.accounts.clone(), req).await;
     }
 
     let authed_user = req
