@@ -172,16 +172,23 @@ impl TrashStore {
     /// as `VersionStore::next_version_id`.
     async fn next_id(&self) -> Result<String, StorageError> {
         fs::create_dir_all(&self.root).await?;
-        let mut nanos = SystemTime::now()
+        let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
+        self.claim_id_at(nanos).await
+    }
+
+    async fn claim_id_at(&self, mut nanos: u128) -> Result<String, StorageError> {
         loop {
             let id = format!("{nanos:020}");
-            if fs::metadata(self.entry_dir(&id)).await.is_err() {
-                return Ok(id);
+            match fs::create_dir(self.entry_dir(&id)).await {
+                Ok(()) => return Ok(id),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    nanos += 1;
+                }
+                Err(error) => return Err(error.into()),
             }
-            nanos += 1;
         }
     }
 
@@ -202,8 +209,6 @@ impl TrashStore {
         size: u64,
     ) -> Result<TrashEntry, StorageError> {
         let id = self.next_id().await?;
-        let dir = self.entry_dir(&id);
-        fs::create_dir_all(&dir).await?;
 
         crate::move_path(live_fs_path, &self.payload_path(&id)).await?;
         fs::write(
@@ -409,6 +414,22 @@ mod tests {
         assert_eq!(listed[0].original_path, dav_path);
         assert_eq!(listed[0].size, 5);
         assert_eq!(listed[0].kind, EntryKind::File);
+    }
+
+    #[tokio::test]
+    async fn concurrent_id_claims_retry_the_same_timestamp_without_reusing_entries() {
+        let (_live, trash_dir, store) = store(GENEROUS_AGE, GENEROUS_BYTES);
+        let timestamp = 1_800_000_000_000_000_000u128;
+
+        let (first, second) =
+            tokio::join!(store.claim_id_at(timestamp), store.claim_id_at(timestamp));
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_ne!(first, second);
+        assert!(store.entry_dir(&first).is_dir());
+        assert!(store.entry_dir(&second).is_dir());
+        assert_eq!(std::fs::read_dir(trash_dir.path()).unwrap().count(), 2);
     }
 
     #[tokio::test]
