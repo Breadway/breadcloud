@@ -150,6 +150,12 @@ fn url_scoped_user(path: &str) -> Option<&str> {
     None
 }
 
+fn contains_encoded_slash(path: &str) -> bool {
+    path.as_bytes().windows(3).any(|sequence| {
+        sequence[0] == b'%' && sequence[1] == b'2' && matches!(sequence[2], b'f' | b'F')
+    })
+}
+
 /// True only for the one request shape that means "a browser navigated to
 /// the bare server root", never for anything a WebDAV/CalDAV/CardDAV
 /// client sends there. Two conditions, both required:
@@ -185,6 +191,14 @@ fn is_browser_root_navigation(method: &Method, path: &str, headers: &HeaderMap) 
 
 async fn dispatch(State(state): State<CombinedState>, req: Request) -> Response {
     let path = req.uri().path().to_string();
+
+    if contains_encoded_slash(&path) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "encoded slashes are not allowed in request paths",
+        )
+            .into_response();
+    }
 
     let authed_user = req
         .extensions()
@@ -1178,6 +1192,67 @@ mod tests {
         assert_eq!(bobs_own.status(), multi_status());
         let xml = body_string(bobs_own).await;
         assert!(!xml.contains("alice-contact-1"));
+    }
+
+    #[tokio::test]
+    async fn encoded_slashes_cannot_escape_account_scoping() {
+        let (_dirs, app) = multi_user_test_app(&[
+            ("alice", "secret1", 100 * GIB),
+            ("bob", "secret2", 100 * GIB),
+        ])
+        .await;
+
+        let event = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:bob-event-1\r\nDTSTART:20260401T090000Z\r\nDTEND:20260401T100000Z\r\nSUMMARY:Bob only\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".to_vec();
+        let event_put = request_as(
+            &app,
+            "PUT",
+            "/remote.php/dav/calendars/bob/personal/bob-event-1.ics",
+            "bob",
+            "secret2",
+            &[],
+            event,
+        )
+        .await;
+        assert_eq!(event_put.status(), StatusCode::CREATED);
+
+        let contact =
+            b"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:bob-contact-1\r\nFN:Bob's Contact\r\nEND:VCARD\r\n"
+                .to_vec();
+        let contact_put = request_as(
+            &app,
+            "PUT",
+            "/remote.php/dav/addressbooks/bob/contacts/bob-contact-1.vcf",
+            "bob",
+            "secret2",
+            &[],
+            contact,
+        )
+        .await;
+        assert_eq!(contact_put.status(), StatusCode::CREATED);
+
+        let event_read = request_as(
+            &app,
+            "GET",
+            "/remote.php/dav/calendars%2Fbob/personal/bob-event-1.ics",
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(event_read.status(), StatusCode::BAD_REQUEST);
+
+        let contact_read = request_as(
+            &app,
+            "PROPFIND",
+            "/remote.php/dav/addressbooks%2fbob/contacts/",
+            "alice",
+            "secret1",
+            &[("Depth", "1")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(contact_read.status(), StatusCode::BAD_REQUEST);
     }
 
     /// The bare-root `current-user-principal` splice (CLOUD-6) must
