@@ -401,6 +401,17 @@ impl Storage {
         );
     }
 
+    fn evict_etag_cache_subtree(&self, fs_path: &Path) {
+        let mut cache = self.etag_cache.lock().expect("etag cache lock poisoned");
+        cache.retain(|cached_path, _| !cached_path.starts_with(fs_path));
+    }
+
+    /// Forget cached etags after a caller outside `Storage` mutates this
+    /// path in the served tree.
+    pub fn invalidate_etag_cache(&self, path: &DavPath) {
+        self.evict_etag_cache_subtree(&self.resolve(path));
+    }
+
     /// Assemble `chunk_files` (in the order given -- the caller is
     /// responsible for sorting them into upload order) into `dest`,
     /// streaming each one through rather than buffering the whole result
@@ -581,6 +592,7 @@ impl Storage {
         } else {
             fs::remove_file(&fs_path).await?;
         }
+        self.evict_etag_cache_subtree(&fs_path);
         Ok(())
     }
 
@@ -653,6 +665,7 @@ impl Storage {
             } else {
                 fs::remove_file(&to_fs).await?;
             }
+            self.evict_etag_cache_subtree(&to_fs);
         }
 
         if copy {
@@ -663,6 +676,11 @@ impl Storage {
             }
         } else {
             fs::rename(&from_fs, &to_fs).await?;
+        }
+
+        self.evict_etag_cache_subtree(&to_fs);
+        if !copy {
+            self.evict_etag_cache_subtree(&from_fs);
         }
 
         Ok(if existed {
@@ -1465,17 +1483,36 @@ mod tests {
         let (_dir, storage) = storage().await;
         let file = DavPath::parse("/f.txt").unwrap();
         storage.write_bytes(&file, b"x").await.unwrap();
+        let file_meta = storage.metadata(&file).await.unwrap();
+        storage.etag_for(&file, &file_meta).await.unwrap();
+        assert!(storage
+            .etag_cache
+            .lock()
+            .unwrap()
+            .contains_key(&storage.resolve(&file)));
         storage.delete(&file).await.unwrap();
         assert!(!storage.exists(&file).await);
+        assert!(!storage
+            .etag_cache
+            .lock()
+            .unwrap()
+            .contains_key(&storage.resolve(&file)));
 
         let dir_path = DavPath::parse("/d").unwrap();
         storage.mkcol(&dir_path).await.unwrap();
-        storage
-            .write_bytes(&dir_path.child("child.txt"), b"x")
-            .await
-            .unwrap();
+        let child = dir_path.child("child.txt");
+        storage.write_bytes(&child, b"x").await.unwrap();
+        let child_meta = storage.metadata(&child).await.unwrap();
+        storage.etag_for(&child, &child_meta).await.unwrap();
+        let sibling = DavPath::parse("/d-other.txt").unwrap();
+        storage.write_bytes(&sibling, b"x").await.unwrap();
+        let sibling_meta = storage.metadata(&sibling).await.unwrap();
+        storage.etag_for(&sibling, &sibling_meta).await.unwrap();
         storage.delete(&dir_path).await.unwrap();
         assert!(!storage.exists(&dir_path).await);
+        let cache = storage.etag_cache.lock().unwrap();
+        assert!(!cache.contains_key(&storage.resolve(&child)));
+        assert!(cache.contains_key(&storage.resolve(&sibling)));
     }
 
     #[tokio::test]
@@ -1499,6 +1536,25 @@ mod tests {
         assert_eq!(outcome, WriteOutcome::Created);
         assert!(!storage.exists(&from).await);
         assert!(storage.exists(&to).await);
+    }
+
+    #[tokio::test]
+    async fn move_evicts_source_and_overwritten_destination_etags() {
+        let (_dir, storage) = storage().await;
+        let from = DavPath::parse("/from.txt").unwrap();
+        let to = DavPath::parse("/to.txt").unwrap();
+        storage.write_bytes(&from, b"source").await.unwrap();
+        storage.write_bytes(&to, b"destination").await.unwrap();
+        let from_meta = storage.metadata(&from).await.unwrap();
+        let to_meta = storage.metadata(&to).await.unwrap();
+        storage.etag_for(&from, &from_meta).await.unwrap();
+        storage.etag_for(&to, &to_meta).await.unwrap();
+
+        storage.move_to(&from, &to, true).await.unwrap();
+
+        let cache = storage.etag_cache.lock().unwrap();
+        assert!(!cache.contains_key(&storage.resolve(&from)));
+        assert!(!cache.contains_key(&storage.resolve(&to)));
     }
 
     #[tokio::test]
