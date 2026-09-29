@@ -36,10 +36,11 @@
 //! instance the way each account needs its own `Storage`.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -463,13 +464,31 @@ async fn auth_gate(State(state): State<CombinedState>, mut req: Request, next: N
         return next.run(req).await;
     }
 
-    match state.accounts.authenticate_request(req.headers()) {
-        Some(username) => {
+    let peer_ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(address)| address.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    match state
+        .accounts
+        .authenticate_request_from(req.headers(), peer_ip)
+    {
+        Ok(Some(username)) => {
             req.extensions_mut().insert(AuthenticatedUser(username));
             next.run(req).await
         }
-        None => unauthorized(),
+        Ok(None) => unauthorized(),
+        Err(retry_after) => rate_limited(retry_after),
     }
+}
+
+fn rate_limited(retry_after: std::time::Duration) -> Response {
+    let seconds = retry_after.as_secs().max(1);
+    let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
+    if let Ok(value) = seconds.to_string().parse() {
+        response.headers_mut().insert("Retry-After", value);
+    }
+    response
 }
 
 fn unauthorized() -> Response {
@@ -838,6 +857,36 @@ mod tests {
         let response =
             request_as(&app, "GET", "/note.txt", "alice", "wrong", &[], Vec::new()).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn repeated_failed_authentication_is_rate_limited() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
+        for _ in 0..5 {
+            let response = request_as(
+                &app,
+                "GET",
+                "/note.txt",
+                "missing",
+                "wrong",
+                &[],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = request_as(
+            &app,
+            "GET",
+            "/note.txt",
+            "missing",
+            "wrong",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key("Retry-After"));
     }
 
     #[tokio::test]

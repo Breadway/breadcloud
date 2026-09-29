@@ -13,7 +13,11 @@
 //! crate for `check_basic_auth`, the same "shared placeholder auth"
 //! relationship this generalizes.
 
-use std::collections::HashMap;
+use std::collections::{hash_map::RandomState, HashMap, VecDeque};
+use std::hash::BuildHasher;
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
@@ -84,6 +88,133 @@ impl Account {
 #[derive(Clone, Default)]
 pub struct AccountStore {
     accounts: HashMap<String, Account>,
+    protection: Arc<Mutex<AuthProtection>>,
+}
+
+// A desktop sync can send many requests over this brief window; keep the
+// cache short-lived and bounded so changed credentials take effect quickly.
+const AUTH_CACHE_TTL: Duration = Duration::from_secs(15);
+const AUTH_CACHE_CAPACITY: usize = 4096;
+// Permit five consecutive failures in a rolling minute per peer and per
+// username, then reject attempts until the oldest failure leaves the window.
+const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+const AUTH_FAILURE_LIMIT: usize = 5;
+const AUTH_FAILURE_BUCKET_CAPACITY: usize = 8192;
+
+#[derive(Default)]
+struct AuthProtection {
+    cache_hasher: RandomState,
+    successful: HashMap<u64, (String, Instant)>,
+    failures_by_ip: HashMap<IpAddr, VecDeque<Instant>>,
+    failures_by_user: HashMap<String, VecDeque<Instant>>,
+}
+
+impl AuthProtection {
+    fn cache_key(&self, header: &[u8]) -> u64 {
+        self.cache_hasher.hash_one(header)
+    }
+
+    fn cached_user(&mut self, header: &[u8], now: Instant) -> Option<String> {
+        let key = self.cache_key(header);
+        match self.successful.get(&key) {
+            Some((user, expires)) if *expires > now => Some(user.clone()),
+            Some(_) => {
+                self.successful.remove(&key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn cache_success(&mut self, header: &[u8], username: &str, now: Instant) {
+        if self.successful.len() >= AUTH_CACHE_CAPACITY {
+            self.successful.retain(|_, (_, expires)| *expires > now);
+        }
+        if self.successful.len() >= AUTH_CACHE_CAPACITY {
+            if let Some(key) = self.successful.keys().next().copied() {
+                self.successful.remove(&key);
+            }
+        }
+        self.successful.insert(
+            self.cache_key(header),
+            (username.to_string(), now + AUTH_CACHE_TTL),
+        );
+    }
+
+    fn check_allowed(&mut self, ip: IpAddr, user: &str, now: Instant) -> Result<(), Duration> {
+        prune_failure_bucket(&mut self.failures_by_ip, &ip, now);
+        prune_failure_bucket(&mut self.failures_by_user, &user.to_string(), now);
+        let ip_retry = blocked_for(&self.failures_by_ip, &ip, now);
+        let user_retry = blocked_for(&self.failures_by_user, &user.to_string(), now);
+        match (ip_retry, user_retry) {
+            (Some(ip), Some(user)) => Err(ip.max(user)),
+            (Some(retry), None) | (None, Some(retry)) => Err(retry),
+            (None, None) => Ok(()),
+        }
+    }
+
+    fn record_failure(&mut self, ip: IpAddr, user: &str, now: Instant) {
+        add_failure(&mut self.failures_by_ip, ip, now);
+        add_failure(&mut self.failures_by_user, user.to_string(), now);
+    }
+
+    fn clear_failures(&mut self, ip: IpAddr, user: &str) {
+        self.failures_by_ip.remove(&ip);
+        self.failures_by_user.remove(user);
+    }
+}
+
+fn prune_failure_bucket<K: Eq + std::hash::Hash>(
+    buckets: &mut HashMap<K, VecDeque<Instant>>,
+    key: &K,
+    now: Instant,
+) {
+    let empty = buckets.get_mut(key).is_some_and(|attempts| {
+        while attempts
+            .front()
+            .is_some_and(|attempt| now.duration_since(*attempt) >= AUTH_FAILURE_WINDOW)
+        {
+            attempts.pop_front();
+        }
+        attempts.is_empty()
+    });
+    if empty {
+        buckets.remove(key);
+    }
+}
+
+fn blocked_for<K: Eq + std::hash::Hash>(
+    buckets: &HashMap<K, VecDeque<Instant>>,
+    key: &K,
+    now: Instant,
+) -> Option<Duration> {
+    buckets.get(key).and_then(|attempts| {
+        (attempts.len() >= AUTH_FAILURE_LIMIT).then(|| {
+            attempts
+                .front()
+                .map(|first| AUTH_FAILURE_WINDOW.saturating_sub(now.duration_since(*first)))
+                .unwrap_or_default()
+        })
+    })
+}
+
+fn add_failure<K: Clone + Eq + std::hash::Hash>(
+    buckets: &mut HashMap<K, VecDeque<Instant>>,
+    key: K,
+    now: Instant,
+) {
+    prune_failure_bucket(buckets, &key, now);
+    if buckets.len() >= AUTH_FAILURE_BUCKET_CAPACITY && !buckets.contains_key(&key) {
+        if let Some(oldest) = buckets.keys().next().cloned() {
+            // The rolling-window pruning above normally frees entries. If
+            // an attacker supplies many distinct usernames within one
+            // window, evict one bucket to keep this process-local guard
+            // bounded rather than allowing unbounded memory growth.
+            buckets.remove(&oldest);
+        }
+    }
+    let attempts = buckets.entry(key).or_default();
+    attempts.push_back(now);
 }
 
 impl AccountStore {
@@ -93,6 +224,7 @@ impl AccountStore {
                 .into_iter()
                 .map(|a| (a.username.clone(), a))
                 .collect(),
+            protection: Arc::default(),
         }
     }
 
@@ -123,18 +255,84 @@ impl AccountStore {
     /// this password match any configured account", which would let one
     /// account's credentials authenticate as a different username.
     pub fn authenticate_request(&self, headers: &HeaderMap) -> Option<String> {
-        let value = headers.get("Authorization")?.to_str().ok()?;
-        let encoded = value.strip_prefix("Basic ")?;
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .ok()?;
-        let text = String::from_utf8(decoded).ok()?;
-        let (user, pass) = text.split_once(':')?;
-        let account = self.accounts.get(user)?;
-        if account.verify(pass) {
-            Some(account.username.clone())
+        self.authenticate_request_from(headers, IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+            .ok()
+            .flatten()
+    }
+
+    /// Authenticate a request while tracking failed attempts against both
+    /// the peer address and the supplied username. The Basic auth header
+    /// is never retained: successful checks are cached for 15 seconds
+    /// under a process-keyed fast hash, with a fixed cache capacity.
+    pub fn authenticate_request_from(
+        &self,
+        headers: &HeaderMap,
+        peer_ip: IpAddr,
+    ) -> Result<Option<String>, Duration> {
+        let Some(value) = headers.get("Authorization") else {
+            let mut protection = self.protection.lock().expect("auth state poisoned");
+            let now = Instant::now();
+            protection.check_allowed(peer_ip, "", now)?;
+            protection.record_failure(peer_ip, "", now);
+            return Ok(None);
+        };
+        let Ok(value) = value.to_str() else {
+            let mut protection = self.protection.lock().expect("auth state poisoned");
+            let now = Instant::now();
+            protection.check_allowed(peer_ip, "", now)?;
+            protection.record_failure(peer_ip, "", now);
+            return Ok(None);
+        };
+        let mut protection = self.protection.lock().expect("auth state poisoned");
+        let now = Instant::now();
+        if let Some(username) = protection.cached_user(value.as_bytes(), now) {
+            return Ok(Some(username));
+        }
+
+        // Parse enough to choose the per-user bucket before the expensive
+        // Argon2 verify. Malformed credentials still consume the per-IP
+        // budget, using an empty username bucket.
+        let parsed = value
+            .strip_prefix("Basic ")
+            .and_then(|encoded| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .ok()
+            })
+            .and_then(|decoded| String::from_utf8(decoded).ok())
+            .and_then(|text| {
+                text.split_once(':')
+                    .map(|(user, pass)| (user.to_string(), pass.to_string()))
+            });
+        let username = parsed.as_ref().map_or("", |(user, _)| user.as_str());
+        protection.check_allowed(peer_ip, username, now)?;
+        drop(protection);
+
+        let Some((user, pass)) = parsed else {
+            self.protection
+                .lock()
+                .expect("auth state poisoned")
+                .record_failure(peer_ip, "", now);
+            return Ok(None);
+        };
+        let Some(account) = self.accounts.get(&user) else {
+            self.protection
+                .lock()
+                .expect("auth state poisoned")
+                .record_failure(peer_ip, &user, now);
+            return Ok(None);
+        };
+        if account.verify(&pass) {
+            let mut protection = self.protection.lock().expect("auth state poisoned");
+            protection.clear_failures(peer_ip, &user);
+            protection.cache_success(value.as_bytes(), &account.username, Instant::now());
+            Ok(Some(account.username.clone()))
         } else {
-            None
+            self.protection
+                .lock()
+                .expect("auth state poisoned")
+                .record_failure(peer_ip, &user, now);
+            Ok(None)
         }
     }
 }
@@ -192,5 +390,35 @@ mod tests {
     fn missing_authorization_header_is_none() {
         let store = AccountStore::new(vec![Account::new("alice", "secret1", 100)]);
         assert_eq!(store.authenticate_request(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn failed_authentication_is_limited_by_ip_and_username() {
+        let store = AccountStore::new(vec![Account::new("alice", "secret1", 100)]);
+        let headers = headers_with_basic_auth("alice", "wrong");
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        for _ in 0..AUTH_FAILURE_LIMIT {
+            assert_eq!(store.authenticate_request_from(&headers, ip), Ok(None));
+        }
+        assert!(store.authenticate_request_from(&headers, ip).is_err());
+
+        // The username bucket applies across source addresses, and the IP
+        // bucket applies across usernames.
+        let other_ip: IpAddr = "192.0.2.2".parse().unwrap();
+        assert!(store.authenticate_request_from(&headers, other_ip).is_err());
+        let other_user = headers_with_basic_auth("bob", "wrong");
+        assert!(store.authenticate_request_from(&other_user, ip).is_err());
+    }
+
+    #[test]
+    fn successful_credential_cache_expires_without_retaining_header_text() {
+        let mut protection = AuthProtection::default();
+        let header = b"Basic YWxpY2U6c2VjcmV0MQ==";
+        let now = Instant::now();
+        protection.cache_success(header, "alice", now);
+        assert_eq!(protection.cached_user(header, now), Some("alice".into()));
+        assert_eq!(protection.successful.len(), 1);
+        assert_eq!(protection.successful.values().next().unwrap().0, "alice");
+        assert_eq!(protection.cached_user(header, now + AUTH_CACHE_TTL), None);
     }
 }
