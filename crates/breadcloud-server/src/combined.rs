@@ -39,7 +39,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -101,21 +101,6 @@ pub fn router(
         .fallback(dispatch)
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, auth_gate))
-        // axum applies its own 2 MiB default body-size limit to any
-        // request read through a `DefaultBodyLimit`-aware extractor,
-        // silently overriding a handler's own larger cap unless this is
-        // raised to match. `breadcloud_webui::files::upload`'s
-        // `Multipart::from_request` is the *only* such extractor
-        // anywhere in this workspace -- every other handler
-        // (`breadcloud_webdav::handlers::put`, this crate's own
-        // `mkdir`/`delete` form-body reads, and so on) reads its body via
-        // a plain `axum::body::to_bytes(req.into_body(), <its own cap>)`
-        // call on the raw `Request`, which this layer has no effect on
-        // at all -- so raising it here, once, for the whole combined
-        // router is equivalent to raising it for exactly the one route
-        // that needs it, not a blanket loosening of every route's body
-        // size handling.
-        .layer(DefaultBodyLimit::max(breadcloud_webui::MAX_UPLOAD_BYTES))
 }
 
 /// Path prefixes where the very next segment names an account (Nextcloud's
@@ -1962,19 +1947,10 @@ mod tests {
         assert_eq!(get.status(), StatusCode::NOT_FOUND);
     }
 
-    /// Regression test for the CLOUD-12 review's second finding: axum
-    /// applies its own 2 MiB default body-size limit to any request read
-    /// through a `DefaultBodyLimit`-aware extractor, and
-    /// `/ui/upload`'s `Multipart::from_request` is exactly such an
-    /// extractor -- before the combined router's `DefaultBodyLimit` layer
-    /// was raised to match `MAX_UPLOAD_BYTES`, this exact shape of
-    /// request (comfortably over 2 MiB, comfortably under both the real
-    /// cap and the account's quota) failed with a generic 400, live-
-    /// verified by the reviewer via bisection at exactly the 2 MiB
-    /// boundary. The prior quota test above uses a 10-byte quota and a
-    /// payload nowhere near 2 MiB, so it could not have caught this; this
-    /// test exists specifically because that one does not exercise a
-    /// realistic size.
+    /// Regression coverage for a streamed multipart upload larger than
+    /// axum's default 2 MiB body limit. Upload parsing applies its own
+    /// explicit stream limit, so this request should succeed while staying
+    /// within both the file cap and the account quota.
     #[tokio::test]
     async fn ui_upload_larger_than_axum_default_body_limit_succeeds() {
         let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", GIB)]).await;

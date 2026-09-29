@@ -152,6 +152,36 @@ impl VersionStore {
         Ok(info)
     }
 
+    /// Copy a live file into version history without reading its full
+    /// contents into memory.
+    pub async fn snapshot_file(
+        &self,
+        path: &DavPath,
+        source: &Path,
+    ) -> Result<VersionInfo, StorageError> {
+        let dir = self.dir_for(path);
+        fs::create_dir_all(&dir).await?;
+        let id = self.next_version_id(&dir).await?;
+        let destination = dir.join(&id);
+        let temporary = dir.join(format!(".pending-{id}"));
+        if let Err(err) = fs::copy(source, &temporary).await {
+            let _ = fs::remove_file(&temporary).await;
+            return Err(err.into());
+        }
+        if let Err(err) = fs::rename(&temporary, &destination).await {
+            let _ = fs::remove_file(&temporary).await;
+            return Err(err.into());
+        }
+        let len = fs::metadata(&destination).await?.len();
+        let info = VersionInfo {
+            id,
+            len,
+            modified: SystemTime::now(),
+        };
+        self.prune(&dir).await?;
+        Ok(info)
+    }
+
     /// A zero-padded (fixed-width, so lexicographic order matches numeric
     /// order) nanosecond timestamp. Bumped forward a nanosecond at a time
     /// on the rare collision (two snapshots of the same file landing in

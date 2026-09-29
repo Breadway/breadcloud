@@ -27,17 +27,18 @@ use crate::state::AppState;
 /// with it rather than proceeding with an overwrite that could not be
 /// safely versioned.
 pub async fn snapshot_before_overwrite(state: &AppState, path: &DavPath) -> Result<(), Response> {
-    let existing = match state.storage.read_bytes(path).await {
-        Ok(bytes) => bytes,
+    match state.storage.metadata(path).await {
+        Ok(metadata) if metadata.is_dir() => {
+            Err(storage_error_response(StorageError::IsADirectory))
+        }
+        Ok(_) => state
+            .versions
+            .snapshot_file(path, &state.storage.resolve(path))
+            .await
+            .map(|_| ())
+            .map_err(storage_error_response),
         // First creation: nothing to snapshot.
-        Err(StorageError::NotFound) => return Ok(()),
-        Err(err) => return Err(storage_error_response(err)),
-    };
-
-    state
-        .versions
-        .snapshot(path, &existing)
-        .await
-        .map(|_| ())
-        .map_err(storage_error_response)
+        Err(StorageError::NotFound) => Ok(()),
+        Err(err) => Err(storage_error_response(err)),
+    }
 }

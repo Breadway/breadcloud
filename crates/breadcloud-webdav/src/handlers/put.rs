@@ -3,16 +3,14 @@ use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use breadcloud_storage::{DavPath, WriteOutcome};
+use futures_util::StreamExt;
 
 use crate::error::storage_error_response;
 use crate::preconditions;
 use crate::state::AppState;
 
-/// Safety cap on a buffered PUT body. Individual files in the target tree
-/// can be multiple gigabytes; buffering the whole request in memory is
-/// fine at this size for the plain (non-chunked) PUT path -- real clients
-/// switch to chunked upload (see `handlers::uploads`) well before their
-/// files get anywhere near this cap.
+/// Maximum plain WebDAV PUT size. Request data is streamed to disk, so
+/// this limit bounds storage use rather than process memory.
 const MAX_BODY_BYTES: usize = 20 * 1024 * 1024 * 1024;
 
 pub async fn handle(state: &AppState, path: &DavPath, req: Request) -> Response {
@@ -26,17 +24,25 @@ pub async fn handle(state: &AppState, path: &DavPath, req: Request) -> Response 
         return conflict;
     }
 
-    // Snapshot whatever is currently at `path` into version history
-    // (CLOUD-4) before the write below can replace it. A no-op if `path`
-    // does not exist yet -- first creation is not a "previous version".
-    if let Err(resp) = crate::versioning::snapshot_before_overwrite(state, path).await {
-        return resp;
-    }
-
-    let bytes = match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
-        Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, "could not read request body").into_response(),
+    let mut prepared = match state.storage.prepare_write(path).await {
+        Ok(prepared) => prepared,
+        Err(err) => return storage_error_response(err),
     };
+    let mut body = req.into_body().into_data_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                return (StatusCode::BAD_REQUEST, "could not read request body").into_response()
+            }
+        };
+        if prepared.total().saturating_add(chunk.len() as u64) > MAX_BODY_BYTES as u64 {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response();
+        }
+        if let Err(err) = prepared.write_chunk(&chunk).await {
+            return storage_error_response(err);
+        }
+    }
 
     // CLOUD-11: reject a write that would exceed this account's quota
     // before it touches disk at all. `quota_gate` also closes the TOCTOU
@@ -49,7 +55,7 @@ pub async fn handle(state: &AppState, path: &DavPath, req: Request) -> Response 
     let quota_guard = match state.quota_limit_bytes {
         Some(limit) => match state
             .storage
-            .quota_gate(limit, path, bytes.len() as u64)
+            .quota_gate(limit, path, prepared.total())
             .await
         {
             Ok(guard) => Some(guard),
@@ -61,7 +67,12 @@ pub async fn handle(state: &AppState, path: &DavPath, req: Request) -> Response 
     // RFC 4918 9.7.1: PUT creates the resource if it does not exist and
     // overwrites it if it does; the parent collection must already
     // exist, which `write_bytes` enforces (409 Conflict otherwise).
-    let (outcome, etag) = match state.storage.write_bytes(path, &bytes).await {
+    // Snapshot only after the body and quota have been accepted, and
+    // immediately before the atomic replacement is committed.
+    if let Err(resp) = crate::versioning::snapshot_before_overwrite(state, path).await {
+        return resp;
+    }
+    let (outcome, total, etag) = match prepared.commit(&state.storage).await {
         Ok(v) => v,
         Err(err) => return storage_error_response(err),
     };
@@ -72,7 +83,7 @@ pub async fn handle(state: &AppState, path: &DavPath, req: Request) -> Response 
         state.owner_label(),
         &path.to_request_path(),
         breadcloud_events::FileOp::Put,
-        Some(bytes.len() as u64),
+        Some(total),
     );
     if let Some(guard) = &quota_guard {
         if let Some(percent) = breadcloud_events::crossed_threshold(

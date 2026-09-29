@@ -31,6 +31,7 @@
 //! leave partial chunk files where a sync client might mistake them for
 //! real content.
 
+use futures_util::StreamExt;
 use std::path::PathBuf;
 
 use axum::body::Body;
@@ -45,10 +46,8 @@ use crate::preconditions;
 use crate::state::AppState;
 use crate::xml::{build_multistatus, PropfindRequest, ResourceEntry};
 
-/// Safety cap on one buffered chunk. Real clients keep individual chunks
-/// well under this (historically single-digit to low tens of MB); it
-/// exists to bound memory, not to match any particular client's chunk
-/// size.
+/// Maximum size of one chunk body. Chunk bodies are streamed to disk, so
+/// this bounds staging storage rather than process memory.
 const MAX_CHUNK_BYTES: usize = 512 * 1024 * 1024;
 
 const UPLOADS_PREFIX: &str = "/remote.php/dav/uploads";
@@ -129,15 +128,29 @@ async fn handle_chunk(
 ) -> Response {
     match method.as_str() {
         "PUT" => {
-            let bytes = match axum::body::to_bytes(req.into_body(), MAX_CHUNK_BYTES).await {
-                Ok(b) => b,
-                Err(_) => {
-                    return (StatusCode::BAD_REQUEST, "could not read chunk body").into_response()
-                }
+            let mut prepared = match state.uploads.prepare_write(chunk_path).await {
+                Ok(prepared) => prepared,
+                Err(err) => return storage_error_response(err),
             };
-            match state.uploads.write_bytes(chunk_path, &bytes).await {
-                Ok((WriteOutcome::Created, _)) => StatusCode::CREATED.into_response(),
-                Ok((WriteOutcome::Overwritten, _)) => StatusCode::NO_CONTENT.into_response(),
+            let mut body = req.into_body().into_data_stream();
+            while let Some(chunk) = body.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(_) => {
+                        return (StatusCode::BAD_REQUEST, "could not read chunk body")
+                            .into_response()
+                    }
+                };
+                if prepared.total().saturating_add(chunk.len() as u64) > MAX_CHUNK_BYTES as u64 {
+                    return (StatusCode::PAYLOAD_TOO_LARGE, "chunk too large").into_response();
+                }
+                if let Err(err) = prepared.write_chunk(&chunk).await {
+                    return storage_error_response(err);
+                }
+            }
+            match prepared.commit(&state.uploads).await {
+                Ok((WriteOutcome::Created, _, _)) => StatusCode::CREATED.into_response(),
+                Ok((WriteOutcome::Overwritten, _, _)) => StatusCode::NO_CONTENT.into_response(),
                 Err(err) => storage_error_response(err),
             }
         }
