@@ -595,6 +595,64 @@ async fn basic_auth_rejects_missing_and_wrong_credentials() {
 }
 
 #[tokio::test]
+async fn status_discovery_exemption_only_allows_get_on_exact_path() {
+    let dir = TempDir::new().unwrap();
+    let uploads_dir = TempDir::new().unwrap();
+    let versions_dir = TempDir::new().unwrap();
+    let trash_dir = TempDir::new().unwrap();
+    let storage = Storage::new(dir.path());
+    let uploads = Storage::new(uploads_dir.path());
+    let versions = VersionStore::new(versions_dir.path());
+    let trash = TrashStore::new(trash_dir.path());
+    let state = AppState::new(storage, uploads, versions, trash).with_auth("alice", "secret");
+    let app = router(state);
+
+    let status_get = Request::builder()
+        .method("GET")
+        .uri("/status.php")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(status_get).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let status_put = Request::builder()
+        .method("PUT")
+        .uri("/status.php")
+        .body(Body::from("unauthenticated"))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(status_put).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let nested_status_get = Request::builder()
+        .method("GET")
+        .uri("/anything/status.php")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(nested_status_get)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let nested_status_put = Request::builder()
+        .method("PUT")
+        .uri("/anything/status.php")
+        .body(Body::from("unauthenticated"))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(nested_status_put).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
 async fn first_put_creates_no_version_history() {
     let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app();
 
