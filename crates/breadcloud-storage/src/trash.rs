@@ -215,18 +215,19 @@ impl TrashStore {
             }
         };
 
-        // Publish complete metadata before moving the live payload. A
-        // concurrent listing can then either skip this entry while its
-        // metadata is incomplete or read a complete entry, but will never
-        // fail the whole listing because a metadata file is missing.
+        // Prepare metadata before moving the live payload. Keep the size
+        // unpublished until the payload is complete so concurrent listing
+        // and cap enforcement cannot process an entry still being moved.
         fs::write(
             self.original_path_file(&id),
             original_path.to_request_path(),
         )
         .await?;
         fs::write(self.kind_file(&id), kind_marker(kind)).await?;
-        fs::write(self.size_file(&id), size.to_string()).await?;
+        let pending_size = self.entry_dir(&id).join("size.pending");
+        fs::write(&pending_size, size.to_string()).await?;
         crate::move_path(live_fs_path, &self.payload_path(&id)).await?;
+        fs::rename(pending_size, self.size_file(&id)).await?;
 
         Ok(TrashEntry {
             deleted_at: id_to_time(&id),
@@ -474,6 +475,32 @@ mod tests {
             malformed_dir.exists(),
             "listing must not delete malformed data"
         );
+    }
+
+    #[tokio::test]
+    async fn unpublished_entry_is_skipped_until_payload_is_ready() {
+        let (_live, trash_dir, store) = store(GENEROUS_AGE, 0);
+        let dir = trash_dir.path().join("00000000000000000001");
+        tokio::fs::create_dir(&dir).await.unwrap();
+        tokio::fs::write(dir.join("original-path"), "/pending.txt")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("kind"), "file").await.unwrap();
+        tokio::fs::write(dir.join("size.pending"), "7")
+            .await
+            .unwrap();
+        assert!(store.list().await.unwrap().is_empty());
+        store.enforce_caps().await.unwrap();
+        assert!(dir.exists());
+        tokio::fs::write(dir.join("payload"), b"payload")
+            .await
+            .unwrap();
+        tokio::fs::rename(dir.join("size.pending"), dir.join("size"))
+            .await
+            .unwrap();
+        assert_eq!(store.list().await.unwrap().len(), 1);
+        store.enforce_caps().await.unwrap();
+        assert!(!dir.exists());
     }
 
     #[tokio::test]
