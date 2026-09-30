@@ -261,7 +261,7 @@ pub async fn create(state: &AppState, body: &[u8]) -> Response {
             }
             Err(err) => with_api_versions_header(note_storage_error(err)),
         },
-        Err(resp) => with_api_versions_header(resp),
+        Err(resp) => with_api_versions_header(*resp),
     }
 }
 
@@ -339,7 +339,7 @@ pub async fn update(state: &AppState, id: &str, headers: &HeaderMap, body: &[u8]
         let new_path = dir.child(&filename);
         if new_path != path {
             if let Err(resp) = rename_note(state, &path, &new_path).await {
-                return with_api_versions_header(resp);
+                return with_api_versions_header(*resp);
             }
             path = new_path;
         }
@@ -347,7 +347,7 @@ pub async fn update(state: &AppState, id: &str, headers: &HeaderMap, body: &[u8]
 
     if let Some(content) = &input.content {
         if let Err(resp) = write_note_content(state, &path, content.as_bytes()).await {
-            return with_api_versions_header(resp);
+            return with_api_versions_header(*resp);
         }
     }
 
@@ -565,7 +565,7 @@ pub async fn attachment_upload(state: &AppState, note_id: &str, req: Request) ->
             StatusCode::OK,
             json!({"filename": format!("{}/{}", note::attachment_dir_name(note_id), sanitized)}),
         )),
-        Err(resp) => with_api_versions_header(resp),
+        Err(resp) => with_api_versions_header(*resp),
     }
 }
 
@@ -585,7 +585,11 @@ fn attachment_path(note_path: &DavPath, note_id: &str, raw_name: &str) -> Option
 /// as a raw request body `handlers::put::handle` could take directly
 /// (the same reason `breadcloud-webui`'s own `files::upload` duplicates
 /// this same short sequence instead of calling `handlers::put::handle`).
-async fn write_note_content(state: &AppState, path: &DavPath, data: &[u8]) -> Result<(), Response> {
+async fn write_note_content(
+    state: &AppState,
+    path: &DavPath,
+    data: &[u8],
+) -> Result<(), Box<Response>> {
     breadcloud_webdav::versioning::snapshot_before_overwrite(state, path)
         .await
         .map_err(breadcloud_webdav::error::storage_error_response)?;
@@ -597,7 +601,7 @@ async fn write_note_content(state: &AppState, path: &DavPath, data: &[u8]) -> Re
             .await
         {
             Ok(guard) => Some(guard),
-            Err(err) => return Err(note_storage_error(err)),
+            Err(err) => return Err(Box::new(note_storage_error(err))),
         },
         None => None,
     };
@@ -624,7 +628,7 @@ async fn write_note_content(state: &AppState, path: &DavPath, data: &[u8]) -> Re
 /// a `Destination` header this crate has no equivalent of (the rename
 /// target is computed from the note's new title/category, not read off a
 /// header).
-async fn rename_note(state: &AppState, from: &DavPath, to: &DavPath) -> Result<(), Response> {
+async fn rename_note(state: &AppState, from: &DavPath, to: &DavPath) -> Result<(), Box<Response>> {
     state
         .storage
         .move_to(from, to, false)
@@ -664,7 +668,7 @@ async fn rename_attachments_dir(
     state: &AppState,
     from: &DavPath,
     to: &DavPath,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     let (Some(from_parent), Some(to_parent)) = (from.parent(), to.parent()) else {
         return Ok(());
     };
@@ -693,11 +697,13 @@ fn sanitize_query_str(raw: &str) -> String {
 /// `axum::extract::Request`, buffering the body -- notes are small text
 /// files, never the multi-gigabyte payloads `breadcloud-webdav`'s own PUT
 /// path has to stream.
-pub async fn read_json_body(req: Request) -> Result<Vec<u8>, Response> {
+pub async fn read_json_body(req: Request) -> Result<Vec<u8>, Box<Response>> {
     axum::body::to_bytes(req.into_body(), 8 * 1024 * 1024)
         .await
         .map(|b| b.to_vec())
         .map_err(|_| {
-            with_api_versions_header(error_response(StatusCode::BAD_REQUEST)).into_response()
+            Box::new(
+                with_api_versions_header(error_response(StatusCode::BAD_REQUEST)).into_response(),
+            )
         })
 }
