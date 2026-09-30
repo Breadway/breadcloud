@@ -10,17 +10,28 @@ pub struct RequestedProperty {
 }
 
 impl RequestedProperty {
-    fn from_resolved(namespace: ResolveResult<'_>, local_name: String) -> Self {
+    fn from_resolved(namespace: ResolveResult<'_>, local_name: String) -> Option<Self> {
         let namespace = match namespace {
             ResolveResult::Bound(namespace) => {
-                Some(String::from_utf8_lossy(namespace.0).into_owned())
+                // NsReader returns raw namespace attribute bytes, including XML
+                // references. Normalize literal attribute whitespace before
+                // decoding references, which must retain their referenced chars.
+                let raw = std::str::from_utf8(namespace.0).ok()?;
+                let normalized = raw.replace("\r\n", " ").replace(['\r', '\n', '\t'], " ");
+                let decoded = quick_xml::escape::unescape(&normalized).ok()?;
+                if !decoded.chars().all(|c| {
+                    matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
+                }) {
+                    return None;
+                }
+                Some(decoded.into_owned())
             }
             ResolveResult::Unbound | ResolveResult::Unknown(_) => None,
         };
-        Self {
+        Some(Self {
             namespace,
             local_name,
-        }
+        })
     }
 }
 
@@ -63,7 +74,11 @@ pub fn parse_propfind_body(body: &[u8]) -> PropfindRequest {
                 if in_prop {
                     prop_child_depth += 1;
                     if prop_child_depth == 1 {
-                        names.push(RequestedProperty::from_resolved(namespace, local));
+                        let Some(property) = RequestedProperty::from_resolved(namespace, local)
+                        else {
+                            return PropfindRequest::AllProp;
+                        };
+                        names.push(property);
                     }
                 } else {
                     match local.as_str() {
@@ -78,7 +93,11 @@ pub fn parse_propfind_body(body: &[u8]) -> PropfindRequest {
                 let local = local_name(e.local_name().as_ref());
                 if in_prop {
                     if prop_child_depth == 0 {
-                        names.push(RequestedProperty::from_resolved(namespace, local));
+                        let Some(property) = RequestedProperty::from_resolved(namespace, local)
+                        else {
+                            return PropfindRequest::AllProp;
+                        };
+                        names.push(property);
                     }
                 } else {
                     match local.as_str() {
@@ -189,5 +208,27 @@ mod tests {
         assert_eq!(names[0].local_name, "has-preview");
         assert_eq!(names[1].namespace.as_deref(), Some("DAV:"));
         assert_eq!(names[1].local_name, "getetag");
+    }
+
+    #[test]
+    fn namespace_attribute_normalizes_literal_whitespace_before_references() {
+        let body = b"<d:propfind xmlns:d=\"DAV:\" xmlns:x=\"urn:a\r\nb\tc&#9;d\"><d:prop><x:custom/></d:prop></d:propfind>";
+        let PropfindRequest::Prop(names) = parse_propfind_body(body) else {
+            panic!("expected Prop request");
+        };
+        assert_eq!(names[0].namespace.as_deref(), Some("urn:a b c\td"));
+    }
+
+    #[test]
+    fn malformed_namespace_reference_uses_safe_fallback() {
+        for raw in ["urn:&undefined;", "urn:&#xZZ;", "urn:&#0;", "urn:&#1;"] {
+            let body = format!(
+                "<d:propfind xmlns:d=\"DAV:\" xmlns:x=\"{raw}\"><d:prop><x:custom/></d:prop></d:propfind>"
+            );
+            assert_eq!(
+                parse_propfind_body(body.as_bytes()),
+                PropfindRequest::AllProp
+            );
+        }
     }
 }

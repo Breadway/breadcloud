@@ -66,7 +66,10 @@ pub fn build_multistatus(
     body.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
     body.push_str("<d:multistatus xmlns:d=\"DAV:\" xmlns:oc=\"http://owncloud.org/ns\"");
     for (namespace, prefix) in &extension_prefixes {
-        body.push_str(&format!(" xmlns:{prefix}=\"{}\"", xml_escape(namespace)));
+        body.push_str(&format!(
+            " xmlns:{prefix}=\"{}\"",
+            xml_escape_attribute(namespace)
+        ));
     }
     body.push_str(">\n");
 
@@ -352,6 +355,15 @@ pub fn encode_segment(name: &str, is_collection: bool) -> String {
     out
 }
 
+fn xml_escape_attribute(input: &str) -> String {
+    // Literal attribute whitespace would be normalized to spaces by clients.
+    // References retain the original characters in the namespace's URI.
+    xml_escape(input)
+        .replace('\t', "&#9;")
+        .replace('\n', "&#10;")
+        .replace('\r', "&#13;")
+}
+
 fn xml_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for c in input.chars() {
@@ -460,6 +472,47 @@ mod tests {
         assert!(xml.contains("xmlns:p0=\"http://nextcloud.org/ns\""));
         assert!(xml.contains("<p0:has-preview/>"));
         assert!(xml.contains("404 Not Found"));
+    }
+
+    #[test]
+    fn escaped_extension_namespace_round_trips_its_expanded_name() {
+        let request = super::super::request::parse_propfind_body(
+            br#"<d:propfind xmlns:d="DAV:" xmlns:x="urn:test?a&amp;b&#9;c"><d:prop><x:custom/></d:prop></d:propfind>"#,
+        );
+        let xml = build_multistatus(&[file_entry("/a.txt")], &request, "");
+        let mut reader = quick_xml::reader::NsReader::from_str(&xml);
+        let mut found = false;
+        loop {
+            let (namespace, event) = reader.read_resolved_event().unwrap();
+            match event {
+                quick_xml::events::Event::Empty(element)
+                    if element.local_name().as_ref() == b"custom" =>
+                {
+                    let quick_xml::name::ResolveResult::Bound(namespace) = namespace else {
+                        panic!("extension property has no namespace");
+                    };
+                    let raw = std::str::from_utf8(namespace.0).unwrap();
+                    assert_eq!(quick_xml::escape::unescape(raw).unwrap(), "urn:test?a&b\tc");
+                    assert!(!raw.contains('\t'));
+                    found = true;
+                }
+                quick_xml::events::Event::Eof => break,
+                _ => {}
+            }
+        }
+        assert!(found);
+        assert!(xml.contains("404 Not Found"));
+    }
+
+    #[test]
+    fn character_reference_dav_namespace_selects_supported_property() {
+        let request = super::super::request::parse_propfind_body(
+            br#"<d:propfind xmlns:d="DAV&#58;"><d:prop><d:getetag/></d:prop></d:propfind>"#,
+        );
+        let xml = build_multistatus(&[file_entry("/a.txt")], &request, "");
+        assert!(xml.contains("<d:getetag>&quot;deadbeef&quot;</d:getetag>"));
+        assert!(xml.contains("HTTP/1.1 200 OK"));
+        assert!(!xml.contains("404 Not Found"));
     }
 
     #[test]
