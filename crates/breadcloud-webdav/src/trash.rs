@@ -16,10 +16,8 @@
 //! purged outright) avoids both leaking it forever and losing it before
 //! the user has decided the deletion is really final.
 
-use axum::response::Response;
 use breadcloud_storage::{DavPath, EntryKind, StorageError};
 
-use crate::error::storage_error_response;
 use crate::state::AppState;
 
 /// Move the live resource at `path` into trash instead of removing it.
@@ -27,36 +25,26 @@ use crate::state::AppState;
 /// filesystem content into a new trash entry, moves its version history
 /// (if any) into that same entry, then enforces the retention caps.
 ///
-/// Returns `Err` (a ready-to-send response) only if `path` does not exist
+/// Returns a storage error only if `path` does not exist
 /// or the move itself fails; a failure moving version history or
 /// enforcing caps afterward is logged but does not turn an
 /// already-successful soft-delete into an error response (mirroring how
 /// version-history purging was already best-effort before CLOUD-5).
-pub async fn move_to_trash(state: &AppState, path: &DavPath) -> Result<(), Response> {
-    let meta = state
-        .storage
-        .metadata(path)
-        .await
-        .map_err(storage_error_response)?;
+pub async fn move_to_trash(state: &AppState, path: &DavPath) -> Result<(), StorageError> {
+    let meta = state.storage.metadata(path).await?;
     let kind = if meta.is_dir() {
         EntryKind::Directory
     } else {
         EntryKind::File
     };
     let size = if meta.is_dir() {
-        directory_size(state, path)
-            .await
-            .map_err(storage_error_response)?
+        directory_size(state, path).await?
     } else {
         meta.len
     };
 
     let live_fs_path = state.storage.resolve(path);
-    let entry = state
-        .trash
-        .trash(&live_fs_path, path, kind, size)
-        .await
-        .map_err(storage_error_response)?;
+    let entry = state.trash.trash(&live_fs_path, path, kind, size).await?;
 
     if let Err(err) = state
         .versions
