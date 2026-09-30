@@ -21,6 +21,9 @@ view) on that same combined server and the same account model, see "Web UI
 Notes OCS API (`breadcloud-notes`) as a JSON view over the same `Notes/`
 markdown files WebDAV already served, for the official Notes mobile app.
 
+Android setup, protocol preflight and the physical-device acceptance checklist
+are documented in [docs/android.md](docs/android.md).
+
 ## Workspace layout
 
 A Cargo workspace, not a single binary, so later issues (the web UI) can add
