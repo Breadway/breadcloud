@@ -254,9 +254,8 @@ pub async fn upload(state: &AppState, req: Request) -> Response {
     let dest = parent.child(leaf);
     let data = data.unwrap_or_default();
 
-    if let Err(resp) = breadcloud_webdav::versioning::snapshot_before_overwrite(state, &dest).await
-    {
-        return resp;
+    if let Err(err) = breadcloud_webdav::versioning::snapshot_before_overwrite(state, &dest).await {
+        return breadcloud_webdav::error::storage_error_response(err);
     }
 
     let _quota_guard = match state.quota_limit_bytes {
