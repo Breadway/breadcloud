@@ -196,6 +196,42 @@ impl Storage {
         }
     }
 
+    /// Configure an assembly directory outside the served tree. Validate
+    /// access and filesystem placement before accepting upload requests.
+    pub fn with_staging_root(
+        root: impl Into<PathBuf>,
+        staging_root: impl Into<PathBuf>,
+    ) -> Result<Self, StorageError> {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = std::fs::canonicalize(root.into())?;
+        let staging_root = staging_root.into();
+        std::fs::create_dir_all(&staging_root)?;
+        let staging_root = std::fs::canonicalize(staging_root)?;
+        if staging_root.starts_with(&root) || root.starts_with(&staging_root) {
+            return Err(StorageError::Conflict(
+                "assembly staging must be outside the served storage tree".into(),
+            ));
+        }
+        if std::fs::metadata(&root)?.dev() != std::fs::metadata(&staging_root)?.dev() {
+            return Err(StorageError::Conflict(
+                "assembly staging must share the storage filesystem for atomic commits".into(),
+            ));
+        }
+        // Opening a unique probe detects read-only or inaccessible staging
+        // immediately, rather than on the first chunked upload finalize.
+        let probe = staging_root.join(format!(".write-probe-{}", tmp_suffix()));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)?;
+        drop(file);
+        std::fs::remove_file(probe)?;
+        let mut storage = Self::new(root);
+        storage.staging_root = staging_root;
+        Ok(storage)
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -2208,5 +2244,40 @@ mod tests {
 
         assert!(!storage.exists(&dest).await);
         assert_eq!(storage.used_bytes().await.unwrap(), 0);
+    }
+    #[tokio::test]
+    async fn explicit_staging_is_outside_quota_and_commits_without_a_root_sibling() {
+        let base = TempDir::new().unwrap();
+        let root = base.path().join("served");
+        let staging = base.path().join("configured-assembly");
+        tokio::fs::create_dir(&root).await.unwrap();
+        let storage = Storage::with_staging_root(&root, &staging).unwrap();
+        let chunk = base.path().join("chunk");
+        tokio::fs::write(&chunk, b"content").await.unwrap();
+        let path = DavPath::parse("/file").unwrap();
+        let prepared = storage
+            .prepare_assemble(&path, &[chunk], true, None)
+            .await
+            .unwrap();
+        assert_eq!(storage.used_bytes().await.unwrap(), 0);
+        assert!(!sibling_staging_root(&root).exists());
+        storage.commit_assemble(prepared).await.unwrap();
+        assert_eq!(storage.read_bytes(&path).await.unwrap(), b"content");
+        assert!(tokio::fs::read_dir(&staging)
+            .await
+            .unwrap()
+            .next_entry()
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn explicit_staging_rejects_served_tree_overlap() {
+        let root = TempDir::new().unwrap();
+        assert!(matches!(
+            Storage::with_staging_root(root.path(), root.path().join("staging")),
+            Err(StorageError::Conflict(_))
+        ));
     }
 }

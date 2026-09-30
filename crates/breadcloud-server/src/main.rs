@@ -198,6 +198,11 @@ async fn main() {
     // default to sibling directories (rather than the system temp dir)
     // since, unlike uploads staging, they need to persist across
     // restarts.
+    let assembly_root = resolve_root("BREADCLOUD_ASSEMBLY_ROOT", "./breadcloud-assembly");
+    if assembly_root.starts_with(&root) || root.starts_with(&assembly_root) {
+        panic!("BREADCLOUD_ASSEMBLY_ROOT must be outside BREADCLOUD_ROOT");
+    }
+
     let versions_root = resolve_root("BREADCLOUD_VERSIONS_ROOT", "./breadcloud-versions");
     let trash_root = resolve_root("BREADCLOUD_TRASH_ROOT", "./breadcloud-trash");
     let calendars_root = resolve_root("BREADCLOUD_CALENDARS_ROOT", "./breadcloud-calendars");
@@ -232,7 +237,12 @@ async fn main() {
             per_user_dir(&versions_root, username, loaded.nest_storage_per_user);
         let user_trash_root = per_user_dir(&trash_root, username, loaded.nest_storage_per_user);
 
-        let storage = Storage::new(user_root);
+        let user_assembly_root =
+            per_user_dir(&assembly_root, username, loaded.nest_storage_per_user);
+        let storage =
+            Storage::with_staging_root(user_root, user_assembly_root).unwrap_or_else(|error| {
+                panic!("invalid BREADCLOUD_ASSEMBLY_ROOT for {username}: {error}")
+            });
         let uploads = Storage::new(user_uploads_root);
         let versions = VersionStore::new(user_versions_root);
         let trash = TrashStore::new(user_trash_root);
