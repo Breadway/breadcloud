@@ -151,6 +151,31 @@ impl PreparedAssembly {
     }
 }
 
+/// Validated MOVE/COPY with copied content fully staged before retention
+/// or replacement starts. A failed preparation leaves the destination intact.
+#[derive(Debug)]
+pub struct PreparedRelocation {
+    source: PathBuf,
+    destination: PathBuf,
+    copied: bool,
+    existed: bool,
+    source_is_dir: bool,
+}
+
+impl PreparedRelocation {
+    pub fn existed(&self) -> bool {
+        self.existed
+    }
+    pub fn source_is_dir(&self) -> bool {
+        self.source_is_dir
+    }
+    pub async fn discard(self) {
+        if self.copied {
+            remove_any(&self.source).await;
+        }
+    }
+}
+
 /// Filesystem-backed storage, sandboxed to a root directory.
 ///
 /// Cheap to clone: the etag cache is behind an `Arc`, so clones share it
@@ -607,19 +632,19 @@ impl Storage {
         self.relocate(from, to, overwrite, true).await
     }
 
-    async fn relocate(
+    pub async fn prepare_relocation(
         &self,
         from: &DavPath,
         to: &DavPath,
         overwrite: bool,
         copy: bool,
-    ) -> Result<WriteOutcome, StorageError> {
+    ) -> Result<PreparedRelocation, StorageError> {
         if from == to {
             return Err(StorageError::Conflict(
                 "source and destination are the same".into(),
             ));
         }
-        if from.is_ancestor_of(to) {
+        if from.is_root() || to.is_ancestor_of(from) || from.is_ancestor_of(to) {
             return Err(StorageError::Conflict(
                 "cannot move or copy a collection into itself".into(),
             ));
@@ -644,32 +669,53 @@ impl Storage {
         let to_fs = self.resolve(to);
         let existing = fs::metadata(&to_fs).await.ok();
         let existed = existing.is_some();
-        if let Some(existing_meta) = existing {
-            if !overwrite {
-                return Err(StorageError::AlreadyExists);
-            }
-            if existing_meta.is_dir() {
-                fs::remove_dir_all(&to_fs).await?;
-            } else {
-                fs::remove_file(&to_fs).await?;
-            }
+        if existed && !overwrite {
+            return Err(StorageError::AlreadyExists);
         }
-
-        if copy {
-            if from_meta.is_dir() {
-                copy_dir_recursive(&from_fs, &to_fs).await?;
-            } else {
-                fs::copy(&from_fs, &to_fs).await?;
-            }
+        let source = if copy {
+            let staging = to_parent_fs.join(format!(".breadcloud-copy-{}", tmp_suffix()));
+            copy_verified(&from_fs, &staging).await?;
+            staging
         } else {
-            fs::rename(&from_fs, &to_fs).await?;
-        }
+            from_fs
+        };
+        Ok(PreparedRelocation {
+            source,
+            destination: to_fs,
+            copied: copy,
+            existed,
+            source_is_dir: from_meta.is_dir(),
+        })
+    }
 
-        Ok(if existed {
+    pub async fn commit_relocation(
+        &self,
+        prepared: PreparedRelocation,
+    ) -> Result<WriteOutcome, StorageError> {
+        if let Err(error) = move_path(&prepared.source, &prepared.destination).await {
+            // RecoveryFailed may name the staging copy as the only retained
+            // content. Preserve it rather than cleaning up recovery evidence.
+            if prepared.copied && !matches!(error, StorageError::RecoveryFailed { .. }) {
+                remove_any(&prepared.source).await;
+            }
+            return Err(error);
+        }
+        Ok(if prepared.existed {
             WriteOutcome::Overwritten
         } else {
             WriteOutcome::Created
         })
+    }
+
+    async fn relocate(
+        &self,
+        from: &DavPath,
+        to: &DavPath,
+        overwrite: bool,
+        copy: bool,
+    ) -> Result<WriteOutcome, StorageError> {
+        let prepared = self.prepare_relocation(from, to, overwrite, copy).await?;
+        self.commit_relocation(prepared).await
     }
 
     /// Disk usage of the volume backing the storage root. Filesystem-level,
@@ -2208,5 +2254,48 @@ mod tests {
 
         assert!(!storage.exists(&dest).await);
         assert_eq!(storage.used_bytes().await.unwrap(), 0);
+    }
+    #[tokio::test]
+    async fn failed_copy_preparation_preserves_destination_and_cleans_staging() {
+        let (_root, storage) = storage().await;
+        let source = DavPath::parse("/source").unwrap();
+        let destination = DavPath::parse("/destination").unwrap();
+        storage.mkcol(&source).await.unwrap();
+        storage
+            .write_bytes(&destination, b"retained")
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink("missing", storage.resolve(&source).join("broken")).unwrap();
+        assert!(storage
+            .prepare_relocation(&source, &destination, true, true)
+            .await
+            .is_err());
+        assert_eq!(storage.read_bytes(&destination).await.unwrap(), b"retained");
+        assert!(storage
+            .list_dir(&DavPath::root())
+            .await
+            .unwrap()
+            .iter()
+            .all(|entry| !entry.path.to_request_path().contains("breadcloud-copy")));
+    }
+
+    #[tokio::test]
+    async fn failed_commit_preserves_destination() {
+        let (_root, storage) = storage().await;
+        let source = DavPath::parse("/source").unwrap();
+        let destination = DavPath::parse("/destination").unwrap();
+        storage.write_bytes(&source, b"new").await.unwrap();
+        storage
+            .write_bytes(&destination, b"retained")
+            .await
+            .unwrap();
+        let prepared = storage
+            .prepare_relocation(&source, &destination, true, true)
+            .await
+            .unwrap();
+        tokio::fs::remove_file(&prepared.source).await.unwrap();
+        assert!(storage.commit_relocation(prepared).await.is_err());
+        assert_eq!(storage.read_bytes(&destination).await.unwrap(), b"retained");
+        assert_eq!(storage.read_bytes(&source).await.unwrap(), b"new");
     }
 }
