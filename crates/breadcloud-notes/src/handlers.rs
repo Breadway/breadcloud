@@ -403,11 +403,11 @@ pub async fn delete(state: &AppState, id: &str) -> Response {
 
     if let Some(dir) = attachments_dir {
         if state.storage.exists(&dir).await {
-            if let Err(resp) = breadcloud_webdav::trash::move_to_trash(state, &dir).await {
+            if let Err(err) = breadcloud_webdav::trash::move_to_trash(state, &dir).await {
                 tracing::warn!(
                     "note {id} deleted, but trashing its attachments directory {dir} failed: \
                      {status}",
-                    status = resp.status()
+                    status = breadcloud_webdav::error::storage_error_response(err).status()
                 );
             }
         }
@@ -586,7 +586,9 @@ fn attachment_path(note_path: &DavPath, note_id: &str, raw_name: &str) -> Option
 /// (the same reason `breadcloud-webui`'s own `files::upload` duplicates
 /// this same short sequence instead of calling `handlers::put::handle`).
 async fn write_note_content(state: &AppState, path: &DavPath, data: &[u8]) -> Result<(), Response> {
-    breadcloud_webdav::versioning::snapshot_before_overwrite(state, path).await?;
+    breadcloud_webdav::versioning::snapshot_before_overwrite(state, path)
+        .await
+        .map_err(breadcloud_webdav::error::storage_error_response)?;
 
     let _quota_guard = match state.quota_limit_bytes {
         Some(limit) => match state
