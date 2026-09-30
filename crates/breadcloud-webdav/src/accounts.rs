@@ -95,7 +95,7 @@ pub struct AccountStore {
 // cache short-lived and bounded so changed credentials take effect quickly.
 const AUTH_CACHE_TTL: Duration = Duration::from_secs(15);
 const AUTH_CACHE_CAPACITY: usize = 4096;
-// Permit five consecutive failures in a rolling minute per peer and per
+// Permit five failures in a rolling minute per peer and per
 // username, then reject attempts until the oldest failure leaves the window.
 const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const AUTH_FAILURE_LIMIT: usize = 5;
@@ -107,6 +107,9 @@ struct AuthProtection {
     successful: HashMap<u64, (String, Instant)>,
     failures_by_ip: HashMap<IpAddr, VecDeque<Instant>>,
     failures_by_user: HashMap<String, VecDeque<Instant>>,
+    in_flight_by_ip: HashMap<IpAddr, usize>,
+    in_flight_by_user: HashMap<String, usize>,
+    in_flight: usize,
 }
 
 impl AuthProtection {
@@ -153,14 +156,53 @@ impl AuthProtection {
         }
     }
 
+    // Reserve admission while holding the same mutex as the failure
+    // budget. Concurrent requests must count before Argon2 starts.
+    fn reserve_verification(
+        &mut self,
+        ip: IpAddr,
+        user: &str,
+        now: Instant,
+    ) -> Result<(), Duration> {
+        self.check_allowed(ip, user, now)?;
+        let ip_count = self.failures_by_ip.get(&ip).map_or(0, VecDeque::len)
+            + self.in_flight_by_ip.get(&ip).copied().unwrap_or(0);
+        let user_count = self.failures_by_user.get(user).map_or(0, VecDeque::len)
+            + self.in_flight_by_user.get(user).copied().unwrap_or(0);
+        if ip_count >= AUTH_FAILURE_LIMIT
+            || user_count >= AUTH_FAILURE_LIMIT
+            || self.in_flight >= AUTH_FAILURE_BUCKET_CAPACITY
+        {
+            return Err(AUTH_FAILURE_WINDOW);
+        }
+        *self.in_flight_by_ip.entry(ip).or_default() += 1;
+        *self.in_flight_by_user.entry(user.to_owned()).or_default() += 1;
+        self.in_flight += 1;
+        Ok(())
+    }
+
+    fn finish_verification(&mut self, ip: IpAddr, user: &str, success: bool, now: Instant) {
+        if let Some(count) = self.in_flight_by_ip.get_mut(&ip) {
+            *count -= 1;
+            if *count == 0 {
+                self.in_flight_by_ip.remove(&ip);
+            }
+        }
+        if let Some(count) = self.in_flight_by_user.get_mut(user) {
+            *count -= 1;
+            if *count == 0 {
+                self.in_flight_by_user.remove(user);
+            }
+        }
+        self.in_flight -= 1;
+        if !success {
+            self.record_failure(ip, user, now);
+        }
+    }
+
     fn record_failure(&mut self, ip: IpAddr, user: &str, now: Instant) {
         add_failure(&mut self.failures_by_ip, ip, now);
         add_failure(&mut self.failures_by_user, user.to_string(), now);
-    }
-
-    fn clear_failures(&mut self, ip: IpAddr, user: &str) {
-        self.failures_by_ip.remove(&ip);
-        self.failures_by_user.remove(user);
     }
 }
 
@@ -269,6 +311,15 @@ impl AccountStore {
         headers: &HeaderMap,
         peer_ip: IpAddr,
     ) -> Result<Option<String>, Duration> {
+        self.authenticate_with_verifier(headers, peer_ip, Account::verify)
+    }
+
+    fn authenticate_with_verifier(
+        &self,
+        headers: &HeaderMap,
+        peer_ip: IpAddr,
+        verify: impl FnOnce(&Account, &str) -> bool,
+    ) -> Result<Option<String>, Duration> {
         let Some(value) = headers.get("Authorization") else {
             let mut protection = self.protection.lock().expect("auth state poisoned");
             let now = Instant::now();
@@ -305,33 +356,33 @@ impl AccountStore {
                     .map(|(user, pass)| (user.to_string(), pass.to_string()))
             });
         let username = parsed.as_ref().map_or("", |(user, _)| user.as_str());
-        protection.check_allowed(peer_ip, username, now)?;
+        protection.reserve_verification(peer_ip, username, now)?;
         drop(protection);
 
         let Some((user, pass)) = parsed else {
             self.protection
                 .lock()
                 .expect("auth state poisoned")
-                .record_failure(peer_ip, "", now);
+                .finish_verification(peer_ip, "", false, Instant::now());
             return Ok(None);
         };
         let Some(account) = self.accounts.get(&user) else {
             self.protection
                 .lock()
                 .expect("auth state poisoned")
-                .record_failure(peer_ip, &user, now);
+                .finish_verification(peer_ip, &user, false, Instant::now());
             return Ok(None);
         };
-        if account.verify(&pass) {
+        if verify(account, &pass) {
             let mut protection = self.protection.lock().expect("auth state poisoned");
-            protection.clear_failures(peer_ip, &user);
+            protection.finish_verification(peer_ip, &user, true, Instant::now());
             protection.cache_success(value.as_bytes(), &account.username, Instant::now());
             Ok(Some(account.username.clone()))
         } else {
             self.protection
                 .lock()
                 .expect("auth state poisoned")
-                .record_failure(peer_ip, &user, now);
+                .finish_verification(peer_ip, &user, false, Instant::now());
             Ok(None)
         }
     }
@@ -420,5 +471,87 @@ mod tests {
         assert_eq!(protection.successful.len(), 1);
         assert_eq!(protection.successful.values().next().unwrap().0, "alice");
         assert_eq!(protection.cached_user(header, now + AUTH_CACHE_TTL), None);
+    }
+    #[test]
+    fn concurrent_auth_attempts_reserve_the_budget_before_verification() {
+        use std::sync::{mpsc, Barrier};
+        use std::thread;
+        let store = AccountStore::new(vec![Account::new("alice", "secret", 100)]);
+        let barrier = Arc::new(Barrier::new(AUTH_FAILURE_LIMIT + 1));
+        let (started, admitted) = mpsc::channel();
+        let mut threads = Vec::new();
+        for _ in 0..16 {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            let started = started.clone();
+            threads.push(thread::spawn(move || {
+                let headers = headers_with_basic_auth("alice", "wrong");
+                store.authenticate_with_verifier(&headers, "192.0.2.1".parse().unwrap(), |_, _| {
+                    started.send(()).unwrap();
+                    barrier.wait();
+                    false
+                })
+            }));
+        }
+        for _ in 0..AUTH_FAILURE_LIMIT {
+            admitted.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        {
+            let protection = store.protection.lock().unwrap();
+            assert_eq!(protection.in_flight, AUTH_FAILURE_LIMIT);
+            assert_eq!(protection.in_flight_by_user["alice"], AUTH_FAILURE_LIMIT);
+        }
+        barrier.wait();
+        let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(
+            results.iter().filter(|r| **r == Ok(None)).count(),
+            AUTH_FAILURE_LIMIT
+        );
+        assert_eq!(
+            results.iter().filter(|r| r.is_err()).count(),
+            16 - AUTH_FAILURE_LIMIT
+        );
+        let protection = store.protection.lock().unwrap();
+        assert_eq!(protection.in_flight, 0);
+        assert!(protection.in_flight_by_ip.is_empty());
+        assert!(protection.in_flight_by_user.is_empty());
+        assert_eq!(
+            protection.failures_by_user["alice"].len(),
+            AUTH_FAILURE_LIMIT
+        );
+    }
+
+    #[test]
+    fn inflight_budgets_apply_across_ips_and_users_and_success_releases_admission() {
+        let mut protection = AuthProtection::default();
+        let ip = "192.0.2.1".parse().unwrap();
+        let other = "192.0.2.2".parse().unwrap();
+        let now = Instant::now();
+        for _ in 0..AUTH_FAILURE_LIMIT {
+            protection.reserve_verification(ip, "alice", now).unwrap();
+        }
+        assert!(protection
+            .reserve_verification(other, "alice", now)
+            .is_err());
+        assert!(protection.reserve_verification(ip, "bob", now).is_err());
+        protection.finish_verification(ip, "alice", true, now);
+        protection
+            .reserve_verification(other, "alice", now)
+            .unwrap();
+        protection.finish_verification(other, "alice", false, now);
+        for _ in 1..AUTH_FAILURE_LIMIT {
+            protection.finish_verification(ip, "alice", false, now);
+        }
+        assert_eq!(protection.in_flight, 0);
+        assert_eq!(
+            protection.failures_by_user["alice"].len(),
+            AUTH_FAILURE_LIMIT
+        );
+        assert!(protection
+            .reserve_verification(other, "alice", now)
+            .is_err());
+        assert!(protection
+            .reserve_verification(other, "alice", now + AUTH_FAILURE_WINDOW)
+            .is_ok());
     }
 }
