@@ -178,10 +178,11 @@ impl TrashStore {
             .as_nanos();
         loop {
             let id = format!("{nanos:020}");
-            if fs::metadata(self.entry_dir(&id)).await.is_err() {
-                return Ok(id);
+            match fs::metadata(self.entry_dir(&id)).await {
+                Ok(_) => nanos += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(id),
+                Err(error) => return Err(error.into()),
             }
-            nanos += 1;
         }
     }
 
@@ -201,11 +202,23 @@ impl TrashStore {
         kind: EntryKind,
         size: u64,
     ) -> Result<TrashEntry, StorageError> {
-        let id = self.next_id().await?;
-        let dir = self.entry_dir(&id);
-        fs::create_dir_all(&dir).await?;
+        fs::create_dir_all(&self.root).await?;
+        let id = loop {
+            let id = self.next_id().await?;
+            match fs::create_dir(self.entry_dir(&id)).await {
+                Ok(()) => break id,
+                // `next_id` is only a hint. Two concurrent trash operations
+                // can choose the same id, so the directory creation itself
+                // must claim it atomically.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
 
-        crate::move_path(live_fs_path, &self.payload_path(&id)).await?;
+        // Publish complete metadata before moving the live payload. A
+        // concurrent listing can then either skip this entry while its
+        // metadata is incomplete or read a complete entry, but will never
+        // fail the whole listing because a metadata file is missing.
         fs::write(
             self.original_path_file(&id),
             original_path.to_request_path(),
@@ -213,6 +226,7 @@ impl TrashStore {
         .await?;
         fs::write(self.kind_file(&id), kind_marker(kind)).await?;
         fs::write(self.size_file(&id), size.to_string()).await?;
+        crate::move_path(live_fs_path, &self.payload_path(&id)).await?;
 
         Ok(TrashEntry {
             deleted_at: id_to_time(&id),
@@ -236,7 +250,13 @@ impl TrashStore {
                 continue;
             }
             let id = entry.file_name().to_string_lossy().into_owned();
-            out.push(self.get(&id).await?);
+            match self.get(&id).await {
+                Ok(trash_entry) => out.push(trash_entry),
+                Err(error) if is_malformed_entry(&error) => {
+                    tracing::warn!(trash_entry = %id, error = %error, "skipping malformed trash entry");
+                }
+                Err(error) => return Err(error),
+            }
         }
         out.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(out)
@@ -370,6 +390,13 @@ fn map_not_found(e: std::io::Error) -> StorageError {
     }
 }
 
+fn is_malformed_entry(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::NotFound | StorageError::Conflict(_) | StorageError::InvalidPath(_)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +442,38 @@ mod tests {
     async fn list_on_empty_trash_is_empty_not_error() {
         let (_live, _trash_dir, store) = store(GENEROUS_AGE, GENEROUS_BYTES);
         assert!(store.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_skips_incomplete_entries_and_cap_enforcement_still_runs() {
+        let (live, trash_dir, store) = store(GENEROUS_AGE, 5);
+        let malformed_dir = trash_dir.path().join("00000000000000000001");
+        tokio::fs::create_dir(&malformed_dir).await.unwrap();
+        tokio::fs::write(malformed_dir.join("versions"), b"partial restore state")
+            .await
+            .unwrap();
+
+        let live_path = write_live_file(&live, "a.txt", b"payload").await;
+        store
+            .trash(
+                &live_path,
+                &DavPath::parse("/a.txt").unwrap(),
+                EntryKind::File,
+                7,
+            )
+            .await
+            .unwrap();
+
+        let listed = store.list().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].original_path.to_request_path(), "/a.txt");
+
+        store.enforce_caps().await.unwrap();
+        assert!(store.list().await.unwrap().is_empty());
+        assert!(
+            malformed_dir.exists(),
+            "listing must not delete malformed data"
+        );
     }
 
     #[tokio::test]
