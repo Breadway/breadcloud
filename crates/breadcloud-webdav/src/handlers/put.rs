@@ -29,8 +29,8 @@ pub async fn handle(state: &AppState, path: &DavPath, req: Request) -> Response 
     // Snapshot whatever is currently at `path` into version history
     // (CLOUD-4) before the write below can replace it. A no-op if `path`
     // does not exist yet -- first creation is not a "previous version".
-    if let Err(resp) = crate::versioning::snapshot_before_overwrite(state, path).await {
-        return resp;
+    if let Err(err) = crate::versioning::snapshot_before_overwrite(state, path).await {
+        return storage_error_response(err);
     }
 
     let bytes = match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
