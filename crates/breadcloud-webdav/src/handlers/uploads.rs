@@ -126,6 +126,25 @@ async fn handle_chunk(
     chunk_path: &DavPath,
     req: Request,
 ) -> Response {
+    handle_chunk_with_limit(
+        state,
+        method,
+        headers,
+        chunk_path,
+        req,
+        MAX_CHUNK_BYTES as u64,
+    )
+    .await
+}
+
+async fn handle_chunk_with_limit(
+    state: &AppState,
+    method: &Method,
+    headers: &HeaderMap,
+    chunk_path: &DavPath,
+    req: Request,
+    max_bytes: u64,
+) -> Response {
     match method.as_str() {
         "PUT" => {
             let mut prepared = match state.uploads.prepare_write(chunk_path).await {
@@ -141,7 +160,7 @@ async fn handle_chunk(
                             .into_response()
                     }
                 };
-                if prepared.total().saturating_add(chunk.len() as u64) > MAX_CHUNK_BYTES as u64 {
+                if prepared.total().saturating_add(chunk.len() as u64) > max_bytes {
                     return (StatusCode::PAYLOAD_TOO_LARGE, "chunk too large").into_response();
                 }
                 if let Err(err) = prepared.write_chunk(&chunk).await {
@@ -397,5 +416,80 @@ async fn finalize(state: &AppState, transfer_dir: &DavPath, headers: &HeaderMap)
             builder.body(Body::empty()).unwrap()
         }
         Err(err) => storage_error_response(err),
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    fn state() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let live = dir.path().join("live");
+        let uploads = dir.path().join("uploads");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&uploads).unwrap();
+        let state = AppState::new(
+            breadcloud_storage::Storage::new(live),
+            breadcloud_storage::Storage::new(uploads),
+            breadcloud_storage::VersionStore::new(dir.path().join("versions")),
+            breadcloud_storage::TrashStore::new(dir.path().join("trash")),
+        );
+        (dir, state)
+    }
+    fn assert_no_staging(dir: &std::path::Path) {
+        for name in [".live-assembly-staging", ".uploads-assembly-staging"] {
+            let stage = dir.join(name);
+            if stage.exists() {
+                assert_eq!(std::fs::read_dir(stage).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_and_interrupted_streams_preserve_existing_content() {
+        let (dir, state) = state();
+        let path = DavPath::parse("/dev/transfer/1").unwrap();
+        state
+            .uploads
+            .mkcol(&DavPath::parse("/dev").unwrap())
+            .await
+            .unwrap();
+        state
+            .uploads
+            .mkcol(&DavPath::parse("/dev/transfer").unwrap())
+            .await
+            .unwrap();
+        let storage = &state.uploads;
+        storage.write_bytes(&path, b"old bytes").await.unwrap();
+        for interrupted in [false, true] {
+            let chunks = if interrupted {
+                vec![
+                    Ok(bytes::Bytes::from_static(b"new")),
+                    Err(std::io::Error::other("connection interrupted")),
+                ]
+            } else {
+                vec![
+                    Ok(bytes::Bytes::from_static(b"new")),
+                    Ok(bytes::Bytes::from_static(b" data")),
+                ]
+            };
+            let body = Body::from_stream(futures_util::stream::iter(chunks));
+            let req = Request::builder().method("PUT").body(body).unwrap();
+            let response =
+                handle_chunk_with_limit(&state, &Method::PUT, &HeaderMap::new(), &path, req, 4)
+                    .await;
+            assert_eq!(
+                response.status(),
+                if interrupted {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                }
+            );
+            assert_eq!(storage.read_bytes(&path).await.unwrap(), b"old bytes");
+            assert!(state.versions.list(&path).await.unwrap().is_empty());
+            assert_no_staging(dir.path());
+        }
     }
 }

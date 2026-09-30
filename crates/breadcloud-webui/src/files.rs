@@ -178,6 +178,10 @@ pub async fn download(state: &AppState, path: &DavPath) -> Response {
 }
 
 pub async fn upload(state: &AppState, req: Request) -> Response {
+    upload_with_limit(state, req, MAX_UPLOAD_BYTES as u64).await
+}
+
+async fn upload_with_limit(state: &AppState, req: Request, max_bytes: u64) -> Response {
     let content_type = match req
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
@@ -192,9 +196,9 @@ pub async fn upload(state: &AppState, req: Request) -> Response {
     };
     let constraints = multer::Constraints::new().size_limit(
         multer::SizeLimit::new()
-            .whole_stream(MAX_UPLOAD_BYTES as u64 + 1024 * 1024)
+            .whole_stream(max_bytes + 1024 * 1024)
             .per_field(64 * 1024)
-            .for_field("file", MAX_UPLOAD_BYTES as u64),
+            .for_field("file", max_bytes),
     );
     let mut multipart = multer::Multipart::with_constraints(
         req.into_body().into_data_stream(),
@@ -202,8 +206,8 @@ pub async fn upload(state: &AppState, req: Request) -> Response {
         constraints,
     );
 
-    let mut dir = String::from("/");
-    let mut prepared: Option<(DavPath, DavPath, breadcloud_storage::PreparedWrite)> = None;
+    let mut dir: Option<String> = None;
+    let mut prepared: Option<(String, breadcloud_storage::PreparedWrite)> = None;
 
     loop {
         let mut field = match multipart.next_field().await {
@@ -214,10 +218,17 @@ pub async fn upload(state: &AppState, req: Request) -> Response {
         let field_name = field.name().unwrap_or("").to_string();
         match field_name.as_str() {
             "dir" => {
-                dir = match field.text().await {
+                if dir.is_some() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "only one target folder may be supplied",
+                    )
+                        .into_response();
+                }
+                dir = Some(match field.text().await {
                     Ok(dir) => dir,
                     Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-                };
+                });
             }
             "file" => {
                 if prepared.is_some() {
@@ -231,20 +242,14 @@ pub async fn upload(state: &AppState, req: Request) -> Response {
                     return (StatusCode::BAD_REQUEST, "no file selected").into_response();
                 }
                 let leaf = file_name.rsplit(['/', '\\']).next().unwrap_or(&file_name);
-                let Ok(parent) = DavPath::parse(&dir) else {
-                    return (StatusCode::BAD_REQUEST, "invalid target folder").into_response();
-                };
-                let dest = parent.child(leaf);
-                let mut write = match state.storage.prepare_write(&dest).await {
+                let mut write = match state.storage.prepare_upload().await {
                     Ok(write) => write,
                     Err(err) => return breadcloud_webdav::error::storage_error_response(err),
                 };
                 loop {
                     match field.chunk().await {
                         Ok(Some(chunk)) => {
-                            if write.total().saturating_add(chunk.len() as u64)
-                                > MAX_UPLOAD_BYTES as u64
-                            {
+                            if write.total().saturating_add(chunk.len() as u64) > max_bytes {
                                 return (StatusCode::PAYLOAD_TOO_LARGE, "file too large")
                                     .into_response();
                             }
@@ -256,14 +261,22 @@ pub async fn upload(state: &AppState, req: Request) -> Response {
                         Err(err) => return multipart_error_response(err),
                     }
                 }
-                prepared = Some((parent, dest, write));
+                prepared = Some((leaf.to_owned(), write));
             }
             _ => {}
         }
     }
 
-    let Some((parent, dest, prepared)) = prepared else {
+    let Some((leaf, prepared)) = prepared else {
         return (StatusCode::BAD_REQUEST, "no file selected").into_response();
+    };
+    let Ok(parent) = DavPath::parse(dir.as_deref().unwrap_or("/")) else {
+        return (StatusCode::BAD_REQUEST, "invalid target folder").into_response();
+    };
+    let dest = parent.child(&leaf);
+    let prepared = match prepared.for_destination(&state.storage, &dest).await {
+        Ok(write) => write,
+        Err(err) => return breadcloud_webdav::error::storage_error_response(err),
     };
     let total = prepared.total();
 
@@ -345,5 +358,151 @@ pub async fn delete(state: &AppState, req: Request) -> Response {
         Redirect::to(&encode_ui_path("/ui/files", &parent)).into_response()
     } else {
         resp
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    fn state() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let live = dir.path().join("live");
+        let uploads = dir.path().join("uploads");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&uploads).unwrap();
+        let state = AppState::new(
+            breadcloud_storage::Storage::new(live),
+            breadcloud_storage::Storage::new(uploads),
+            breadcloud_storage::VersionStore::new(dir.path().join("versions")),
+            breadcloud_storage::TrashStore::new(dir.path().join("trash")),
+        );
+        (dir, state)
+    }
+    fn assert_no_staging(dir: &std::path::Path) {
+        for name in [".live-assembly-staging", ".uploads-assembly-staging"] {
+            let stage = dir.join(name);
+            if stage.exists() {
+                assert_eq!(std::fs::read_dir(stage).unwrap().count(), 0);
+            }
+        }
+    }
+
+    fn multipart(parts: &[(&str, Option<&str>, &str)], complete: bool) -> Request {
+        let mut body = String::new();
+        for (name, file, value) in parts {
+            body.push_str(&format!(
+                "--testboundary\r\nContent-Disposition: form-data; name=\"{name}\""
+            ));
+            if let Some(file) = file {
+                body.push_str(&format!("; filename=\"{file}\""));
+            }
+            body.push_str(&format!("\r\n\r\n{value}\r\n"));
+        }
+        if complete {
+            body.push_str("--testboundary--\r\n");
+        }
+        Request::builder()
+            .method("POST")
+            .header("Content-Type", "multipart/form-data; boundary=testboundary")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn file_before_folder_uploads_to_final_folder() {
+        let (dir, state) = state();
+        state
+            .storage
+            .mkcol(&DavPath::parse("/target").unwrap())
+            .await
+            .unwrap();
+        let req = multipart(
+            &[
+                ("file", Some("photo.jpg"), "new bytes"),
+                ("dir", None, "/target"),
+            ],
+            true,
+        );
+        let response = upload_with_limit(&state, req, 32).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()["location"], "/ui/files/target");
+        assert_eq!(
+            state
+                .storage
+                .read_bytes(&DavPath::parse("/target/photo.jpg").unwrap())
+                .await
+                .unwrap(),
+            b"new bytes"
+        );
+        assert!(
+            !state
+                .storage
+                .exists(&DavPath::parse("/photo.jpg").unwrap())
+                .await
+        );
+        assert_no_staging(dir.path());
+    }
+    #[tokio::test]
+    async fn rejected_multipart_preserves_destination_and_history() {
+        let (dir, state) = state();
+        state
+            .storage
+            .mkcol(&DavPath::parse("/target").unwrap())
+            .await
+            .unwrap();
+        let path = DavPath::parse("/target/file.txt").unwrap();
+        state
+            .storage
+            .write_bytes(&path, b"old bytes")
+            .await
+            .unwrap();
+        let cases = [
+            (
+                vec![
+                    ("dir", None, "/target"),
+                    ("file", Some("file.txt"), "new bytes"),
+                ],
+                true,
+                4,
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                vec![
+                    ("dir", None, "/target"),
+                    ("file", Some("file.txt"), "new bytes"),
+                ],
+                false,
+                32,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                vec![
+                    ("file", Some("file.txt"), "new bytes"),
+                    ("dir", None, "/target"),
+                    ("dir", None, "/"),
+                ],
+                true,
+                32,
+                StatusCode::BAD_REQUEST,
+            ),
+        ];
+        for (parts, complete, limit, status) in cases {
+            assert_eq!(
+                upload_with_limit(&state, multipart(&parts, complete), limit)
+                    .await
+                    .status(),
+                status
+            );
+            assert_eq!(state.storage.read_bytes(&path).await.unwrap(), b"old bytes");
+            assert!(
+                !state
+                    .storage
+                    .exists(&DavPath::parse("/file.txt").unwrap())
+                    .await
+            );
+            assert!(state.versions.list(&path).await.unwrap().is_empty());
+            assert_no_staging(dir.path());
+        }
     }
 }

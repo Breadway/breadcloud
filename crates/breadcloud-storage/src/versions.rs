@@ -422,6 +422,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_snapshot_copy_leaves_no_partial_history() {
+        let (dir, store) = store(10, 1024);
+        let path = DavPath::parse("/file.txt").unwrap();
+        assert!(store
+            .snapshot_file(&path, &dir.path().join("missing-source"))
+            .await
+            .is_err());
+        assert!(store.list(&path).await.unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(store.dir_for(&path)).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
     async fn list_on_unversioned_file_is_empty_not_error() {
         let (_dir, store) = store(10, 1024 * 1024);
         let path = DavPath::parse("/never-written.txt").unwrap();

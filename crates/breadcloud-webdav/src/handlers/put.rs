@@ -14,6 +14,15 @@ use crate::state::AppState;
 const MAX_BODY_BYTES: usize = 20 * 1024 * 1024 * 1024;
 
 pub async fn handle(state: &AppState, path: &DavPath, req: Request) -> Response {
+    handle_with_limit(state, path, req, MAX_BODY_BYTES as u64).await
+}
+
+async fn handle_with_limit(
+    state: &AppState,
+    path: &DavPath,
+    req: Request,
+    max_bytes: u64,
+) -> Response {
     if path.is_root() {
         return (StatusCode::CONFLICT, "cannot PUT to the storage root").into_response();
     }
@@ -36,7 +45,7 @@ pub async fn handle(state: &AppState, path: &DavPath, req: Request) -> Response 
                 return (StatusCode::BAD_REQUEST, "could not read request body").into_response()
             }
         };
-        if prepared.total().saturating_add(chunk.len() as u64) > MAX_BODY_BYTES as u64 {
+        if prepared.total().saturating_add(chunk.len() as u64) > max_bytes {
             return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response();
         }
         if let Err(err) = prepared.write_chunk(&chunk).await {
@@ -120,4 +129,155 @@ pub async fn handle(state: &AppState, path: &DavPath, req: Request) -> Response 
         builder = builder.header("X-OC-MTime", "accepted");
     }
     builder.body(Body::empty()).unwrap()
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    fn state() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let live = dir.path().join("live");
+        let uploads = dir.path().join("uploads");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&uploads).unwrap();
+        let state = AppState::new(
+            breadcloud_storage::Storage::new(live),
+            breadcloud_storage::Storage::new(uploads),
+            breadcloud_storage::VersionStore::new(dir.path().join("versions")),
+            breadcloud_storage::TrashStore::new(dir.path().join("trash")),
+        );
+        (dir, state)
+    }
+    fn assert_no_staging(dir: &std::path::Path) {
+        for name in [".live-assembly-staging", ".uploads-assembly-staging"] {
+            let stage = dir.join(name);
+            if stage.exists() {
+                assert_eq!(std::fs::read_dir(stage).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_and_interrupted_streams_preserve_existing_content() {
+        let (dir, state) = state();
+        let path = DavPath::parse("/file.txt").unwrap();
+        let storage = &state.storage;
+        storage.write_bytes(&path, b"old bytes").await.unwrap();
+        for interrupted in [false, true] {
+            let chunks = if interrupted {
+                vec![
+                    Ok(bytes::Bytes::from_static(b"new")),
+                    Err(std::io::Error::other("connection interrupted")),
+                ]
+            } else {
+                vec![
+                    Ok(bytes::Bytes::from_static(b"new")),
+                    Ok(bytes::Bytes::from_static(b" data")),
+                ]
+            };
+            let body = Body::from_stream(futures_util::stream::iter(chunks));
+            let req = Request::builder().method("PUT").body(body).unwrap();
+            let response = handle_with_limit(&state, &path, req, 4).await;
+            assert_eq!(
+                response.status(),
+                if interrupted {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                }
+            );
+            assert_eq!(storage.read_bytes(&path).await.unwrap(), b"old bytes");
+            assert!(state.versions.list(&path).await.unwrap().is_empty());
+            assert_no_staging(dir.path());
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_overwrite_retains_old_content_in_version_history() {
+        use tokio::io::AsyncReadExt;
+        let (_dir, state) = state();
+        let path = DavPath::parse("/file.txt").unwrap();
+        state
+            .storage
+            .write_bytes(&path, b"old bytes")
+            .await
+            .unwrap();
+        let req = Request::builder()
+            .method("PUT")
+            .body(Body::from("new bytes"))
+            .unwrap();
+        assert_eq!(
+            handle_with_limit(&state, &path, req, 32).await.status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(state.storage.read_bytes(&path).await.unwrap(), b"new bytes");
+        let versions = state.versions.list(&path).await.unwrap();
+        assert_eq!(versions.len(), 1);
+        let (mut file, _) = state.versions.read(&path, &versions[0].id).await.unwrap();
+        let mut old = Vec::new();
+        file.read_to_end(&mut old).await.unwrap();
+        assert_eq!(old, b"old bytes");
+    }
+
+    #[tokio::test]
+    async fn version_copy_failure_preserves_live_content_and_cleans_staging() {
+        let (dir, state) = state();
+        let path = DavPath::parse("/file.txt").unwrap();
+        state
+            .storage
+            .write_bytes(&path, b"old bytes")
+            .await
+            .unwrap();
+        std::fs::write(dir.path().join("versions"), b"blocked directory").unwrap();
+        let req = Request::builder()
+            .method("PUT")
+            .body(Body::from("new bytes"))
+            .unwrap();
+        assert_eq!(
+            handle_with_limit(&state, &path, req, 32).await.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(state.storage.read_bytes(&path).await.unwrap(), b"old bytes");
+        assert_no_staging(dir.path());
+    }
+    #[tokio::test]
+    async fn cancelling_an_inflight_upload_cleans_staging_and_preserves_live_bytes() {
+        let (dir, state) = state();
+        let path = DavPath::parse("/file.txt").unwrap();
+        state
+            .storage
+            .write_bytes(&path, b"old bytes")
+            .await
+            .unwrap();
+        let cloned = state.clone();
+        let target = path.clone();
+        let task = tokio::spawn(async move {
+            let stream = futures_util::stream::once(async {
+                Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"partial"))
+            })
+            .chain(futures_util::stream::pending());
+            let request = Request::builder()
+                .method("PUT")
+                .body(Body::from_stream(stream))
+                .unwrap();
+            handle_with_limit(&cloned, &target, request, 32).await
+        });
+        let staging = dir.path().join(".live-assembly-staging");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if std::fs::read_dir(&staging).is_ok_and(|entries| entries.count() > 0) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_no_staging(dir.path());
+        assert_eq!(state.storage.read_bytes(&path).await.unwrap(), b"old bytes");
+        assert!(state.versions.list(&path).await.unwrap().is_empty());
+    }
 }

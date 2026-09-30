@@ -129,7 +129,7 @@ pub struct PreparedAssembly {
 /// be committed atomically. Dropping an uncommitted write removes its
 /// temporary file.
 pub struct PreparedWrite {
-    dest_fs: PathBuf,
+    dest_fs: Option<PathBuf>,
     tmp_path: PathBuf,
     existed: bool,
     total: u64,
@@ -156,21 +156,36 @@ impl PreparedWrite {
         Ok(())
     }
 
+    /// Choose the final destination after parsing a multipart request.
+    pub async fn for_destination(
+        mut self,
+        storage: &Storage,
+        path: &DavPath,
+    ) -> Result<Self, StorageError> {
+        let (dest_fs, existed) = storage.write_destination(path).await?;
+        self.dest_fs = Some(dest_fs);
+        self.existed = existed;
+        Ok(self)
+    }
+
     /// Atomically replace the destination with the staged content.
     pub async fn commit(
         mut self,
         storage: &Storage,
     ) -> Result<(WriteOutcome, u64, String), StorageError> {
+        let dest_fs = self.dest_fs.as_ref().ok_or_else(|| {
+            StorageError::Conflict("upload destination has not been selected".into())
+        })?;
         let mut file = self.file.take().expect("prepared write file is open");
         file.flush().await?;
         drop(file);
-        fs::rename(&self.tmp_path, &self.dest_fs).await?;
+        fs::rename(&self.tmp_path, dest_fs).await?;
         self.committed = true;
 
         let len = self.total;
         let etag = format_etag(self.hasher.finalize());
-        if let Ok(meta) = fs::metadata(&self.dest_fs).await {
-            storage.seed_etag_cache(&self.dest_fs, &to_metadata(&meta), etag.clone());
+        if let Ok(meta) = fs::metadata(dest_fs).await {
+            storage.seed_etag_cache(dest_fs, &to_metadata(&meta), etag.clone());
         }
         Ok((
             if self.existed {
@@ -362,6 +377,14 @@ impl Storage {
     /// sibling staging directory so quota scans of the live tree do not
     /// count a partially received upload as existing content.
     pub async fn prepare_write(&self, path: &DavPath) -> Result<PreparedWrite, StorageError> {
+        let (fs_path, existed) = self.write_destination(path).await?;
+        let mut prepared = self.prepare_upload().await?;
+        prepared.dest_fs = Some(fs_path);
+        prepared.existed = existed;
+        Ok(prepared)
+    }
+
+    async fn write_destination(&self, path: &DavPath) -> Result<(PathBuf, bool), StorageError> {
         let parent_dav = path
             .parent()
             .ok_or_else(|| StorageError::Conflict("cannot write to the storage root".into()))?;
@@ -381,22 +404,29 @@ impl Storage {
             Ok(_) => true,
             Err(_) => false,
         };
+        Ok((fs_path, existed))
+    }
+
+    /// Stage an upload without choosing a destination until all fields arrive.
+    pub async fn prepare_upload(&self) -> Result<PreparedWrite, StorageError> {
         fs::create_dir_all(&self.staging_root).await?;
         let tmp_path = self
             .staging_root
             .join(format!(".breadcloud-write-{}", tmp_suffix()));
-        let file = fs::OpenOptions::new()
+        // Construct the cleanup owner before the next await. An async open
+        // can finish on Tokio's blocking pool after its future is cancelled,
+        // creating an orphan that no PreparedWrite ever owns.
+        let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&tmp_path)
-            .await?;
+            .open(&tmp_path)?;
         Ok(PreparedWrite {
-            dest_fs: fs_path,
+            dest_fs: None,
             tmp_path,
-            existed,
+            existed: false,
             total: 0,
             hasher: blake3::Hasher::new(),
-            file: Some(file),
+            file: Some(fs::File::from_std(file)),
             committed: false,
         })
     }
@@ -1446,6 +1476,39 @@ mod tests {
         let meta = storage.metadata(&path).await.unwrap();
         assert_eq!(meta.len, 2);
         assert!(!meta.is_dir());
+    }
+
+    #[tokio::test]
+    async fn detached_write_needs_a_destination_and_cleans_up_on_drop() {
+        let (_dir, storage) = storage().await;
+        let mut prepared = storage.prepare_upload().await.unwrap();
+        prepared.write_chunk(b"partial bytes").await.unwrap();
+        let stage = prepared.tmp_path.clone();
+        assert!(stage.exists());
+        assert!(matches!(
+            prepared.commit(&storage).await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(!stage.exists());
+        let mut cancelled = storage.prepare_upload().await.unwrap();
+        cancelled.write_chunk(b"interrupted").await.unwrap();
+        let stage = cancelled.tmp_path.clone();
+        drop(cancelled);
+        assert!(!stage.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_staged_commit_preserves_live_destination() {
+        let (_dir, storage) = storage().await;
+        let path = DavPath::parse("/file.txt").unwrap();
+        storage.write_bytes(&path, b"old bytes").await.unwrap();
+        let mut prepared = storage.prepare_write(&path).await.unwrap();
+        prepared.write_chunk(b"new bytes").await.unwrap();
+        let stage = prepared.tmp_path.clone();
+        fs::remove_file(&stage).await.unwrap();
+        assert!(prepared.commit(&storage).await.is_err());
+        assert_eq!(storage.read_bytes(&path).await.unwrap(), b"old bytes");
+        assert!(!stage.exists());
     }
 
     #[tokio::test]
