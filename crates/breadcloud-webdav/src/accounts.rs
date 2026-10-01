@@ -85,10 +85,19 @@ impl Account {
 /// unauthenticated local-dev mode `breadcloud_webdav::auth` and this
 /// crate's callers have always supported, preserved unchanged by
 /// CLOUD-11 (see `breadcloud-server`'s `main.rs`).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AccountStore {
     accounts: HashMap<String, Account>,
+    // Unknown usernames use this account's hash so a miss takes the same
+    // Argon2 path as a known username with an incorrect password.
+    dummy_account: Account,
     protection: Arc<Mutex<AuthProtection>>,
+}
+
+impl Default for AccountStore {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
 }
 
 // A desktop sync can send many requests over this brief window; keep the
@@ -266,6 +275,7 @@ impl AccountStore {
                 .into_iter()
                 .map(|a| (a.username.clone(), a))
                 .collect(),
+            dummy_account: Account::new("", "breadcloud-unknown-account-placeholder", 0),
             protection: Arc::default(),
         }
     }
@@ -367,6 +377,7 @@ impl AccountStore {
             return Ok(None);
         };
         let Some(account) = self.accounts.get(&user) else {
+            let _ = verify(&self.dummy_account, &pass);
             self.protection
                 .lock()
                 .expect("auth state poisoned")
@@ -421,6 +432,25 @@ mod tests {
         let store = AccountStore::new(vec![Account::new("alice", "secret1", 100)]);
         let headers = headers_with_basic_auth("bob", "secret1");
         assert_eq!(store.authenticate_request(&headers), None);
+    }
+
+    #[test]
+    fn unknown_username_runs_the_password_verifier() {
+        let store = AccountStore::new(vec![Account::new("alice", "secret1", 100)]);
+        let headers = headers_with_basic_auth("bob", "wrong");
+        let mut verified_dummy = false;
+        let result = store.authenticate_with_verifier(
+            &headers,
+            "192.0.2.9".parse().unwrap(),
+            |account, _| {
+                assert!(account.username.is_empty());
+                verified_dummy = true;
+                false
+            },
+        );
+
+        assert_eq!(result, Ok(None));
+        assert!(verified_dummy);
     }
 
     /// One account's password must not authenticate as a different
