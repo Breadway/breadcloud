@@ -5,10 +5,5 @@ edition = "2021"
 description = "bread ecosystem event integration for breadcloud (CLOUD-13): publishes bread.cloud.* events, best-effort and optional"
 
 [dependencies]
+bread-shared = { git = "https://git.breadway.dev/Breadway/bread", tag = "v0.8.0" }
 serde_json = "1"
-tokio = { version = "1", features = ["rt"] }
-# `bread-client` feature: BreadClient, the persistent-app-daemon emit path
-# breadclip's own EVENTS.md documents as the reference implementation of
-# this convention. breadcloud is a long-running server, so it uses this
-# rather than shelling out to bread-emit.
-bread-utils = { git = "https://git.breadway.dev/Breadway/bread-ecosystem", tag = "v0.7.12", features = ["bread-client"] }

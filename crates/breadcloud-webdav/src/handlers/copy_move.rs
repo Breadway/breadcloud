@@ -37,7 +37,15 @@ pub async fn handle(
         .unwrap_or(true);
 
     let result = if copy {
-        state.storage.copy_to(source, &destination, overwrite).await
+        match state.quota_limit_bytes {
+            Some(limit) => {
+                state
+                    .storage
+                    .copy_to_with_quota(source, &destination, overwrite, limit)
+                    .await
+            }
+            None => state.storage.copy_to(source, &destination, overwrite).await,
+        }
     } else {
         state.storage.move_to(source, &destination, overwrite).await
     };

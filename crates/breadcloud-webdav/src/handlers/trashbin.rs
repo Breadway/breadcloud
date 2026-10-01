@@ -218,6 +218,14 @@ async fn restore(state: &AppState, id: &str, headers: &HeaderMap) -> Response {
         entry.original_path.clone()
     };
 
+    if dest_path.is_root() {
+        return (
+            StatusCode::FORBIDDEN,
+            "cannot restore a trash entry over the storage root",
+        )
+            .into_response();
+    }
+
     let overwrite = headers
         .get("Overwrite")
         .and_then(|v| v.to_str().ok())
@@ -232,6 +240,20 @@ async fn restore(state: &AppState, id: &str, headers: &HeaderMap) -> Response {
         )
             .into_response();
     }
+
+    // A restore adds the trashed payload back to live storage. Keep the
+    // quota reservation until both payload and version history have moved.
+    let _quota_guard = match state.quota_limit_bytes {
+        Some(limit) => match state
+            .storage
+            .quota_gate(limit, &dest_path, entry.size)
+            .await
+        {
+            Ok(guard) => Some(guard),
+            Err(err) => return storage_error_response(err),
+        },
+        None => None,
+    };
 
     let dest_fs_path = state.storage.resolve(&dest_path);
     let versions_dir = state.trash.versions_dir(id);

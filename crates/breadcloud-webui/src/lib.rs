@@ -40,7 +40,7 @@ pub mod path;
 pub mod template;
 
 use axum::extract::Request;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use breadcloud_caldav::AppState as CaldavState;
 use breadcloud_webdav::AppState as WebdavState;
@@ -68,6 +68,13 @@ pub async fn dispatch(
     req: Request,
 ) -> Response {
     let method = req.method().clone();
+    if method == axum::http::Method::POST && csrf_rejected(req.headers(), req.uri()) {
+        return (
+            StatusCode::FORBIDDEN,
+            "cross-origin form submission rejected",
+        )
+            .into_response();
+    }
     let raw_path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
 
@@ -99,5 +106,89 @@ pub async fn dispatch(
             "unsupported method for this page",
         )
             .into_response(),
+    }
+}
+
+/// Reject browser POSTs that identify themselves as cross-site, and reject
+/// an Origin whose host does not match this request's Host. Requests from
+/// non-browser clients without these headers remain usable.
+fn csrf_rejected(headers: &HeaderMap, uri: &Uri) -> bool {
+    if headers
+        .get("Sec-Fetch-Site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|site| site.eq_ignore_ascii_case("cross-site"))
+    {
+        return true;
+    }
+
+    let Some(origin) = headers.get("Origin").and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    let Ok(origin_uri) = origin.parse::<Uri>() else {
+        return true;
+    };
+    let Some(origin_authority) = origin_uri.authority() else {
+        return true;
+    };
+    let request_host = headers
+        .get("Host")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| uri.authority().map(|authority| authority.as_str()));
+    let Some(request_host) = request_host else {
+        return true;
+    };
+    if !origin_authority.as_str().eq_ignore_ascii_case(request_host) {
+        return true;
+    }
+
+    let request_scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| uri.scheme_str());
+    request_scheme.is_some_and(|scheme| {
+        origin_uri
+            .scheme_str()
+            .is_some_and(|origin_scheme| !origin_scheme.eq_ignore_ascii_case(scheme))
+    })
+}
+
+#[cfg(test)]
+mod csrf_tests {
+    use super::csrf_rejected;
+    use axum::http::{HeaderMap, Uri};
+
+    #[test]
+    fn rejects_cross_site_fetch_metadata() {
+        let mut headers = HeaderMap::new();
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        assert!(csrf_rejected(&headers, &Uri::from_static("/ui/mkdir")));
+    }
+
+    #[test]
+    fn rejects_an_origin_from_another_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "breadcloud.example".parse().unwrap());
+        headers.insert("origin", "https://attacker.example".parse().unwrap());
+        assert!(csrf_rejected(&headers, &Uri::from_static("/ui/mkdir")));
+    }
+
+    #[test]
+    fn accepts_a_matching_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "breadcloud.example".parse().unwrap());
+        headers.insert("origin", "https://breadcloud.example".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert!(!csrf_rejected(&headers, &Uri::from_static("/ui/mkdir")));
+    }
+
+    #[test]
+    fn falls_back_to_uri_authority_when_host_is_absent() {
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "https://breadcloud.example".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert!(!csrf_rejected(
+            &headers,
+            &Uri::from_static("https://breadcloud.example/ui/mkdir")
+        ));
     }
 }
