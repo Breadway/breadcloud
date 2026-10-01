@@ -497,6 +497,28 @@ async fn sync_collection_initial_then_incremental() {
 }
 
 #[tokio::test]
+async fn sync_collection_rejects_malformed_and_future_tokens() {
+    let (_dir, app) = test_app().await;
+    for token in ["not-a-sync-token", "breadcloud-sync:1"] {
+        let report = format!(
+            "<d:sync-collection xmlns:d=\"DAV:\"><d:sync-token>{token}</d:sync-token><d:prop><d:getetag/></d:prop></d:sync-collection>"
+        );
+        let req = Request::builder()
+            .method("REPORT")
+            .uri("/remote.php/dav/calendars/dev/personal/")
+            .body(Body::from(report))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "token: {token}");
+        let body = body_string(response).await;
+        assert!(
+            body.contains("<d:valid-sync-token/>"),
+            "token: {token}, body: {body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn basic_auth_rejects_missing_and_wrong_credentials() {
     let dir = TempDir::new().unwrap();
     let calendars = CalendarStore::new(dir.path());

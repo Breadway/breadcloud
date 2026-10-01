@@ -340,7 +340,8 @@ impl AddressbookStore {
         file.flush().await?;
 
         let ctag = next.to_string();
-        fs::write(self.ctag_file(&user, &addressbook_id), &ctag).await?;
+        crate::write_file_atomically(&self.ctag_file(&user, &addressbook_id), ctag.as_bytes())
+            .await?;
         Ok(ctag)
     }
 
@@ -402,8 +403,7 @@ impl AddressbookStore {
     }
 
     /// Parse a sync-token this store previously handed out, same format
-    /// and same "unrecognized token means full resync, not an error"
-    /// stance as `CalendarStore::parse_sync_token`.
+    /// and validation behavior as `CalendarStore::parse_sync_token`.
     pub fn parse_sync_token(token: &str) -> Option<u64> {
         token
             .strip_prefix("breadcloud-sync:")

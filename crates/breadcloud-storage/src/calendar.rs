@@ -371,7 +371,7 @@ impl CalendarStore {
         file.flush().await?;
 
         let ctag = next.to_string();
-        fs::write(self.ctag_file(&user, &calendar_id), &ctag).await?;
+        crate::write_file_atomically(&self.ctag_file(&user, &calendar_id), ctag.as_bytes()).await?;
         Ok(ctag)
     }
 
@@ -434,12 +434,8 @@ impl CalendarStore {
 
     /// Parse a sync-token this store previously handed out (a plain
     /// decimal ctag value) back into the sequence number
-    /// [`CalendarStore::changes_since`] expects. `None` for anything that
-    /// is not a plain non-negative integer -- callers treat that as "no
-    /// usable token, do a full initial sync" rather than an error, since
-    /// RFC 6578 has clients treat an unrecognized/expired token that way
-    /// too (a 403 with `valid-sync-token` asking for a fresh
-    /// no-sync-token request).
+    /// [`CalendarStore::changes_since`] expects. Callers reject tokens
+    /// that do not parse with RFC 6578's `valid-sync-token` precondition.
     pub fn parse_sync_token(token: &str) -> Option<u64> {
         token
             .strip_prefix("breadcloud-sync:")

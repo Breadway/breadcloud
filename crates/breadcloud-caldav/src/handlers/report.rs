@@ -1,3 +1,4 @@
+use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -28,6 +29,18 @@ fn event_href(user: &str, calendar_id: &str, obj: &str) -> String {
 /// `.ics` bytes if `calendar-data` was requested (`None` otherwise, or
 /// for a deletion).
 type SyncBuiltEntry = (String, bool, Option<String>, Option<Vec<u8>>);
+
+/// RFC 6578 asks clients with an unrecognized or out-of-range token to
+/// retry with an initial sync, marked by the DAV:valid-sync-token condition.
+fn invalid_sync_token() -> Response {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("Content-Type", "application/xml; charset=utf-8")
+        .body(Body::from(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<d:error xmlns:d=\"DAV:\"><d:valid-sync-token/></d:error>",
+        ))
+        .unwrap()
+}
 
 /// `REPORT` on a calendar collection: dispatches to whichever of the
 /// three shapes real clients send (RFC 4791 `calendar-query`/
@@ -215,7 +228,13 @@ async fn sync_collection(
         Err(err) => return storage_error_response(err),
     };
 
-    let since = sync_token.and_then(CalendarStore::parse_sync_token);
+    let since = match sync_token {
+        Some(token) => match CalendarStore::parse_sync_token(token) {
+            Some(since) => Some(since),
+            None => return invalid_sync_token(),
+        },
+        None => None,
+    };
     let (changes, new_ctag) = match state
         .calendars
         .changes_since(user, calendar_id, since)
@@ -224,6 +243,9 @@ async fn sync_collection(
         Ok(v) => v,
         Err(err) => return storage_error_response(err),
     };
+    if since.is_some_and(|since| new_ctag.parse::<u64>().is_ok_and(|current| since > current)) {
+        return invalid_sync_token();
+    }
 
     let initial = sync_token.is_none();
 

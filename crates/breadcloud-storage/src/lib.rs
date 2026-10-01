@@ -36,6 +36,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Replace a small state file without exposing an empty or partial file to readers.
+/// The temporary file lives beside the destination so rename is atomic.
+pub(crate) async fn write_file_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp_path = parent.join(format!(".{name}.tmp-{}", tmp_suffix()));
+    fs::write(&tmp_path, contents).await?;
+    if let Err(err) = fs::rename(&tmp_path, path).await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// Kind of filesystem entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -1389,6 +1403,26 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let storage = Storage::new(dir.path());
         (dir, storage)
+    }
+
+    #[tokio::test]
+    async fn atomic_state_file_replacement_keeps_complete_values_and_cleans_temps() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ctag");
+        fs::write(&path, b"7").await.unwrap();
+
+        write_file_atomically(&path, b"8").await.unwrap();
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "8");
+
+        let blocked = dir.path().join("blocked-ctag");
+        fs::create_dir(&blocked).await.unwrap();
+        assert!(write_file_atomically(&blocked, b"9").await.is_err());
+        assert!(fs::metadata(&blocked).await.unwrap().is_dir());
+
+        let mut entries = fs::read_dir(dir.path()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            assert!(!entry.file_name().to_string_lossy().contains(".tmp-"));
+        }
     }
 
     #[tokio::test]
