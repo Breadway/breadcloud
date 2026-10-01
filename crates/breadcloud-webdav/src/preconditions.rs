@@ -11,7 +11,7 @@
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use breadcloud_events::ConflictReason;
-use breadcloud_storage::{DavPath, StorageError};
+use breadcloud_storage::{DavPath, Storage, StorageError};
 
 use crate::error::storage_error_response;
 use crate::state::AppState;
@@ -32,7 +32,19 @@ use crate::state::AppState;
 /// Returns `Some(response)` to short-circuit the request with 412
 /// Precondition Failed, `None` to proceed with the write.
 pub async fn check(state: &AppState, path: &DavPath, headers: &HeaderMap) -> Option<Response> {
-    let current_etag = match state.storage.etag(path).await {
+    check_storage(&state.storage, state.owner_label(), path, headers).await
+}
+
+/// Checks the same conditional headers against an arbitrary storage root.
+/// CalDAV and CardDAV use this for their independent event/contact stores,
+/// while plain WebDAV uses [`check`] above.
+pub async fn check_storage(
+    storage: &Storage,
+    owner: Option<&str>,
+    path: &DavPath,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    let current_etag = match storage.etag(path).await {
         Ok(etag) => Some(etag),
         Err(StorageError::NotFound) => None,
         Err(err) => return Some(storage_error_response(err)),
@@ -42,7 +54,7 @@ pub async fn check(state: &AppState, path: &DavPath, headers: &HeaderMap) -> Opt
         if value.trim() == "*" {
             if current_etag.is_some() {
                 return Some(precondition_failed(
-                    state,
+                    owner,
                     path,
                     ConflictReason::IfNoneMatch,
                     "If-None-Match: * but the resource already exists",
@@ -51,7 +63,7 @@ pub async fn check(state: &AppState, path: &DavPath, headers: &HeaderMap) -> Opt
         } else if let Some(etag) = &current_etag {
             if etag_list_contains(value, etag) {
                 return Some(precondition_failed(
-                    state,
+                    owner,
                     path,
                     ConflictReason::IfNoneMatch,
                     "If-None-Match matched the resource's current etag",
@@ -64,7 +76,7 @@ pub async fn check(state: &AppState, path: &DavPath, headers: &HeaderMap) -> Opt
         match &current_etag {
             None => {
                 return Some(precondition_failed(
-                    state,
+                    owner,
                     path,
                     ConflictReason::IfMatch,
                     "If-Match sent but the resource does not exist",
@@ -73,7 +85,7 @@ pub async fn check(state: &AppState, path: &DavPath, headers: &HeaderMap) -> Opt
             Some(etag) => {
                 if value.trim() != "*" && !etag_list_contains(value, etag) {
                     return Some(precondition_failed(
-                        state,
+                        owner,
                         path,
                         ConflictReason::IfMatch,
                         "If-Match did not match: the resource changed since it was last read",
@@ -101,12 +113,12 @@ fn etag_list_contains(header_value: &str, etag: &str) -> bool {
 /// place both PUT and chunked-upload finalize share to detect a conflict
 /// (see this module's doc comment).
 fn precondition_failed(
-    state: &AppState,
+    owner: Option<&str>,
     path: &DavPath,
     reason: ConflictReason,
     message: &str,
 ) -> Response {
-    breadcloud_events::sync_conflict(state.owner_label(), &path.to_request_path(), reason);
+    breadcloud_events::sync_conflict(owner, &path.to_request_path(), reason);
     (
         axum::http::StatusCode::PRECONDITION_FAILED,
         message.to_string(),

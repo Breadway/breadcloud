@@ -36,6 +36,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Replace a small state file without exposing an empty or partial file to readers.
+/// The temporary file lives beside the destination so rename is atomic.
+pub(crate) async fn write_file_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp_path = parent.join(format!(".{name}.tmp-{}", tmp_suffix()));
+    fs::write(&tmp_path, contents).await?;
+    if let Err(err) = fs::rename(&tmp_path, path).await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// Kind of filesystem entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -246,7 +260,7 @@ impl Storage {
             let name = entry.file_name().to_string_lossy().into_owned();
             let child_meta = entry.metadata().await?;
             out.push(DirEntry {
-                path: path.child(&name),
+                path: path.child(&name)?,
                 metadata: to_metadata(&child_meta),
             });
         }
@@ -605,6 +619,32 @@ impl Storage {
         overwrite: bool,
     ) -> Result<WriteOutcome, StorageError> {
         self.relocate(from, to, overwrite, true).await
+    }
+
+    /// Count the source and check the destination while holding the same
+    /// quota lock as PUT and chunk finalization. A source size read before
+    /// this lock could become stale when a concurrent PUT grows the source.
+    pub async fn copy_to_with_quota(
+        &self,
+        from: &DavPath,
+        to: &DavPath,
+        overwrite: bool,
+        limit_bytes: u64,
+    ) -> Result<WriteOutcome, StorageError> {
+        let _guard = self.quota_mutex.lock().await;
+        let metadata = self.metadata(from).await?;
+        let source_bytes = if metadata.is_dir() {
+            self.list_recursive(from)
+                .await?
+                .iter()
+                .filter(|entry| !entry.metadata.is_dir())
+                .map(|entry| entry.metadata.len)
+                .sum()
+        } else {
+            metadata.len
+        };
+        self.check_quota(limit_bytes, to, source_bytes).await?;
+        self.copy_to(from, to, overwrite).await
     }
 
     async fn relocate(
@@ -1366,6 +1406,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn atomic_state_file_replacement_keeps_complete_values_and_cleans_temps() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ctag");
+        fs::write(&path, b"7").await.unwrap();
+
+        write_file_atomically(&path, b"8").await.unwrap();
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "8");
+
+        let blocked = dir.path().join("blocked-ctag");
+        fs::create_dir(&blocked).await.unwrap();
+        assert!(write_file_atomically(&blocked, b"9").await.is_err());
+        assert!(fs::metadata(&blocked).await.unwrap().is_dir());
+
+        let mut entries = fs::read_dir(dir.path()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            assert!(!entry.file_name().to_string_lossy().contains(".tmp-"));
+        }
+    }
+
+    #[tokio::test]
     async fn write_new_file_reports_created() {
         let (_dir, storage) = storage().await;
         let path = DavPath::parse("/hello.txt").unwrap();
@@ -1411,10 +1471,13 @@ mod tests {
         let dir_path = DavPath::parse("/photos").unwrap();
         storage.mkcol(&dir_path).await.unwrap();
         storage
-            .write_bytes(&dir_path.child("a.jpg"), b"jpeg-bytes")
+            .write_bytes(&dir_path.child("a.jpg").unwrap(), b"jpeg-bytes")
             .await
             .unwrap();
-        storage.mkcol(&dir_path.child("sub")).await.unwrap();
+        storage
+            .mkcol(&dir_path.child("sub").unwrap())
+            .await
+            .unwrap();
 
         let entries = storage.list_dir(&dir_path).await.unwrap();
         assert_eq!(entries.len(), 2);
@@ -1471,7 +1534,7 @@ mod tests {
         let dir_path = DavPath::parse("/d").unwrap();
         storage.mkcol(&dir_path).await.unwrap();
         storage
-            .write_bytes(&dir_path.child("child.txt"), b"x")
+            .write_bytes(&dir_path.child("child.txt").unwrap(), b"x")
             .await
             .unwrap();
         storage.delete(&dir_path).await.unwrap();
@@ -1532,7 +1595,7 @@ mod tests {
         let (_dir, storage) = storage().await;
         let parent = DavPath::parse("/a").unwrap();
         storage.mkcol(&parent).await.unwrap();
-        let child = parent.child("b");
+        let child = parent.child("b").unwrap();
 
         let err = storage.move_to(&parent, &child, false).await.unwrap_err();
         assert!(matches!(err, StorageError::Conflict(_)));
@@ -1543,7 +1606,7 @@ mod tests {
         let (_dir, storage) = storage().await;
         let parent = DavPath::parse("/a").unwrap();
         storage.mkcol(&parent).await.unwrap();
-        let child = parent.child("sub");
+        let child = parent.child("sub").unwrap();
 
         let err = storage.copy_to(&parent, &child, false).await.unwrap_err();
         assert!(matches!(err, StorageError::Conflict(_)));
@@ -1554,19 +1617,30 @@ mod tests {
         let (_dir, storage) = storage().await;
         let src = DavPath::parse("/src").unwrap();
         storage.mkcol(&src).await.unwrap();
-        storage.mkcol(&src.child("nested")).await.unwrap();
+        storage.mkcol(&src.child("nested").unwrap()).await.unwrap();
         storage
-            .write_bytes(&src.child("nested").child("file.txt"), b"payload")
+            .write_bytes(
+                &src.child("nested").unwrap().child("file.txt").unwrap(),
+                b"payload",
+            )
             .await
             .unwrap();
 
         let dst = DavPath::parse("/dst").unwrap();
         storage.copy_to(&src, &dst, false).await.unwrap();
 
-        assert!(storage.exists(&src.child("nested").child("file.txt")).await);
-        assert!(storage.exists(&dst.child("nested").child("file.txt")).await);
+        assert!(
+            storage
+                .exists(&src.child("nested").unwrap().child("file.txt").unwrap())
+                .await
+        );
+        assert!(
+            storage
+                .exists(&dst.child("nested").unwrap().child("file.txt").unwrap())
+                .await
+        );
         let meta = storage
-            .metadata(&dst.child("nested").child("file.txt"))
+            .metadata(&dst.child("nested").unwrap().child("file.txt").unwrap())
             .await
             .unwrap();
         assert_eq!(meta.len, 7);
@@ -2062,6 +2136,37 @@ mod tests {
         // But a genuinely larger overwrite still gets rejected.
         let err = storage.check_quota(10, &path, 11).await.unwrap_err();
         assert!(matches!(err, StorageError::QuotaExceeded { .. }));
+    }
+
+    #[tokio::test]
+    async fn copy_rechecks_source_size_after_a_concurrent_growth() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let (_dir, storage) = storage().await;
+        let source = DavPath::parse("/source.bin").unwrap();
+        let destination = DavPath::parse("/copy.bin").unwrap();
+        storage.write_bytes(&source, &[b'a'; 10]).await.unwrap();
+
+        // Model an admitted PUT still holding its quota reservation. COPY
+        // must wait before reading the source size, then reject the larger
+        // source without creating a destination.
+        let put_guard = storage.quota_gate(30, &source, 20).await.unwrap();
+        let mut copy = Box::pin(storage.copy_to_with_quota(&source, &destination, true, 30));
+        std::future::poll_fn(|cx| {
+            assert!(matches!(copy.as_mut().poll(cx), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+        storage.write_bytes(&source, &[b'b'; 20]).await.unwrap();
+        drop(put_guard);
+
+        assert!(matches!(
+            copy.await,
+            Err(StorageError::QuotaExceeded { .. })
+        ));
+        assert_eq!(storage.used_bytes().await.unwrap(), 20);
+        assert!(!storage.exists(&destination).await);
     }
 
     /// The bug this whole CLOUD-11 rework closes, exercised directly

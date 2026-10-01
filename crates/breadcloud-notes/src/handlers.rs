@@ -80,6 +80,7 @@ fn note_storage_error(err: StorageError) -> Response {
 
 fn parse_exclude(query: &str) -> Vec<String> {
     query_param(query, "exclude")
+        .map(sanitize_query_str)
         .map(|v| {
             v.split(',')
                 .map(str::to_string)
@@ -227,7 +228,10 @@ pub async fn create(state: &AppState, body: &[u8]) -> Response {
         .unwrap_or_else(|| content.clone());
     let title = note::sanitize_title(&raw_title);
     let category = note::sanitize_category(&input.category.unwrap_or_default());
-    let dir = note::category_dir(&category);
+    let dir = match note::category_dir(&category) {
+        Ok(dir) => dir,
+        Err(_) => return with_api_versions_header(error_response(StatusCode::BAD_REQUEST)),
+    };
 
     if let Err(resp) = note::ensure_notes_root(&state.storage)
         .await
@@ -251,8 +255,14 @@ pub async fn create(state: &AppState, body: &[u8]) -> Response {
     // would just move the TOCTOU window rather than close it.
     let _create_guard = state.storage.create_gate().await;
 
-    let filename = note::generate_filename(&state.storage, &dir, &title, None).await;
-    let path = dir.child(&filename);
+    let filename = match note::generate_filename(&state.storage, &dir, &title, None).await {
+        Ok(filename) => filename,
+        Err(_) => return with_api_versions_header(error_response(StatusCode::BAD_REQUEST)),
+    };
+    let path = match dir.child(&filename) {
+        Ok(path) => path,
+        Err(_) => return with_api_versions_header(error_response(StatusCode::BAD_REQUEST)),
+    };
 
     match write_note_content(state, &path, content.as_bytes()).await {
         Ok(()) => match note::build(&state.storage, &path).await {
@@ -272,7 +282,7 @@ pub async fn create(state: &AppState, body: &[u8]) -> Response {
 async fn ensure_category_dir(state: &AppState, dir: &DavPath) -> Result<(), StorageError> {
     let mut built = notes_root();
     for seg in dir.segments()[notes_root().segments().len()..].iter() {
-        built = built.child(seg);
+        built = built.child(seg)?;
         match state.storage.mkcol(&built).await {
             Ok(()) | Err(StorageError::AlreadyExists) => {}
             Err(err) => return Err(err),
@@ -329,14 +339,24 @@ pub async fn update(state: &AppState, id: &str, headers: &HeaderMap, body: &[u8]
 
     let mut path = path;
     if new_title != current.title || new_category != current.category {
-        let dir = note::category_dir(&new_category);
+        let dir = match note::category_dir(&new_category) {
+            Ok(dir) => dir,
+            Err(_) => return with_api_versions_header(error_response(StatusCode::BAD_REQUEST)),
+        };
         if !new_category.is_empty() {
             if let Err(err) = ensure_category_dir(state, &dir).await {
                 return with_api_versions_header(note_storage_error(err));
             }
         }
-        let filename = note::generate_filename(&state.storage, &dir, &new_title, Some(id)).await;
-        let new_path = dir.child(&filename);
+        let filename =
+            match note::generate_filename(&state.storage, &dir, &new_title, Some(id)).await {
+                Ok(filename) => filename,
+                Err(_) => return with_api_versions_header(error_response(StatusCode::BAD_REQUEST)),
+            };
+        let new_path = match dir.child(&filename) {
+            Ok(path) => path,
+            Err(_) => return with_api_versions_header(error_response(StatusCode::BAD_REQUEST)),
+        };
         if new_path != path {
             if let Err(resp) = rename_note(state, &path, &new_path).await {
                 return with_api_versions_header(*resp);
@@ -392,9 +412,14 @@ pub async fn delete(state: &AppState, id: &str) -> Response {
         Err(err) => return with_api_versions_header(note_storage_error(err)),
     };
 
-    let attachments_dir = path
+    let attachments_dir = match path
         .parent()
-        .map(|parent| parent.child(&note::attachment_dir_name(id)));
+        .map(|parent| parent.child(&note::attachment_dir_name(id)))
+        .transpose()
+    {
+        Ok(dir) => dir,
+        Err(err) => return with_api_versions_header(note_storage_error(err.into())),
+    };
 
     let resp = breadcloud_webdav::handlers::delete::handle(state, &path).await;
     if !resp.status().is_success() {
@@ -473,13 +498,14 @@ pub async fn attachment_get(state: &AppState, note_id: &str, query: &str) -> Res
     let Some(raw_name) = query_param(query, "path") else {
         return with_api_versions_header(error_response(StatusCode::BAD_REQUEST));
     };
+    let name = sanitize_query_str(raw_name);
     let Some((note_path, _)) = (match resolve(state, note_id).await {
         Ok(v) => v,
         Err(err) => return with_api_versions_header(note_storage_error(err)),
     }) else {
         return with_api_versions_header(not_found());
     };
-    let Some(attachment_path) = attachment_path(&note_path, note_id, raw_name) else {
+    let Some(attachment_path) = attachment_path(&note_path, note_id, &name) else {
         return with_api_versions_header(error_response(StatusCode::BAD_REQUEST));
     };
     with_api_versions_header(
@@ -556,10 +582,17 @@ pub async fn attachment_upload(state: &AppState, note_id: &str, req: Request) ->
         .parent()
         .unwrap_or_else(notes_root)
         .child(&note::attachment_dir_name(note_id));
+    let dir = match dir {
+        Ok(dir) => dir,
+        Err(_) => return with_api_versions_header(error_response(StatusCode::BAD_REQUEST)),
+    };
     if let Err(err) = ensure_category_dir(state, &dir).await {
         return with_api_versions_header(note_storage_error(err));
     }
-    let dest = dir.child(&sanitized);
+    let dest = match dir.child(&sanitized) {
+        Ok(path) => path,
+        Err(_) => return with_api_versions_header(error_response(StatusCode::BAD_REQUEST)),
+    };
     match write_note_content(state, &dest, &data).await {
         Ok(()) => with_api_versions_header(json_response(
             StatusCode::OK,
@@ -573,8 +606,9 @@ fn attachment_path(note_path: &DavPath, note_id: &str, raw_name: &str) -> Option
     let sanitized = note::sanitize_attachment_name(raw_name);
     let dir = note_path
         .parent()?
-        .child(&note::attachment_dir_name(note_id));
-    Some(dir.child(&sanitized))
+        .child(&note::attachment_dir_name(note_id))
+        .ok()?;
+    dir.child(&sanitized).ok()
 }
 
 /// Write `data` to `path`, taking a version snapshot of whatever it
@@ -590,10 +624,6 @@ async fn write_note_content(
     path: &DavPath,
     data: &[u8],
 ) -> Result<(), Box<Response>> {
-    breadcloud_webdav::versioning::snapshot_before_overwrite(state, path)
-        .await
-        .map_err(breadcloud_webdav::error::storage_error_response)?;
-
     let _quota_guard = match state.quota_limit_bytes {
         Some(limit) => match state
             .storage
@@ -606,11 +636,16 @@ async fn write_note_content(
         None => None,
     };
 
-    state
-        .storage
-        .write_bytes(path, data)
+    // Rejected over-quota note writes must not create or evict versions.
+    let pending_snapshot = breadcloud_webdav::versioning::snapshot_before_overwrite(state, path)
         .await
-        .map_err(note_storage_error)?;
+        .map_err(|err| Box::new(note_storage_error(err)))?;
+
+    if let Err(err) = state.storage.write_bytes(path, data).await {
+        breadcloud_webdav::versioning::discard_snapshot(state, path, pending_snapshot).await;
+        return Err(Box::new(note_storage_error(err)));
+    }
+    breadcloud_webdav::versioning::finish_snapshot(state, path, pending_snapshot).await;
 
     breadcloud_events::file_synced(
         state.owner_label(),
@@ -674,11 +709,15 @@ async fn rename_attachments_dir(
     };
     let old_id = breadcloud_webdav::fileid::for_path(from);
     let new_id = breadcloud_webdav::fileid::for_path(to);
-    let old_dir = from_parent.child(&note::attachment_dir_name(&old_id));
+    let old_dir = from_parent
+        .child(&note::attachment_dir_name(&old_id))
+        .map_err(|err| note_storage_error(err.into()))?;
     if !state.storage.exists(&old_dir).await {
         return Ok(());
     }
-    let new_dir = to_parent.child(&note::attachment_dir_name(&new_id));
+    let new_dir = to_parent
+        .child(&note::attachment_dir_name(&new_id))
+        .map_err(|err| note_storage_error(err.into()))?;
     state
         .storage
         .move_to(&old_dir, &new_dir, false)
@@ -688,7 +727,10 @@ async fn rename_attachments_dir(
 }
 
 fn sanitize_query_str(raw: &str) -> String {
-    percent_encoding::percent_decode_str(raw)
+    // Form query values use '+' for space. Replace it before decoding so
+    // an encoded literal plus (%2B) remains a plus in the filename.
+    let raw = raw.replace('+', " ");
+    percent_encoding::percent_decode_str(&raw)
         .decode_utf8_lossy()
         .into_owned()
 }
@@ -698,6 +740,22 @@ fn sanitize_query_str(raw: &str) -> String {
 /// files, never the multi-gigabyte payloads `breadcloud-webdav`'s own PUT
 /// path has to stream.
 pub async fn read_json_body(req: Request) -> Result<Vec<u8>, Box<Response>> {
+    let content_type = req
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if !content_type.is_some_and(|value| value.eq_ignore_ascii_case("application/json")) {
+        return Err(Box::new(with_api_versions_header(
+            (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "expected application/json",
+            )
+                .into_response(),
+        )));
+    }
+
     axum::body::to_bytes(req.into_body(), 8 * 1024 * 1024)
         .await
         .map(|b| b.to_vec())

@@ -12,16 +12,10 @@
 //! breadcloud must behave identically whether or not `breadd` is
 //! installed or running. Concretely:
 //!
-//! - Every publish here goes through [`BreadClient::emit`], which is
-//!   already fail-silent by design: no socket, no reply, no error, it is
-//!   simply dropped. See `bread-utils`'s own `bread_client` module docs.
-//! - Every publish is additionally dispatched onto Tokio's blocking
-//!   thread pool ([`tokio::task::spawn_blocking`]) rather than run
-//!   inline on the caller's async task. `BreadClient::emit` opens a
-//!   blocking `UnixStream` and writes to it under a 200ms write timeout;
-//!   without this, a slow or wedged breadd could add up to that much
-//!   latency to the WebDAV request that triggered the event. Dispatching
-//!   it away means a request never waits on event delivery at all.
+//! - Publishes use a single bounded queue and dedicated worker. The worker
+//!   keeps one IPC connection open while breadd is healthy and reconnects
+//!   after a failed write or reply. The request path only tries to enqueue;
+//!   it never waits for a socket, and events are dropped when the queue is full.
 //! - Nothing here returns a `Result` a caller could feel obligated to
 //!   check: there is nothing meaningful to do with a failure to notify
 //!   an optional automation bus, and building error plumbing for it
@@ -35,8 +29,15 @@
 //! `bread.cloud.quota.warning` (usage crossing an 80/90/100 percent
 //! threshold of a per-account quota, CLOUD-11).
 
-use bread_utils::bread_client::BreadClient;
+use bread_shared::apps::validate_app_namespace;
 use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::OnceLock;
+use std::thread;
+use std::time::Duration;
 
 /// This app's reserved segment in `bread.<id>.*` / `bread.command.<id>.*`.
 pub const APP_ID: &str = "cloud";
@@ -173,20 +174,185 @@ pub fn crossed_threshold(used_before: u64, used_after: u64, limit_bytes: u64) ->
         .max()
 }
 
-/// Fire-and-forget publish under this app's namespace, dispatched onto
-/// Tokio's blocking thread pool. See the module docs for why: the
-/// underlying socket write is synchronous and must never share a thread
-/// with request handling. The returned `JoinHandle` is intentionally
-/// dropped: there is no result to act on and nothing to await.
+const EVENT_QUEUE_CAPACITY: usize = 256;
+
+#[derive(Debug)]
+struct QueuedEvent {
+    name: &'static str,
+    data: Value,
+}
+
+static EVENT_SENDER: OnceLock<Option<SyncSender<QueuedEvent>>> = OnceLock::new();
+
+/// Fire-and-forget publish under this app's namespace. A bounded queue keeps
+/// bursts from creating an unbounded number of blocking operations. If the worker
+/// is behind, this event is dropped rather than delaying the caller.
 fn emit(event: &'static str, data: Value) {
-    tokio::task::spawn_blocking(move || {
-        BreadClient::connect(APP_ID).emit(event, data);
-    });
+    let sender = EVENT_SENDER.get_or_init(start_event_worker);
+    let Some(sender) = sender else {
+        return;
+    };
+    enqueue_event(sender, QueuedEvent { name: event, data });
+}
+
+fn enqueue_event(sender: &SyncSender<QueuedEvent>, event: QueuedEvent) -> bool {
+    sender.try_send(event).is_ok()
+}
+
+fn start_event_worker() -> Option<SyncSender<QueuedEvent>> {
+    let (sender, receiver) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+    thread::Builder::new()
+        .name("breadcloud-events".to_string())
+        .spawn(move || event_worker(receiver))
+        .ok()?;
+    Some(sender)
+}
+
+fn event_worker(receiver: Receiver<QueuedEvent>) {
+    let mut client = PersistentEventClient::default();
+    while let Ok(event) = receiver.recv() {
+        client.emit(event);
+    }
+}
+
+#[derive(Default)]
+struct PersistentEventClient {
+    connection: Option<(UnixStream, BufReader<UnixStream>)>,
+}
+
+impl PersistentEventClient {
+    fn emit(&mut self, event: QueuedEvent) {
+        self.emit_with_socket(event, &bread_shared::resolve_socket_path());
+    }
+
+    fn emit_with_socket(&mut self, event: QueuedEvent, socket_path: &std::path::Path) {
+        if !validate_app_namespace(APP_ID, event.name) {
+            return;
+        }
+
+        if self.connection.is_none() {
+            self.connection = UnixStream::connect(socket_path).ok().and_then(|stream| {
+                stream
+                    .set_write_timeout(Some(Duration::from_millis(200)))
+                    .ok()?;
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(500)))
+                    .ok()?;
+                let reader = BufReader::new(stream.try_clone().ok()?);
+                Some((stream, reader))
+            });
+        }
+
+        let Some((stream, reader)) = self.connection.as_mut() else {
+            return;
+        };
+
+        let request = json!({
+            "id": "0",
+            "method": "emit",
+            "params": {
+                "event": event.name,
+                "source": APP_ID,
+                "kind": event.name,
+                "data": event.data,
+            }
+        });
+        let Ok(line) = serde_json::to_string(&request) else {
+            return;
+        };
+
+        let result = (|| {
+            writeln!(stream, "{line}")?;
+            let mut response = String::new();
+            reader.read_line(&mut response)?;
+            if response.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "breadd closed the event connection",
+                ));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.connection = None;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead;
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn test_socket_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "breadcloud-events-{}-{}.sock",
+            std::process::id(),
+            NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn queue_drops_new_events_when_full() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let event = || QueuedEvent {
+            name: "bread.cloud.test",
+            data: json!({}),
+        };
+
+        assert!(enqueue_event(&sender, event()));
+        assert!(!enqueue_event(&sender, event()));
+    }
+
+    #[test]
+    fn client_reuses_one_connection_for_multiple_events() {
+        let path = test_socket_path();
+        let listener = match UnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                // Some sandboxes forbid creating Unix-domain sockets.
+                return;
+            }
+            Err(error) => panic!("could not bind test socket: {error}"),
+        };
+        let server_path = path.clone();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                requests.push(serde_json::from_str::<Value>(&line).unwrap());
+                writeln!(reader.get_mut(), r#"{{"id":"0","result":null}}"#).unwrap();
+            }
+            requests
+        });
+
+        let mut client = PersistentEventClient { connection: None };
+        for name in ["bread.cloud.first", "bread.cloud.second"] {
+            client.emit_with_socket(
+                QueuedEvent {
+                    name,
+                    data: json!({}),
+                },
+                &path,
+            );
+        }
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["params"]["event"], "bread.cloud.first");
+        assert_eq!(requests[1]["params"]["event"], "bread.cloud.second");
+        assert!(client.connection.is_some());
+        drop(client);
+        std::fs::remove_file(server_path).unwrap();
+    }
 
     #[test]
     fn crossed_threshold_detects_a_fresh_crossing() {
