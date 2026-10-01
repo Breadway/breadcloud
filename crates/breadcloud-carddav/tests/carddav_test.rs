@@ -390,6 +390,54 @@ async fn addressbook_multiget_fetches_explicit_hrefs() {
     assert!(!body.contains("two.vcf"));
 }
 
+#[tokio::test]
+async fn addressbook_multiget_decodes_absolute_hrefs_and_reports_missing_objects() {
+    let (_dir, app) = test_app().await;
+    put_contact(
+        &app,
+        "/remote.php/dav/addressbooks/dev/contacts/space%20name.vcf",
+        &sample_contact("space", "Ada Lovelace"),
+    )
+    .await;
+
+    let report_body = r#"<?xml version="1.0"?>
+<c:addressbook-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav">
+  <d:prop><d:getetag/><c:address-data/></d:prop>
+  <d:href>https://dav.example.test/remote.php/dav/addressbooks/dev/contacts/space%20name.vcf</d:href>
+  <d:href>https://dav.example.test/remote.php/dav/addressbooks/dev/contacts/missing%20contact.vcf</d:href>
+</c:addressbook-multiget>"#;
+    let req = Request::builder()
+        .method("REPORT")
+        .uri("/remote.php/dav/addressbooks/dev/contacts/")
+        .body(Body::from(report_body))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status().as_u16(), 207);
+    let body = body_string(response).await;
+    assert!(body.contains("space%20name.vcf"));
+    assert!(body.contains("FN:Ada Lovelace"));
+    assert!(body.contains("missing%20contact.vcf"));
+    assert!(body.contains("HTTP/1.1 404 Not Found"));
+}
+
+#[tokio::test]
+async fn addressbook_multiget_reports_non_missing_storage_errors() {
+    let (dir, app) = test_app().await;
+    std::fs::create_dir_all(dir.path().join("dev/contacts/contacts/directory.vcf")).unwrap();
+    let report_body = r#"<?xml version="1.0"?>
+<c:addressbook-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav">
+  <d:prop><d:getetag/></d:prop>
+  <d:href>/remote.php/dav/addressbooks/dev/contacts/directory.vcf</d:href>
+</c:addressbook-multiget>"#;
+    let req = Request::builder()
+        .method("REPORT")
+        .uri("/remote.php/dav/addressbooks/dev/contacts/")
+        .body(Body::from(report_body))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
 /// The real data this issue targets is 76 contacts split across groups
 /// (Friends/ICE/starred/Family team); groups are ordinary vCards with
 /// `KIND:group` and `MEMBER:urn:uuid:<uid>` lines, not a separate

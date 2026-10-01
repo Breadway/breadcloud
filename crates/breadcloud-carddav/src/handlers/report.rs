@@ -1,7 +1,7 @@
 use axum::extract::Request;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use breadcloud_storage::{AddressbookStore, DavPath};
+use breadcloud_storage::{AddressbookStore, DavPath, StorageError};
 use breadcloud_webdav::error::storage_error_response;
 
 use crate::handlers::{read_body, xml_response};
@@ -10,6 +10,14 @@ use crate::state::AppState;
 use crate::vcard;
 use crate::xml::request::{parse_report_body, PropFilter, PropSet, ReportRequest};
 use crate::xml::response::{self, ContactEntry, SyncEntry};
+
+fn multiget_path(href: &str) -> Option<String> {
+    let uri = href.parse::<Uri>().ok()?;
+    let path = percent_encoding::percent_decode_str(uri.path())
+        .decode_utf8()
+        .ok()?;
+    Some(path.into_owned())
+}
 
 fn contact_href(user: &str, addressbook_id: &str, obj: &str) -> String {
     format!("/remote.php/dav/addressbooks/{user}/{addressbook_id}/{obj}")
@@ -51,9 +59,8 @@ pub async fn handle(state: &AppState, user: &str, addressbook_id: &str, req: Req
 }
 
 /// RFC 6352 8.7: fetch an explicit, known set of contact objects by href.
-/// Any href that does not belong to this addressbook is silently skipped
-/// rather than erroring the whole REPORT, same tolerance
-/// `breadcloud_caldav::handlers::report::calendar_multiget` documents.
+/// Absolute hrefs and percent-encoded path segments are normalized
+/// before parsing. Missing or out-of-scope hrefs receive a 404 response.
 async fn addressbook_multiget(
     state: &AppState,
     user: &str,
@@ -71,21 +78,38 @@ async fn addressbook_multiget(
     };
 
     let mut fetched: Vec<(String, String, Vec<u8>)> = Vec::new();
+    let mut missing = Vec::new();
     for href in hrefs {
-        let Some(CardPath::Contact(href_user, href_book, obj)) = CardPath::parse(href) else {
+        let Some(path) = multiget_path(href) else {
+            continue;
+        };
+        let Some(CardPath::Contact(href_user, href_book, obj)) = CardPath::parse(&path) else {
+            missing.push(path);
             continue;
         };
         if href_user != user || href_book != addressbook_id {
+            missing.push(path);
             continue;
         }
         let Ok(dav) = DavPath::parse(&format!("/{obj}")) else {
+            missing.push(path);
             continue;
         };
-        let Ok(bytes) = contacts.read_bytes(&dav).await else {
-            continue;
+        let bytes = match contacts.read_bytes(&dav).await {
+            Ok(bytes) => bytes,
+            Err(StorageError::NotFound) => {
+                missing.push(path);
+                continue;
+            }
+            Err(err) => return storage_error_response(err),
         };
-        let Ok(etag) = contacts.etag(&dav).await else {
-            continue;
+        let etag = match contacts.etag(&dav).await {
+            Ok(etag) => etag,
+            Err(StorageError::NotFound) => {
+                missing.push(path);
+                continue;
+            }
+            Err(err) => return storage_error_response(err),
         };
         fetched.push((contact_href(user, addressbook_id, &obj), etag, bytes));
     }
@@ -102,7 +126,9 @@ async fn addressbook_multiget(
             },
         })
         .collect();
-    xml_response(response::addressbook_object_multistatus(&entries, props))
+    xml_response(response::addressbook_object_multistatus_with_missing(
+        &entries, &missing, props,
+    ))
 }
 
 /// RFC 6352 8.6: fetch every contact matching an optional property

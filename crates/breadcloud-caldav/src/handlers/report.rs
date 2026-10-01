@@ -1,7 +1,7 @@
 use axum::extract::Request;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use breadcloud_storage::{CalendarStore, DavPath};
+use breadcloud_storage::{CalendarStore, DavPath, StorageError};
 use breadcloud_webdav::error::storage_error_response;
 
 use crate::handlers::{read_body, xml_response};
@@ -10,6 +10,14 @@ use crate::path::CalPath;
 use crate::state::AppState;
 use crate::xml::request::{parse_report_body, PropSet, ReportRequest, TimeRange};
 use crate::xml::response::{self, EventEntry, SyncEntry};
+
+fn multiget_path(href: &str) -> Option<String> {
+    let uri = href.parse::<Uri>().ok()?;
+    let path = percent_encoding::percent_decode_str(uri.path())
+        .decode_utf8()
+        .ok()?;
+    Some(path.into_owned())
+}
 
 fn event_href(user: &str, calendar_id: &str, obj: &str) -> String {
     format!("/remote.php/dav/calendars/{user}/{calendar_id}/{obj}")
@@ -60,13 +68,8 @@ pub async fn handle(state: &AppState, user: &str, calendar_id: &str, req: Reques
 }
 
 /// RFC 4791 7.9: fetch an explicit, known set of calendar objects by
-/// href. Any href that does not belong to this calendar (wrong user,
-/// wrong calendar id, or not a resource path at all) is silently skipped
-/// rather than erroring the whole REPORT -- RFC 4791 does not define a
-/// per-href error shape for this REPORT beyond simply omitting the
-/// `<d:response>` for anything not found, which real clients (DAVx5,
-/// iOS) already tolerate for hrefs they hold that the server no longer
-/// has.
+/// href. Absolute hrefs and percent-encoded path segments are normalized
+/// before parsing. Missing or out-of-scope hrefs receive a 404 response.
 async fn calendar_multiget(
     state: &AppState,
     user: &str,
@@ -80,21 +83,38 @@ async fn calendar_multiget(
     };
 
     let mut fetched: Vec<(String, String, Vec<u8>)> = Vec::new();
+    let mut missing = Vec::new();
     for href in hrefs {
-        let Some(CalPath::Event(href_user, href_cal, obj)) = CalPath::parse(href) else {
+        let Some(path) = multiget_path(href) else {
+            continue;
+        };
+        let Some(CalPath::Event(href_user, href_cal, obj)) = CalPath::parse(&path) else {
+            missing.push(path);
             continue;
         };
         if href_user != user || href_cal != calendar_id {
+            missing.push(path);
             continue;
         }
         let Ok(dav) = DavPath::parse(&format!("/{obj}")) else {
+            missing.push(path);
             continue;
         };
-        let Ok(bytes) = events.read_bytes(&dav).await else {
-            continue;
+        let bytes = match events.read_bytes(&dav).await {
+            Ok(bytes) => bytes,
+            Err(StorageError::NotFound) => {
+                missing.push(path);
+                continue;
+            }
+            Err(err) => return storage_error_response(err),
         };
-        let Ok(etag) = events.etag(&dav).await else {
-            continue;
+        let etag = match events.etag(&dav).await {
+            Ok(etag) => etag,
+            Err(StorageError::NotFound) => {
+                missing.push(path);
+                continue;
+            }
+            Err(err) => return storage_error_response(err),
         };
         fetched.push((event_href(user, calendar_id, &obj), etag, bytes));
     }
@@ -111,7 +131,9 @@ async fn calendar_multiget(
             },
         })
         .collect();
-    xml_response(response::calendar_object_multistatus(&entries, props))
+    xml_response(response::calendar_object_multistatus_with_missing(
+        &entries, &missing, props,
+    ))
 }
 
 /// RFC 4791 7.8: fetch every calendar object matching an optional

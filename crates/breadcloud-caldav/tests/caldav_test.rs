@@ -359,6 +359,54 @@ async fn calendar_multiget_fetches_explicit_hrefs() {
 }
 
 #[tokio::test]
+async fn calendar_multiget_decodes_absolute_hrefs_and_reports_missing_objects() {
+    let (_dir, app) = test_app().await;
+    put_event(
+        &app,
+        "/remote.php/dav/calendars/dev/personal/space%20name.ics",
+        &sample_event("space", "20260115T090000Z"),
+    )
+    .await;
+
+    let report_body = r#"<?xml version="1.0"?>
+<c:calendar-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:getetag/><c:calendar-data/></d:prop>
+  <d:href>https://dav.example.test/remote.php/dav/calendars/dev/personal/space%20name.ics</d:href>
+  <d:href>https://dav.example.test/remote.php/dav/calendars/dev/personal/missing%20event.ics</d:href>
+</c:calendar-multiget>"#;
+    let req = Request::builder()
+        .method("REPORT")
+        .uri("/remote.php/dav/calendars/dev/personal/")
+        .body(Body::from(report_body))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status().as_u16(), 207);
+    let body = body_string(response).await;
+    assert!(body.contains("space%20name.ics"));
+    assert!(body.contains("SUMMARY:Test event space"));
+    assert!(body.contains("missing%20event.ics"));
+    assert!(body.contains("HTTP/1.1 404 Not Found"));
+}
+
+#[tokio::test]
+async fn calendar_multiget_reports_non_missing_storage_errors() {
+    let (dir, app) = test_app().await;
+    std::fs::create_dir_all(dir.path().join("dev/personal/events/directory.ics")).unwrap();
+    let report_body = r#"<?xml version="1.0"?>
+<c:calendar-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:getetag/></d:prop>
+  <d:href>/remote.php/dav/calendars/dev/personal/directory.ics</d:href>
+</c:calendar-multiget>"#;
+    let req = Request::builder()
+        .method("REPORT")
+        .uri("/remote.php/dav/calendars/dev/personal/")
+        .body(Body::from(report_body))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
 async fn sync_collection_initial_then_incremental() {
     let (_dir, app) = test_app().await;
     put_event(
