@@ -590,10 +590,6 @@ async fn write_note_content(
     path: &DavPath,
     data: &[u8],
 ) -> Result<(), Box<Response>> {
-    breadcloud_webdav::versioning::snapshot_before_overwrite(state, path)
-        .await
-        .map_err(breadcloud_webdav::error::storage_error_response)?;
-
     let _quota_guard = match state.quota_limit_bytes {
         Some(limit) => match state
             .storage
@@ -606,11 +602,16 @@ async fn write_note_content(
         None => None,
     };
 
-    state
-        .storage
-        .write_bytes(path, data)
+    // Rejected over-quota note writes must not create or evict versions.
+    let pending_snapshot = breadcloud_webdav::versioning::snapshot_before_overwrite(state, path)
         .await
-        .map_err(note_storage_error)?;
+        .map_err(|err| Box::new(note_storage_error(err)))?;
+
+    if let Err(err) = state.storage.write_bytes(path, data).await {
+        breadcloud_webdav::versioning::discard_snapshot(state, path, pending_snapshot).await;
+        return Err(Box::new(note_storage_error(err)));
+    }
+    breadcloud_webdav::versioning::finish_snapshot(state, path, pending_snapshot).await;
 
     breadcloud_events::file_synced(
         state.owner_label(),

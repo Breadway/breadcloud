@@ -330,13 +330,17 @@ async fn finalize(state: &AppState, transfer_dir: &DavPath, headers: &HeaderMap)
     // is about to reject. Most files in a real synced dataset take this
     // chunked path rather than plain PUT (see CLOUD-3), so skipping this
     // here would leave versioning working only for small files.
-    if let Err(err) = crate::versioning::snapshot_before_overwrite(state, &dest).await {
-        prepared.discard().await;
-        return storage_error_response(err);
-    }
+    let pending_snapshot = match crate::versioning::snapshot_before_overwrite(state, &dest).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            prepared.discard().await;
+            return storage_error_response(err);
+        }
+    };
 
     match state.storage.commit_assemble(prepared).await {
         Ok((outcome, total, etag)) => {
+            crate::versioning::finish_snapshot(state, &dest, pending_snapshot).await;
             let mtime_accepted = match crate::mtime::parse_oc_mtime(headers) {
                 Some(mtime) => crate::mtime::apply(state.storage.resolve(&dest), mtime),
                 None => false,
@@ -383,6 +387,9 @@ async fn finalize(state: &AppState, transfer_dir: &DavPath, headers: &HeaderMap)
             }
             builder.body(Body::empty()).unwrap()
         }
-        Err(err) => storage_error_response(err),
+        Err(err) => {
+            crate::versioning::discard_snapshot(state, &dest, pending_snapshot).await;
+            storage_error_response(err)
+        }
     }
 }

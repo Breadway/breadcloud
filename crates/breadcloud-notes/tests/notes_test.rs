@@ -275,6 +275,46 @@ async fn update_with_correct_if_match_succeeds_and_is_versioned() {
     );
 }
 
+#[tokio::test]
+async fn quota_rejected_note_overwrite_does_not_create_a_version() {
+    let (_dirs, mut state) = test_state();
+    state.quota_limit_bytes = Some(64);
+
+    let created = breadcloud_notes::dispatch(
+        state.clone(),
+        req(
+            "POST",
+            "/notes",
+            serde_json::to_vec(&serde_json::json!({"title": "quota", "content": "v1"})).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let created_json = body_json(created).await;
+    let id = created_json["id"].as_str().unwrap().to_string();
+
+    let rejected = breadcloud_notes::dispatch(
+        state.clone(),
+        req(
+            "PUT",
+            &format!("/notes/{id}"),
+            serde_json::to_vec(&serde_json::json!({"content": "x".repeat(128)})).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::INSUFFICIENT_STORAGE);
+
+    let versions = state
+        .versions
+        .list(&breadcloud_storage::DavPath::parse("/Notes/quota.md").unwrap())
+        .await
+        .unwrap();
+    assert!(
+        versions.is_empty(),
+        "a rejected write must not create a version"
+    );
+}
+
 /// A `category` change moves the underlying file into a subfolder, and
 /// `category` in the response reflects it -- the folder-mapping CLOUD-8
 /// asks for.

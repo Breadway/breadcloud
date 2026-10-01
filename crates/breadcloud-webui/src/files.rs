@@ -254,10 +254,6 @@ pub async fn upload(state: &AppState, req: Request) -> Response {
     let dest = parent.child(leaf);
     let data = data.unwrap_or_default();
 
-    if let Err(err) = breadcloud_webdav::versioning::snapshot_before_overwrite(state, &dest).await {
-        return breadcloud_webdav::error::storage_error_response(err);
-    }
-
     let _quota_guard = match state.quota_limit_bytes {
         Some(limit) => match state
             .storage
@@ -270,9 +266,23 @@ pub async fn upload(state: &AppState, req: Request) -> Response {
         None => None,
     };
 
+    // Take a version only after the upload body is valid and the quota
+    // gate accepted it, immediately before replacing the live file.
+    let pending_snapshot =
+        match breadcloud_webdav::versioning::snapshot_before_overwrite(state, &dest).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => return breadcloud_webdav::error::storage_error_response(err),
+        };
+
     match state.storage.write_bytes(&dest, &data).await {
-        Ok(_) => Redirect::to(&encode_ui_path("/ui/files", &parent)).into_response(),
-        Err(err) => breadcloud_webdav::error::storage_error_response(err),
+        Ok(_) => {
+            breadcloud_webdav::versioning::finish_snapshot(state, &dest, pending_snapshot).await;
+            Redirect::to(&encode_ui_path("/ui/files", &parent)).into_response()
+        }
+        Err(err) => {
+            breadcloud_webdav::versioning::discard_snapshot(state, &dest, pending_snapshot).await;
+            breadcloud_webdav::error::storage_error_response(err)
+        }
     }
 }
 

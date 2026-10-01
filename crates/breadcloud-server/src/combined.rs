@@ -1462,6 +1462,50 @@ mod tests {
         let get = request_as(&app, "GET", "/f.txt", "alice", "secret1", &[], Vec::new()).await;
         assert_eq!(get.status(), StatusCode::OK);
         assert_eq!(body_string(get).await, "0123456789");
+
+        let versions = request_as(
+            &app,
+            "PROPFIND",
+            "/remote.php/dav/versions/alice/f.txt",
+            "alice",
+            "secret1",
+            &[("Depth", "1")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(versions.status(), multi_status());
+        assert!(!body_string(versions).await.contains("<d:response>"));
+    }
+
+    #[tokio::test]
+    async fn quota_rejected_ui_overwrite_does_not_create_a_version() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 20)]).await;
+        let first = upload_via_ui(&app, "alice", "secret1", "/", "f.txt", b"0123456789").await;
+        assert_eq!(first.status(), StatusCode::SEE_OTHER);
+
+        let rejected = upload_via_ui(
+            &app,
+            "alice",
+            "secret1",
+            "/",
+            "f.txt",
+            b"replacement exceeds the remaining quota",
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::from_u16(507).unwrap());
+
+        let versions = request_as(
+            &app,
+            "PROPFIND",
+            "/remote.php/dav/versions/alice/f.txt",
+            "alice",
+            "secret1",
+            &[("Depth", "1")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(versions.status(), multi_status());
+        assert!(!body_string(versions).await.contains("<d:response>"));
     }
 
     /// Quota is per-user, not shared: alice being nearly out of quota
