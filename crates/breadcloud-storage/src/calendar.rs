@@ -341,6 +341,9 @@ impl CalendarStore {
     ) -> Result<String, StorageError> {
         let user = Self::validate_segment(user)?;
         let calendar_id = Self::validate_segment(calendar_id)?;
+        if uid.chars().any(char::is_control) {
+            return Err(crate::path::InvalidPath(uid.to_string()).into());
+        }
 
         let _guard = self.write_lock.lock().await;
 
@@ -567,6 +570,31 @@ mod tests {
             .unwrap();
         assert_eq!(ctag2, "2");
         assert_eq!(store.ctag("dev", "personal").await.unwrap(), "2");
+    }
+
+    #[tokio::test]
+    async fn record_change_rejects_control_characters_in_uid() {
+        let (_dir, store) = store();
+        store
+            .create_calendar("dev", "personal", "Personal", None)
+            .await
+            .unwrap();
+
+        let err = store
+            .record_change("dev", "personal", "bad\tuid", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::InvalidPath(_)));
+        assert_eq!(store.ctag("dev", "personal").await.unwrap(), "0");
+
+        store
+            .record_change("dev", "personal", "good-uid", false)
+            .await
+            .unwrap();
+        let log = fs::read_to_string(store.changelog_file("dev", "personal"))
+            .await
+            .unwrap();
+        assert_eq!(log, "1\tC\tgood-uid\n");
     }
 
     #[tokio::test]

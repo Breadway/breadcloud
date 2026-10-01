@@ -11,6 +11,9 @@ use crate::state::AppState;
 use crate::vcard;
 
 fn dav_path(obj: &str) -> Option<DavPath> {
+    if obj.chars().any(char::is_control) {
+        return None;
+    }
     DavPath::parse(&format!("/{obj}")).ok()
 }
 

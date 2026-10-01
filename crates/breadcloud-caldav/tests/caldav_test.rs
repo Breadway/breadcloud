@@ -219,6 +219,28 @@ async fn put_without_uid_is_bad_request() {
 }
 
 #[tokio::test]
+async fn put_rejects_control_characters_in_event_names_before_writing() {
+    let (dir, app) = test_app().await;
+    for encoded_name in ["bad%0Aname.ics", "bad%09name.ics"] {
+        let response = put_event(
+            &app,
+            &format!("/remote.php/dav/calendars/dev/personal/{encoded_name}"),
+            &sample_event("evt-1", "20260115T090000Z"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let calendars = CalendarStore::new(dir.path());
+    assert_eq!(calendars.ctag("dev", "personal").await.unwrap(), "0");
+    let events = calendars.events_storage("dev", "personal").await.unwrap();
+    for name in ["bad\nname.ics", "bad\tname.ics"] {
+        let path = breadcloud_storage::DavPath::parse(&format!("/{name}")).unwrap();
+        assert!(!events.exists(&path).await);
+    }
+}
+
+#[tokio::test]
 async fn put_into_a_nonexistent_calendar_is_conflict() {
     let (_dir, app) = test_app().await;
     let ics = sample_event("evt-1", "20260115T090000Z");

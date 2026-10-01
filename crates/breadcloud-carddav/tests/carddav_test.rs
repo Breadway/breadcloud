@@ -218,6 +218,31 @@ async fn put_without_uid_is_bad_request() {
 }
 
 #[tokio::test]
+async fn put_rejects_control_characters_in_contact_names_before_writing() {
+    let (dir, app) = test_app().await;
+    for encoded_name in ["bad%0Aname.vcf", "bad%09name.vcf"] {
+        let response = put_contact(
+            &app,
+            &format!("/remote.php/dav/addressbooks/dev/contacts/{encoded_name}"),
+            &sample_contact("ctc-1", "Ada Lovelace"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let addressbooks = AddressbookStore::new(dir.path());
+    assert_eq!(addressbooks.ctag("dev", "contacts").await.unwrap(), "0");
+    let contacts = addressbooks
+        .contacts_storage("dev", "contacts")
+        .await
+        .unwrap();
+    for name in ["bad\nname.vcf", "bad\tname.vcf"] {
+        let path = breadcloud_storage::DavPath::parse(&format!("/{name}")).unwrap();
+        assert!(!contacts.exists(&path).await);
+    }
+}
+
+#[tokio::test]
 async fn put_into_a_nonexistent_addressbook_is_conflict() {
     let (_dir, app) = test_app().await;
     let vcf = sample_contact("ctc-1", "Ada Lovelace");

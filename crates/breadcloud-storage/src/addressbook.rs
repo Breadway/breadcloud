@@ -313,6 +313,9 @@ impl AddressbookStore {
     ) -> Result<String, StorageError> {
         let user = Self::validate_segment(user)?;
         let addressbook_id = Self::validate_segment(addressbook_id)?;
+        if uid.chars().any(char::is_control) {
+            return Err(crate::path::InvalidPath(uid.to_string()).into());
+        }
 
         let _guard = self.write_lock.lock().await;
 
@@ -528,6 +531,31 @@ mod tests {
             .unwrap();
         assert_eq!(ctag2, "2");
         assert_eq!(store.ctag("dev", "contacts").await.unwrap(), "2");
+    }
+
+    #[tokio::test]
+    async fn record_change_rejects_control_characters_in_uid() {
+        let (_dir, store) = store();
+        store
+            .create_addressbook("dev", "contacts", "Contacts")
+            .await
+            .unwrap();
+
+        let err = store
+            .record_change("dev", "contacts", "bad\nuid", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::InvalidPath(_)));
+        assert_eq!(store.ctag("dev", "contacts").await.unwrap(), "0");
+
+        store
+            .record_change("dev", "contacts", "good-uid", false)
+            .await
+            .unwrap();
+        let log = fs::read_to_string(store.changelog_file("dev", "contacts"))
+            .await
+            .unwrap();
+        assert_eq!(log, "1\tC\tgood-uid\n");
     }
 
     #[tokio::test]
