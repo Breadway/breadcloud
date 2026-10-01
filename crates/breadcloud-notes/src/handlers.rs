@@ -699,6 +699,22 @@ fn sanitize_query_str(raw: &str) -> String {
 /// files, never the multi-gigabyte payloads `breadcloud-webdav`'s own PUT
 /// path has to stream.
 pub async fn read_json_body(req: Request) -> Result<Vec<u8>, Box<Response>> {
+    let content_type = req
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if !content_type.is_some_and(|value| value.eq_ignore_ascii_case("application/json")) {
+        return Err(Box::new(with_api_versions_header(
+            (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "expected application/json",
+            )
+                .into_response(),
+        )));
+    }
+
     axum::body::to_bytes(req.into_body(), 8 * 1024 * 1024)
         .await
         .map(|b| b.to_vec())

@@ -2106,6 +2106,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ui_rejects_cross_site_mutation_posts() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
+        let response = request_as(
+            &app,
+            "POST",
+            "/ui/mkdir",
+            "alice",
+            "secret1",
+            &[
+                ("Content-Type", "application/x-www-form-urlencoded"),
+                ("Sec-Fetch-Site", "cross-site"),
+            ],
+            b"dir=%2F&name=forbidden".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let listing = request_as(
+            &app,
+            "GET",
+            "/ui/files/",
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert!(!body_string(listing).await.contains("forbidden"));
+    }
+
+    #[tokio::test]
     async fn ui_delete_soft_deletes_through_the_real_trash_and_disappears_from_the_listing() {
         let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
         upload_via_ui(&app, "alice", "secret1", "/", "throwaway.txt", b"bye").await;

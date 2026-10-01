@@ -125,6 +125,23 @@ async fn create_then_get_roundtrips_a_note() {
 }
 
 #[tokio::test]
+async fn notes_json_mutations_require_application_json_content_type() {
+    let (_dirs, state) = test_state();
+    let body = serde_json::json!({"title": "Blocked", "content": "form submission"});
+    let response = breadcloud_notes::dispatch(
+        state,
+        Request::builder()
+            .method("POST")
+            .uri(format!("{BASE}/notes"))
+            .header("Content-Type", "text/plain")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
 async fn list_reflects_a_created_note_and_supports_exclude() {
     let (_dirs, state) = test_state();
     let create_body = serde_json::json!({"title": "todo", "content": "buy bread"});
