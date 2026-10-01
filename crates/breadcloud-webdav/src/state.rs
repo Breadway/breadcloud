@@ -2,6 +2,10 @@ use std::sync::Arc;
 
 use breadcloud_storage::{Storage, TrashStore, VersionStore};
 
+/// Maximum bytes an account may hold in unfinalized chunked uploads. This
+/// admits multi-gigabyte transfers while keeping abandoned staging finite.
+pub const DEFAULT_UPLOAD_STAGING_LIMIT_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
 /// Shared state for the whole WebDAV router.
 #[derive(Clone)]
 pub struct AppState {
@@ -12,6 +16,8 @@ pub struct AppState {
     /// real tree never has a chance of listing someone's in-flight
     /// upload chunks alongside their files.
     pub uploads: Arc<Storage>,
+    /// Maximum aggregate bytes in this account's chunk staging area.
+    pub upload_staging_limit_bytes: u64,
     /// Per-file version history (CLOUD-4), sandboxed to its own root
     /// distinct from both `storage` and `uploads`, for the same reason as
     /// `uploads`: a PROPFIND of the real tree must never see this data.
@@ -64,6 +70,7 @@ impl AppState {
         AppState {
             storage: Arc::new(storage),
             uploads: Arc::new(uploads),
+            upload_staging_limit_bytes: DEFAULT_UPLOAD_STAGING_LIMIT_BYTES,
             versions: Arc::new(versions),
             trash: Arc::new(trash),
             auth: None,
@@ -87,6 +94,12 @@ impl AppState {
     /// `AppState::quota_limit_bytes`.
     pub fn with_quota_limit(mut self, quota_limit_bytes: u64) -> Self {
         self.quota_limit_bytes = Some(quota_limit_bytes);
+        self
+    }
+
+    /// Set the independent cap for aggregate in-progress chunk uploads.
+    pub fn with_upload_staging_limit_bytes(mut self, limit_bytes: u64) -> Self {
+        self.upload_staging_limit_bytes = limit_bytes;
         self
     }
 

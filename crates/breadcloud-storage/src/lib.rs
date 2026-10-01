@@ -607,6 +607,32 @@ impl Storage {
         self.relocate(from, to, overwrite, true).await
     }
 
+    /// Count the source and check the destination while holding the same
+    /// quota lock as PUT and chunk finalization. A source size read before
+    /// this lock could become stale when a concurrent PUT grows the source.
+    pub async fn copy_to_with_quota(
+        &self,
+        from: &DavPath,
+        to: &DavPath,
+        overwrite: bool,
+        limit_bytes: u64,
+    ) -> Result<WriteOutcome, StorageError> {
+        let _guard = self.quota_mutex.lock().await;
+        let metadata = self.metadata(from).await?;
+        let source_bytes = if metadata.is_dir() {
+            self.list_recursive(from)
+                .await?
+                .iter()
+                .filter(|entry| !entry.metadata.is_dir())
+                .map(|entry| entry.metadata.len)
+                .sum()
+        } else {
+            metadata.len
+        };
+        self.check_quota(limit_bytes, to, source_bytes).await?;
+        self.copy_to(from, to, overwrite).await
+    }
+
     async fn relocate(
         &self,
         from: &DavPath,
@@ -2062,6 +2088,37 @@ mod tests {
         // But a genuinely larger overwrite still gets rejected.
         let err = storage.check_quota(10, &path, 11).await.unwrap_err();
         assert!(matches!(err, StorageError::QuotaExceeded { .. }));
+    }
+
+    #[tokio::test]
+    async fn copy_rechecks_source_size_after_a_concurrent_growth() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let (_dir, storage) = storage().await;
+        let source = DavPath::parse("/source.bin").unwrap();
+        let destination = DavPath::parse("/copy.bin").unwrap();
+        storage.write_bytes(&source, &[b'a'; 10]).await.unwrap();
+
+        // Model an admitted PUT still holding its quota reservation. COPY
+        // must wait before reading the source size, then reject the larger
+        // source without creating a destination.
+        let put_guard = storage.quota_gate(30, &source, 20).await.unwrap();
+        let mut copy = Box::pin(storage.copy_to_with_quota(&source, &destination, true, 30));
+        std::future::poll_fn(|cx| {
+            assert!(matches!(copy.as_mut().poll(cx), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+        storage.write_bytes(&source, &[b'b'; 20]).await.unwrap();
+        drop(put_guard);
+
+        assert!(matches!(
+            copy.await,
+            Err(StorageError::QuotaExceeded { .. })
+        ));
+        assert_eq!(storage.used_bytes().await.unwrap(), 20);
+        assert!(!storage.exists(&destination).await);
     }
 
     /// The bug this whole CLOUD-11 rework closes, exercised directly
