@@ -63,11 +63,11 @@ pub async fn handle(
         if copy && !prepared.source_is_dir() && !destination_meta.is_dir() {
             // File COPY keeps destination history just like PUT. MOVE and
             // collection replacements retain the displaced resource in trash.
-            if let Err(response) =
+            if let Err(error) =
                 crate::versioning::snapshot_before_overwrite(state, &destination).await
             {
                 prepared.discard().await;
-                return response;
+                return storage_error_response(error);
             }
         } else {
             match retain_destination(state, &destination, destination_meta.is_dir()).await {
