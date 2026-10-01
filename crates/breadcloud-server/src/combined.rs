@@ -1180,6 +1180,169 @@ mod tests {
         assert!(!xml.contains("alice-contact-1"));
     }
 
+    #[tokio::test]
+    async fn caldav_and_carddav_writes_and_deletes_honor_preconditions() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
+
+        let event_path = "/remote.php/dav/calendars/alice/personal/conditional.ics";
+        let event = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:conditional-event\r\nDTSTART:20260401T090000Z\r\nDTEND:20260401T100000Z\r\nSUMMARY:Initial event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".to_vec();
+        let event_create = request_as(
+            &app,
+            "PUT",
+            event_path,
+            "alice",
+            "secret1",
+            &[("If-None-Match", "*")],
+            event.clone(),
+        )
+        .await;
+        assert_eq!(event_create.status(), StatusCode::CREATED);
+
+        let event_duplicate_create = request_as(
+            &app,
+            "PUT",
+            event_path,
+            "alice",
+            "secret1",
+            &[("If-None-Match", "*")],
+            event.clone(),
+        )
+        .await;
+        assert_eq!(
+            event_duplicate_create.status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+
+        let event_read =
+            request_as(&app, "GET", event_path, "alice", "secret1", &[], Vec::new()).await;
+        let event_etag = event_read
+            .headers()
+            .get("ETag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let event_stale_update = request_as(
+            &app,
+            "PUT",
+            event_path,
+            "alice",
+            "secret1",
+            &[("If-Match", "\"stale\"")],
+            event.clone(),
+        )
+        .await;
+        assert_eq!(event_stale_update.status(), StatusCode::PRECONDITION_FAILED);
+        let event_stale_delete = request_as(
+            &app,
+            "DELETE",
+            event_path,
+            "alice",
+            "secret1",
+            &[("If-Match", "\"stale\"")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(event_stale_delete.status(), StatusCode::PRECONDITION_FAILED);
+        let event_delete = request_as(
+            &app,
+            "DELETE",
+            event_path,
+            "alice",
+            "secret1",
+            &[("If-Match", &event_etag)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(event_delete.status(), StatusCode::NO_CONTENT);
+
+        let contact_path = "/remote.php/dav/addressbooks/alice/contacts/conditional.vcf";
+        let contact = b"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:conditional-contact\r\nFN:Initial Contact\r\nEND:VCARD\r\n".to_vec();
+        let contact_create = request_as(
+            &app,
+            "PUT",
+            contact_path,
+            "alice",
+            "secret1",
+            &[("If-None-Match", "*")],
+            contact.clone(),
+        )
+        .await;
+        assert_eq!(contact_create.status(), StatusCode::CREATED);
+
+        let contact_duplicate_create = request_as(
+            &app,
+            "PUT",
+            contact_path,
+            "alice",
+            "secret1",
+            &[("If-None-Match", "*")],
+            contact.clone(),
+        )
+        .await;
+        assert_eq!(
+            contact_duplicate_create.status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+
+        let contact_read = request_as(
+            &app,
+            "GET",
+            contact_path,
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        let contact_etag = contact_read
+            .headers()
+            .get("ETag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let contact_stale_update = request_as(
+            &app,
+            "PUT",
+            contact_path,
+            "alice",
+            "secret1",
+            &[("If-Match", "\"stale\"")],
+            contact,
+        )
+        .await;
+        assert_eq!(
+            contact_stale_update.status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        let contact_stale_delete = request_as(
+            &app,
+            "DELETE",
+            contact_path,
+            "alice",
+            "secret1",
+            &[("If-Match", "\"stale\"")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            contact_stale_delete.status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        let contact_delete = request_as(
+            &app,
+            "DELETE",
+            contact_path,
+            "alice",
+            "secret1",
+            &[("If-Match", &contact_etag)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(contact_delete.status(), StatusCode::NO_CONTENT);
+    }
+
     /// The bare-root `current-user-principal` splice (CLOUD-6) must
     /// advertise whichever account actually authenticated this specific
     /// request, not a single fixed account -- the bug `principal_href_for`
@@ -1299,6 +1462,50 @@ mod tests {
         let get = request_as(&app, "GET", "/f.txt", "alice", "secret1", &[], Vec::new()).await;
         assert_eq!(get.status(), StatusCode::OK);
         assert_eq!(body_string(get).await, "0123456789");
+
+        let versions = request_as(
+            &app,
+            "PROPFIND",
+            "/remote.php/dav/versions/alice/f.txt",
+            "alice",
+            "secret1",
+            &[("Depth", "1")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(versions.status(), multi_status());
+        assert!(!body_string(versions).await.contains("<d:response>"));
+    }
+
+    #[tokio::test]
+    async fn quota_rejected_ui_overwrite_does_not_create_a_version() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 20)]).await;
+        let first = upload_via_ui(&app, "alice", "secret1", "/", "f.txt", b"0123456789").await;
+        assert_eq!(first.status(), StatusCode::SEE_OTHER);
+
+        let rejected = upload_via_ui(
+            &app,
+            "alice",
+            "secret1",
+            "/",
+            "f.txt",
+            b"replacement exceeds the remaining quota",
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::from_u16(507).unwrap());
+
+        let versions = request_as(
+            &app,
+            "PROPFIND",
+            "/remote.php/dav/versions/alice/f.txt",
+            "alice",
+            "secret1",
+            &[("Depth", "1")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(versions.status(), multi_status());
+        assert!(!body_string(versions).await.contains("<d:response>"));
     }
 
     /// Quota is per-user, not shared: alice being nearly out of quota
@@ -1899,6 +2106,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ui_rejects_cross_site_mutation_posts() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
+        let response = request_as(
+            &app,
+            "POST",
+            "/ui/mkdir",
+            "alice",
+            "secret1",
+            &[
+                ("Content-Type", "application/x-www-form-urlencoded"),
+                ("Sec-Fetch-Site", "cross-site"),
+            ],
+            b"dir=%2F&name=forbidden".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let listing = request_as(
+            &app,
+            "GET",
+            "/ui/files/",
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert!(!body_string(listing).await.contains("forbidden"));
+    }
+
+    #[tokio::test]
     async fn ui_delete_soft_deletes_through_the_real_trash_and_disappears_from_the_listing() {
         let (_dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
         upload_via_ui(&app, "alice", "secret1", "/", "throwaway.txt", b"bye").await;
@@ -2427,5 +2665,100 @@ mod tests {
             html.contains(r#"class="quota-bar warn""#),
             "expected the quota bar to carry the warn class at 85% of a 100-byte quota: {html}"
         );
+    }
+    struct ObservedBodyReader {
+        reader: tokio::io::DuplexStream,
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl tokio::io::AsyncRead for ObservedBodyReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+            }
+            std::pin::Pin::new(&mut self.reader).poll_read(cx, buffer)
+        }
+    }
+
+    async fn simultaneous_conditional_puts(
+        app: &Router,
+        uri: &str,
+        condition: (&str, &str),
+        first: Vec<u8>,
+        second: Vec<u8>,
+    ) -> (Response, Response) {
+        use tokio::io::AsyncWriteExt;
+        let mut writers = Vec::new();
+        let mut tasks = Vec::new();
+        let mut starts = Vec::new();
+        for _ in 0..2 {
+            let (writer, reader) = tokio::io::duplex(4096);
+            let (start, started) = tokio::sync::oneshot::channel();
+            let body = Body::from_stream(tokio_util::io::ReaderStream::new(ObservedBodyReader {
+                reader,
+                started: Some(start),
+            }));
+            let request = Request::builder()
+                .method("PUT")
+                .uri(uri)
+                .header("Authorization", basic_auth("alice", "secret1"))
+                .header(condition.0, condition.1)
+                .body(body)
+                .unwrap();
+            let app = app.clone();
+            tasks.push(tokio::spawn(
+                async move { app.oneshot(request).await.unwrap() },
+            ));
+            starts.push(started);
+            writers.push(writer);
+        }
+        // Both handlers reached body reading before either receives content.
+        // Checking preconditions before that await recreates the lost-update
+        // bug deterministically; checking under the shared gate avoids it.
+        for started in starts {
+            tokio::time::timeout(std::time::Duration::from_secs(5), started)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        writers[0].write_all(&first).await.unwrap();
+        writers[1].write_all(&second).await.unwrap();
+        drop(writers);
+        let second = tasks.pop().unwrap();
+        let first = tasks.pop().unwrap();
+        (first.await.unwrap(), second.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn conditional_calendar_and_contact_mutations_are_atomic_across_requests() {
+        let (dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
+        for (uri, template, calendar) in [
+            ("/remote.php/dav/calendars/alice/personal/concurrent.ics", "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:concurrent\r\nDTSTART:20260401T090000Z\r\nSUMMARY:VALUE\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n", true),
+            ("/remote.php/dav/addressbooks/alice/contacts/concurrent.vcf", "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:concurrent\r\nFN:VALUE\r\nEND:VCARD\r\n", false),
+        ] {
+            let initial = template.replace("VALUE", "initial").into_bytes();
+            assert_eq!(request_as(&app, "PUT", uri, "alice", "secret1", &[], initial).await.status(), StatusCode::CREATED);
+            let read = request_as(&app, "GET", uri, "alice", "secret1", &[], vec![]).await;
+            let etag = read.headers().get("ETag").unwrap().to_str().unwrap().to_string();
+            let first = template.replace("VALUE", "first").into_bytes();
+            let second = template.replace("VALUE", "second").into_bytes();
+            let (a, b) = simultaneous_conditional_puts(&app, uri, ("If-Match", &etag), first.clone(), second.clone()).await;
+            assert!(matches!((a.status(), b.status()), (StatusCode::NO_CONTENT, StatusCode::PRECONDITION_FAILED) | (StatusCode::PRECONDITION_FAILED, StatusCode::NO_CONTENT)));
+            let read = request_as(&app, "GET", uri, "alice", "secret1", &[], vec![]).await;
+            let content = read.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(content.as_ref(), if a.status() == StatusCode::NO_CONTENT { first.as_slice() } else { second.as_slice() });
+            // The losing device's old ETag must also fail to delete the winner.
+            assert_eq!(request_as(&app, "DELETE", uri, "alice", "secret1", &[("If-Match", &etag)], vec![]).await.status(), StatusCode::PRECONDITION_FAILED);
+            assert_eq!(request_as(&app, "GET", uri, "alice", "secret1", &[], vec![]).await.status(), StatusCode::OK);
+            let create_uri = uri.replace("concurrent", "create-race");
+            let (a, b) = simultaneous_conditional_puts(&app, &create_uri, ("If-None-Match", "*"), first, second).await;
+            assert!(matches!((a.status(), b.status()), (StatusCode::CREATED, StatusCode::PRECONDITION_FAILED) | (StatusCode::PRECONDITION_FAILED, StatusCode::CREATED)));
+            let ctag = if calendar { CalendarStore::new(dirs._calendars.path()).ctag("alice", "personal").await.unwrap() } else { AddressbookStore::new(dirs._addressbooks.path()).ctag("alice", "contacts").await.unwrap() };
+            assert_eq!(ctag, "3", "only initial creation, winning update, and winning create record changes");
+        }
     }
 }

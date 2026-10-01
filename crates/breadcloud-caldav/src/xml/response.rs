@@ -296,6 +296,16 @@ pub struct EventEntry<'a> {
 /// `<d:response>` per matched/fetched event, each 200 OK with
 /// `getetag`/`calendar-data` as requested.
 pub fn calendar_object_multistatus(entries: &[EventEntry], props: &PropSet) -> String {
+    calendar_object_multistatus_with_missing(entries, &[], props)
+}
+
+/// REPORT response for `calendar-multiget`, including a 404 response for
+/// each requested href that could not be resolved.
+pub fn calendar_object_multistatus_with_missing(
+    entries: &[EventEntry],
+    missing_hrefs: &[String],
+    props: &PropSet,
+) -> String {
     let mut buf = String::new();
     multistatus_open(&mut buf);
     for entry in entries {
@@ -315,6 +325,13 @@ pub fn calendar_object_multistatus(entries: &[EventEntry], props: &PropSet) -> S
             }
         }
         render_response(&mut buf, &entry.href, &prop_list, &PropfindRequest::AllProp);
+    }
+    for href in missing_hrefs {
+        buf.push_str("  <d:response>\n    <d:href>");
+        buf.push_str(&escape(&encode_href(href)));
+        buf.push_str(
+            "</d:href>\n    <d:status>HTTP/1.1 404 Not Found</d:status>\n  </d:response>\n",
+        );
     }
     multistatus_close(&mut buf);
     buf

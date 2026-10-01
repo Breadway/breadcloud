@@ -32,6 +32,7 @@
 //! real content.
 
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 use axum::body::Body;
 use axum::extract::Request;
@@ -50,6 +51,7 @@ use crate::xml::{build_multistatus, PropfindRequest, ResourceEntry};
 /// exists to bound memory, not to match any particular client's chunk
 /// size.
 const MAX_CHUNK_BYTES: usize = 512 * 1024 * 1024;
+const STALE_TRANSFER_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 const UPLOADS_PREFIX: &str = "/remote.php/dav/uploads";
 
@@ -97,7 +99,16 @@ async fn handle_transfer_collection(
                 }
             }
             match state.uploads.mkcol(transfer_dir).await {
-                Ok(()) => StatusCode::CREATED.into_response(),
+                Ok(()) => {
+                    if let Some(user_dir) = transfer_dir.parent() {
+                        if let Err(err) =
+                            expire_stale_transfers(state, &user_dir, STALE_TRANSFER_AGE).await
+                        {
+                            tracing::warn!("failed to expire stale chunked uploads: {err}");
+                        }
+                    }
+                    StatusCode::CREATED.into_response()
+                }
                 Err(StorageError::AlreadyExists) => (
                     StatusCode::METHOD_NOT_ALLOWED,
                     "transfer collection already exists",
@@ -135,6 +146,18 @@ async fn handle_chunk(
                     return (StatusCode::BAD_REQUEST, "could not read chunk body").into_response()
                 }
             };
+            let _quota_guard = match state
+                .uploads
+                .quota_gate(
+                    state.upload_staging_limit_bytes,
+                    chunk_path,
+                    bytes.len() as u64,
+                )
+                .await
+            {
+                Ok(guard) => guard,
+                Err(err) => return storage_error_response(err),
+            };
             match state.uploads.write_bytes(chunk_path, &bytes).await {
                 Ok((WriteOutcome::Created, _)) => StatusCode::CREATED.into_response(),
                 Ok((WriteOutcome::Overwritten, _)) => StatusCode::NO_CONTENT.into_response(),
@@ -160,6 +183,37 @@ async fn handle_chunk(
         )
             .into_response(),
     }
+}
+
+/// Remove transfer collections with no activity for a week. Chunk mtimes
+/// are included because overwriting an existing chunk does not necessarily
+/// update the parent directory mtime.
+async fn expire_stale_transfers(
+    state: &AppState,
+    user_dir: &DavPath,
+    max_age: Duration,
+) -> Result<(), StorageError> {
+    let transfers = match state.uploads.list_dir(user_dir).await {
+        Ok(transfers) => transfers,
+        Err(StorageError::NotFound) => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let cutoff = SystemTime::now()
+        .checked_sub(max_age)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    for transfer in transfers
+        .into_iter()
+        .filter(|entry| entry.metadata.is_dir())
+    {
+        let mut last_activity = transfer.metadata.modified;
+        for child in state.uploads.list_recursive(&transfer.path).await? {
+            last_activity = last_activity.max(child.metadata.modified);
+        }
+        if last_activity < cutoff {
+            state.uploads.delete(&transfer.path).await?;
+        }
+    }
+    Ok(())
 }
 
 /// PROPFIND on a transfer collection: reports the chunks already landed
@@ -330,13 +384,17 @@ async fn finalize(state: &AppState, transfer_dir: &DavPath, headers: &HeaderMap)
     // is about to reject. Most files in a real synced dataset take this
     // chunked path rather than plain PUT (see CLOUD-3), so skipping this
     // here would leave versioning working only for small files.
-    if let Err(resp) = crate::versioning::snapshot_before_overwrite(state, &dest).await {
-        prepared.discard().await;
-        return resp;
-    }
+    let pending_snapshot = match crate::versioning::snapshot_before_overwrite(state, &dest).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            prepared.discard().await;
+            return storage_error_response(err);
+        }
+    };
 
     match state.storage.commit_assemble(prepared).await {
         Ok((outcome, total, etag)) => {
+            crate::versioning::finish_snapshot(state, &dest, pending_snapshot).await;
             let mtime_accepted = match crate::mtime::parse_oc_mtime(headers) {
                 Some(mtime) => crate::mtime::apply(state.storage.resolve(&dest), mtime),
                 None => false,
@@ -383,6 +441,44 @@ async fn finalize(state: &AppState, transfer_dir: &DavPath, headers: &HeaderMap)
             }
             builder.body(Body::empty()).unwrap()
         }
-        Err(err) => storage_error_response(err),
+        Err(err) => {
+            crate::versioning::discard_snapshot(state, &dest, pending_snapshot).await;
+            storage_error_response(err)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expire_stale_transfers;
+    use crate::state::AppState;
+    use breadcloud_storage::{DavPath, Storage, TrashStore, VersionStore};
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn stale_transfer_collections_are_removed() {
+        let storage_dir = TempDir::new().unwrap();
+        let uploads_dir = TempDir::new().unwrap();
+        let versions_dir = TempDir::new().unwrap();
+        let trash_dir = TempDir::new().unwrap();
+        let state = AppState::new(
+            Storage::new(storage_dir.path()),
+            Storage::new(uploads_dir.path()),
+            VersionStore::new(versions_dir.path()),
+            TrashStore::new(trash_dir.path()),
+        );
+        let user_dir = DavPath::parse("/alice").unwrap();
+        let transfer_dir = DavPath::parse("/alice/old-transfer").unwrap();
+        let chunk = DavPath::parse("/alice/old-transfer/1").unwrap();
+        state.uploads.mkcol(&user_dir).await.unwrap();
+        state.uploads.mkcol(&transfer_dir).await.unwrap();
+        state.uploads.write_bytes(&chunk, b"staged").await.unwrap();
+
+        expire_stale_transfers(&state, &user_dir, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(!state.uploads.exists(&transfer_dir).await);
     }
 }

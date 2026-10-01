@@ -218,6 +218,31 @@ async fn put_without_uid_is_bad_request() {
 }
 
 #[tokio::test]
+async fn put_rejects_control_characters_in_contact_names_before_writing() {
+    let (dir, app) = test_app().await;
+    for encoded_name in ["bad%0Aname.vcf", "bad%09name.vcf"] {
+        let response = put_contact(
+            &app,
+            &format!("/remote.php/dav/addressbooks/dev/contacts/{encoded_name}"),
+            &sample_contact("ctc-1", "Ada Lovelace"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let addressbooks = AddressbookStore::new(dir.path());
+    assert_eq!(addressbooks.ctag("dev", "contacts").await.unwrap(), "0");
+    let contacts = addressbooks
+        .contacts_storage("dev", "contacts")
+        .await
+        .unwrap();
+    for name in ["bad\nname.vcf", "bad\tname.vcf"] {
+        let path = breadcloud_storage::DavPath::parse(&format!("/{name}")).unwrap();
+        assert!(!contacts.exists(&path).await);
+    }
+}
+
+#[tokio::test]
 async fn put_into_a_nonexistent_addressbook_is_conflict() {
     let (_dir, app) = test_app().await;
     let vcf = sample_contact("ctc-1", "Ada Lovelace");
@@ -390,6 +415,54 @@ async fn addressbook_multiget_fetches_explicit_hrefs() {
     assert!(!body.contains("two.vcf"));
 }
 
+#[tokio::test]
+async fn addressbook_multiget_decodes_absolute_hrefs_and_reports_missing_objects() {
+    let (_dir, app) = test_app().await;
+    put_contact(
+        &app,
+        "/remote.php/dav/addressbooks/dev/contacts/space%20name.vcf",
+        &sample_contact("space", "Ada Lovelace"),
+    )
+    .await;
+
+    let report_body = r#"<?xml version="1.0"?>
+<c:addressbook-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav">
+  <d:prop><d:getetag/><c:address-data/></d:prop>
+  <d:href>https://dav.example.test/remote.php/dav/addressbooks/dev/contacts/space%20name.vcf</d:href>
+  <d:href>https://dav.example.test/remote.php/dav/addressbooks/dev/contacts/missing%20contact.vcf</d:href>
+</c:addressbook-multiget>"#;
+    let req = Request::builder()
+        .method("REPORT")
+        .uri("/remote.php/dav/addressbooks/dev/contacts/")
+        .body(Body::from(report_body))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status().as_u16(), 207);
+    let body = body_string(response).await;
+    assert!(body.contains("space%20name.vcf"));
+    assert!(body.contains("FN:Ada Lovelace"));
+    assert!(body.contains("missing%20contact.vcf"));
+    assert!(body.contains("HTTP/1.1 404 Not Found"));
+}
+
+#[tokio::test]
+async fn addressbook_multiget_reports_non_missing_storage_errors() {
+    let (dir, app) = test_app().await;
+    std::fs::create_dir_all(dir.path().join("dev/contacts/contacts/directory.vcf")).unwrap();
+    let report_body = r#"<?xml version="1.0"?>
+<c:addressbook-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav">
+  <d:prop><d:getetag/></d:prop>
+  <d:href>/remote.php/dav/addressbooks/dev/contacts/directory.vcf</d:href>
+</c:addressbook-multiget>"#;
+    let req = Request::builder()
+        .method("REPORT")
+        .uri("/remote.php/dav/addressbooks/dev/contacts/")
+        .body(Body::from(report_body))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
 /// The real data this issue targets is 76 contacts split across groups
 /// (Friends/ICE/starred/Family team); groups are ordinary vCards with
 /// `KIND:group` and `MEMBER:urn:uuid:<uid>` lines, not a separate
@@ -502,6 +575,28 @@ async fn sync_collection_initial_then_incremental() {
     assert!(body.contains("two.vcf"));
     assert!(body.contains("one.vcf</d:href>\n    <d:status>HTTP/1.1 404 Not Found</d:status>"));
     assert!(body.contains("<d:sync-token>breadcloud-sync:3</d:sync-token>"));
+}
+
+#[tokio::test]
+async fn sync_collection_rejects_malformed_and_future_tokens() {
+    let (_dir, app) = test_app().await;
+    for token in ["not-a-sync-token", "breadcloud-sync:1"] {
+        let report = format!(
+            "<d:sync-collection xmlns:d=\"DAV:\"><d:sync-token>{token}</d:sync-token><d:prop><d:getetag/></d:prop></d:sync-collection>"
+        );
+        let req = Request::builder()
+            .method("REPORT")
+            .uri("/remote.php/dav/addressbooks/dev/contacts/")
+            .body(Body::from(report))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "token: {token}");
+        let body = body_string(response).await;
+        assert!(
+            body.contains("<d:valid-sync-token/>"),
+            "token: {token}, body: {body}"
+        );
+    }
 }
 
 #[tokio::test]

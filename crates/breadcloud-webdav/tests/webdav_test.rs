@@ -313,6 +313,36 @@ async fn copy_duplicates_resource_and_leaves_source_intact() {
 }
 
 #[tokio::test]
+async fn copy_is_rejected_when_source_would_exceed_quota() {
+    let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app_with_quota(1000);
+    assert_eq!(
+        put(&app, "/source.bin", &"x".repeat(600)).await,
+        StatusCode::CREATED
+    );
+
+    let copy = Request::builder()
+        .method("COPY")
+        .uri("/source.bin")
+        .header("Destination", "/copy.bin")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(copy).await.unwrap().status(),
+        StatusCode::from_u16(507).unwrap()
+    );
+
+    let get = Request::builder()
+        .method("GET")
+        .uri("/copy.bin")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.oneshot(get).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
 async fn copy_collection_into_own_subdirectory_is_409() {
     let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app();
 
@@ -441,6 +471,129 @@ fn test_app_with_quota(limit_bytes: u64) -> (TempDir, TempDir, TempDir, TempDir,
     (dir, uploads_dir, versions_dir, trash_dir, router(state))
 }
 
+fn test_app_with_staging_limit(
+    limit_bytes: u64,
+) -> (TempDir, TempDir, TempDir, TempDir, axum::Router) {
+    let dir = TempDir::new().unwrap();
+    let uploads_dir = TempDir::new().unwrap();
+    let versions_dir = TempDir::new().unwrap();
+    let trash_dir = TempDir::new().unwrap();
+    let state = AppState::new(
+        Storage::new(dir.path()),
+        Storage::new(uploads_dir.path()),
+        VersionStore::new(versions_dir.path()),
+        TrashStore::new(trash_dir.path()),
+    )
+    .with_upload_staging_limit_bytes(limit_bytes);
+    (dir, uploads_dir, versions_dir, trash_dir, router(state))
+}
+
+#[tokio::test]
+async fn staged_chunk_bytes_are_capped_across_transfers_for_one_user() {
+    let (_dir, uploads_dir, _versions_dir, _trash_dir, app) = test_app_with_staging_limit(10);
+    for transfer in ["txn1", "txn2"] {
+        let mkcol = Request::builder()
+            .method("MKCOL")
+            .uri(format!("/remote.php/dav/uploads/alice/{transfer}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(mkcol).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+    }
+
+    let first_chunk = Request::builder()
+        .method("PUT")
+        .uri("/remote.php/dav/uploads/alice/txn1/1")
+        .body(Body::from(vec![b'x'; 8]))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(first_chunk).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    let over_limit_chunk = Request::builder()
+        .method("PUT")
+        .uri("/remote.php/dav/uploads/alice/txn2/1")
+        .body(Body::from(vec![b'y'; 4]))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(over_limit_chunk).await.unwrap().status(),
+        StatusCode::from_u16(507).unwrap()
+    );
+    assert_eq!(
+        Storage::new(uploads_dir.path()).used_bytes().await.unwrap(),
+        8
+    );
+}
+
+#[tokio::test]
+async fn mkcol_expires_only_transfers_inactive_for_seven_days() {
+    use std::time::{Duration, SystemTime};
+
+    let (_dir, uploads_dir, _versions_dir, _trash_dir, app) = test_app();
+    let old = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+    for transfer in ["stale", "active-chunk", "recent"] {
+        let mkcol = Request::builder()
+            .method("MKCOL")
+            .uri(format!("/remote.php/dav/uploads/alice/{transfer}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(mkcol).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+    }
+    for transfer in ["stale", "active-chunk"] {
+        let chunk = Request::builder()
+            .method("PUT")
+            .uri(format!("/remote.php/dav/uploads/alice/{transfer}/1"))
+            .body(Body::from("chunk"))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(chunk).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+    }
+    // Backdate both collections and chunks, then overwrite one old chunk.
+    // Its current mtime must keep that otherwise old transfer alive.
+    for transfer in ["stale", "active-chunk"] {
+        let path = uploads_dir.path().join("alice").join(transfer);
+        std::fs::File::open(path.join("1"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    let overwrite = Request::builder()
+        .method("PUT")
+        .uri("/remote.php/dav/uploads/alice/active-chunk/1")
+        .body(Body::from("new chunk"))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(overwrite).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    let trigger = Request::builder()
+        .method("MKCOL")
+        .uri("/remote.php/dav/uploads/alice/new")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.oneshot(trigger).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    let user = uploads_dir.path().join("alice");
+    assert!(!user.join("stale").exists());
+    assert!(user.join("active-chunk/1").exists());
+    assert!(user.join("recent").exists());
+    assert!(user.join("new").exists());
+}
+
 /// CLOUD-11 round 3: `prepare_assemble` used to stage the fully assembled
 /// content inside the account's live storage root before the quota check
 /// ran, so `used_bytes`'s recursive walk counted those staged bytes once
@@ -548,6 +701,43 @@ async fn chunked_finalize_over_quota_is_still_rejected() {
         .unwrap();
     let response = app.oneshot(get_dest).await.unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn trash_restore_is_rejected_when_it_would_exceed_quota() {
+    let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app_with_quota(1000);
+    assert_eq!(
+        put(&app, "/old.bin", &"o".repeat(700)).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(delete(&app, "/old.bin").await, StatusCode::NO_CONTENT);
+    assert_eq!(
+        put(&app, "/new.bin", &"n".repeat(500)).await,
+        StatusCode::CREATED
+    );
+
+    let (_status, xml) = propfind_trashbin(&app).await;
+    let href = extract_hrefs(&xml).into_iter().next().unwrap();
+    let restore = Request::builder()
+        .method("MOVE")
+        .uri(href)
+        .header("Destination", "/restored.bin")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(restore).await.unwrap().status(),
+        StatusCode::from_u16(507).unwrap()
+    );
+
+    let get = Request::builder()
+        .method("GET")
+        .uri("/restored.bin")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.oneshot(get).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
 }
 
 #[tokio::test]
@@ -1185,6 +1375,49 @@ async fn restore_with_explicit_overwrite_replaces_the_occupied_destination() {
         .unwrap();
     let response = app.oneshot(get).await.unwrap();
     assert_eq!(body_string(response).await, "old content");
+}
+
+#[tokio::test]
+async fn restore_rejects_the_storage_root_as_destination() {
+    let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app();
+
+    assert_eq!(
+        put(&app, "/keep.txt", "keep this file").await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        put(&app, "/a.txt", "trashed content").await,
+        StatusCode::CREATED
+    );
+    assert_eq!(delete(&app, "/a.txt").await, StatusCode::NO_CONTENT);
+
+    let (_status, xml) = propfind_trashbin(&app).await;
+    let href = extract_hrefs(&xml).into_iter().next().unwrap();
+
+    let restore = Request::builder()
+        .method("MOVE")
+        .uri(&href)
+        .header("Destination", "/")
+        .header("Overwrite", "T")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(restore).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let keep = Request::builder()
+        .method("GET")
+        .uri("/keep.txt")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(keep).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_string(response).await, "keep this file");
+
+    let (_status, xml) = propfind_trashbin(&app).await;
+    assert_eq!(xml.matches("<d:response>").count(), 1);
+    assert!(extract_hrefs(&xml).contains(&href));
 }
 
 #[tokio::test]

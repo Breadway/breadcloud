@@ -125,6 +125,23 @@ async fn create_then_get_roundtrips_a_note() {
 }
 
 #[tokio::test]
+async fn notes_json_mutations_require_application_json_content_type() {
+    let (_dirs, state) = test_state();
+    let body = serde_json::json!({"title": "Blocked", "content": "form submission"});
+    let response = breadcloud_notes::dispatch(
+        state,
+        Request::builder()
+            .method("POST")
+            .uri(format!("{BASE}/notes"))
+            .header("Content-Type", "text/plain")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
 async fn list_reflects_a_created_note_and_supports_exclude() {
     let (_dirs, state) = test_state();
     let create_body = serde_json::json!({"title": "todo", "content": "buy bread"});
@@ -272,6 +289,46 @@ async fn update_with_correct_if_match_succeeds_and_is_versioned() {
         versions.len(),
         1,
         "the v1 content should be captured as a version"
+    );
+}
+
+#[tokio::test]
+async fn quota_rejected_note_overwrite_does_not_create_a_version() {
+    let (_dirs, mut state) = test_state();
+    state.quota_limit_bytes = Some(64);
+
+    let created = breadcloud_notes::dispatch(
+        state.clone(),
+        req(
+            "POST",
+            "/notes",
+            serde_json::to_vec(&serde_json::json!({"title": "quota", "content": "v1"})).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let created_json = body_json(created).await;
+    let id = created_json["id"].as_str().unwrap().to_string();
+
+    let rejected = breadcloud_notes::dispatch(
+        state.clone(),
+        req(
+            "PUT",
+            &format!("/notes/{id}"),
+            serde_json::to_vec(&serde_json::json!({"content": "x".repeat(128)})).unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::INSUFFICIENT_STORAGE);
+
+    let versions = state
+        .versions
+        .list(&breadcloud_storage::DavPath::parse("/Notes/quota.md").unwrap())
+        .await
+        .unwrap();
+    assert!(
+        versions.is_empty(),
+        "a rejected write must not create a version"
     );
 }
 
@@ -452,6 +509,79 @@ fn upload_req(note_id: &str, boundary: &str, body: Vec<u8>) -> Request<Body> {
         )
         .body(Body::from(body))
         .unwrap()
+}
+
+#[tokio::test]
+async fn attachment_and_exclude_queries_decode_form_values_once() {
+    let (_dirs, state) = test_state();
+    let created = breadcloud_notes::dispatch(
+        state.clone(),
+        req(
+            "POST",
+            "/notes",
+            br#"{"title":"recipe","content":"bread"}"#.to_vec(),
+        ),
+    )
+    .await;
+    let id = body_json(created).await["id"].as_str().unwrap().to_string();
+    let boundary = "----breadcloud-query-decoding";
+    for (filename, encoded) in [
+        ("my photo+é.jpg", "my+photo%2B%C3%A9.jpg"),
+        ("literal%20.jpg", "literal%2520.jpg"),
+    ] {
+        let upload = breadcloud_notes::dispatch(
+            state.clone(),
+            upload_req(
+                &id,
+                boundary,
+                multipart_file_body(
+                    boundary,
+                    filename,
+                    "application/octet-stream",
+                    b"attachment bytes",
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(upload.status(), StatusCode::OK);
+        let downloaded = breadcloud_notes::dispatch(
+            state.clone(),
+            req(
+                "GET",
+                &format!("/attachment/{id}?path={encoded}"),
+                Vec::new(),
+            ),
+        )
+        .await;
+        assert_eq!(downloaded.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(downloaded.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"attachment bytes"
+        );
+    }
+    let invalid = breadcloud_notes::dispatch(
+        state.clone(),
+        req(
+            "GET",
+            &format!("/attachment/{id}?path=..%2Fphoto.jpg"),
+            Vec::new(),
+        ),
+    )
+    .await;
+    // Existing filename sanitization confines the lookup to attachments.
+    assert_eq!(invalid.status(), StatusCode::NOT_FOUND);
+    let listed = breadcloud_notes::dispatch(
+        state,
+        req("GET", "/notes?exclude=%74itle%2Ccontent", Vec::new()),
+    )
+    .await;
+    let json = body_json(listed).await;
+    assert!(json[0].get("title").is_none());
+    assert!(json[0].get("content").is_none());
+    assert!(json[0].get("id").is_some());
 }
 
 /// CLOUD-8 review round 1 found this live: 20 concurrent `POST /notes`
