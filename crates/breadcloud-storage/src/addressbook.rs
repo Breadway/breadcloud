@@ -50,8 +50,9 @@
 //! way `MKCALENDAR` does for calendars. `breadcloud-server` only
 //! bootstraps a single `contacts` addressbook per user by default.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use tokio::fs;
 use tokio::sync::Mutex as AsyncMutex;
@@ -80,6 +81,7 @@ pub struct AddressbookInfo {
 pub struct AddressbookStore {
     root: PathBuf,
     write_lock: Arc<AsyncMutex<()>>,
+    resource_locks: Arc<AsyncMutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>>,
 }
 
 impl AddressbookStore {
@@ -87,7 +89,35 @@ impl AddressbookStore {
         AddressbookStore {
             root: root.into(),
             write_lock: Arc::new(AsyncMutex::new(())),
+            resource_locks: Arc::new(AsyncMutex::new(HashMap::new())),
         }
+    }
+
+    /// Serialize one resource's conditional mutation across requests and
+    /// store clones, including change recording. Weak entries keep the map
+    /// bounded by active resources rather than every resource ever written.
+    pub async fn resource_gate(
+        &self,
+        user: &str,
+        addressbook_id: &str,
+        object: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, StorageError> {
+        let user = Self::validate_segment(user)?;
+        let collection = Self::validate_segment(addressbook_id)?;
+        let object = Self::validate_segment(object)?;
+        let key = self.root.join(user).join(collection).join(object);
+        let lock = {
+            let mut locks = self.resource_locks.lock().await;
+            locks.retain(|_, value| value.strong_count() > 0);
+            if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(AsyncMutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        Ok(lock.lock_owned().await)
     }
 
     pub fn root(&self) -> &std::path::Path {
