@@ -80,6 +80,7 @@ fn note_storage_error(err: StorageError) -> Response {
 
 fn parse_exclude(query: &str) -> Vec<String> {
     query_param(query, "exclude")
+        .map(sanitize_query_str)
         .map(|v| {
             v.split(',')
                 .map(str::to_string)
@@ -497,13 +498,14 @@ pub async fn attachment_get(state: &AppState, note_id: &str, query: &str) -> Res
     let Some(raw_name) = query_param(query, "path") else {
         return with_api_versions_header(error_response(StatusCode::BAD_REQUEST));
     };
+    let name = sanitize_query_str(raw_name);
     let Some((note_path, _)) = (match resolve(state, note_id).await {
         Ok(v) => v,
         Err(err) => return with_api_versions_header(note_storage_error(err)),
     }) else {
         return with_api_versions_header(not_found());
     };
-    let Some(attachment_path) = attachment_path(&note_path, note_id, raw_name) else {
+    let Some(attachment_path) = attachment_path(&note_path, note_id, &name) else {
         return with_api_versions_header(error_response(StatusCode::BAD_REQUEST));
     };
     with_api_versions_header(
@@ -725,7 +727,10 @@ async fn rename_attachments_dir(
 }
 
 fn sanitize_query_str(raw: &str) -> String {
-    percent_encoding::percent_decode_str(raw)
+    // Form query values use '+' for space. Replace it before decoding so
+    // an encoded literal plus (%2B) remains a plus in the filename.
+    let raw = raw.replace('+', " ");
+    percent_encoding::percent_decode_str(&raw)
         .decode_utf8_lossy()
         .into_owned()
 }

@@ -511,6 +511,79 @@ fn upload_req(note_id: &str, boundary: &str, body: Vec<u8>) -> Request<Body> {
         .unwrap()
 }
 
+#[tokio::test]
+async fn attachment_and_exclude_queries_decode_form_values_once() {
+    let (_dirs, state) = test_state();
+    let created = breadcloud_notes::dispatch(
+        state.clone(),
+        req(
+            "POST",
+            "/notes",
+            br#"{"title":"recipe","content":"bread"}"#.to_vec(),
+        ),
+    )
+    .await;
+    let id = body_json(created).await["id"].as_str().unwrap().to_string();
+    let boundary = "----breadcloud-query-decoding";
+    for (filename, encoded) in [
+        ("my photo+é.jpg", "my+photo%2B%C3%A9.jpg"),
+        ("literal%20.jpg", "literal%2520.jpg"),
+    ] {
+        let upload = breadcloud_notes::dispatch(
+            state.clone(),
+            upload_req(
+                &id,
+                boundary,
+                multipart_file_body(
+                    boundary,
+                    filename,
+                    "application/octet-stream",
+                    b"attachment bytes",
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(upload.status(), StatusCode::OK);
+        let downloaded = breadcloud_notes::dispatch(
+            state.clone(),
+            req(
+                "GET",
+                &format!("/attachment/{id}?path={encoded}"),
+                Vec::new(),
+            ),
+        )
+        .await;
+        assert_eq!(downloaded.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(downloaded.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"attachment bytes"
+        );
+    }
+    let invalid = breadcloud_notes::dispatch(
+        state.clone(),
+        req(
+            "GET",
+            &format!("/attachment/{id}?path=..%2Fphoto.jpg"),
+            Vec::new(),
+        ),
+    )
+    .await;
+    // Existing filename sanitization confines the lookup to attachments.
+    assert_eq!(invalid.status(), StatusCode::NOT_FOUND);
+    let listed = breadcloud_notes::dispatch(
+        state,
+        req("GET", "/notes?exclude=%74itle%2Ccontent", Vec::new()),
+    )
+    .await;
+    let json = body_json(listed).await;
+    assert!(json[0].get("title").is_none());
+    assert!(json[0].get("content").is_none());
+    assert!(json[0].get("id").is_some());
+}
+
 /// CLOUD-8 review round 1 found this live: 20 concurrent `POST /notes`
 /// with an identical title raced past `generate_filename`'s check-then-
 /// write gap (it checks a candidate filename is free, then returns --
