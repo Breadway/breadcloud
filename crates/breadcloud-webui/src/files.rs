@@ -251,7 +251,10 @@ pub async fn upload(state: &AppState, req: Request) -> Response {
     let Ok(parent) = DavPath::parse(&dir) else {
         return (StatusCode::BAD_REQUEST, "invalid target folder").into_response();
     };
-    let dest = parent.child(leaf);
+    let dest = match parent.child(leaf) {
+        Ok(path) => path,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid file name").into_response(),
+    };
     let data = data.unwrap_or_default();
 
     let _quota_guard = match state.quota_limit_bytes {
@@ -299,13 +302,10 @@ pub async fn mkdir(state: &AppState, req: Request) -> Response {
     let Ok(parent) = DavPath::parse(&dir) else {
         return (StatusCode::BAD_REQUEST, "invalid target folder").into_response();
     };
-    // Reject an embedded separator rather than letting it silently
-    // address a nested path: this form field is meant to name one new
-    // child of `parent`, not a multi-segment path.
-    if name.contains('/') {
-        return (StatusCode::BAD_REQUEST, "folder name cannot contain '/'").into_response();
-    }
-    let target = parent.child(name);
+    let target = match parent.child(name) {
+        Ok(path) => path,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid folder name").into_response(),
+    };
 
     let resp = breadcloud_webdav::handlers::mkcol::handle(state, &target).await;
     if resp.status().is_success() {
@@ -334,5 +334,46 @@ pub async fn delete(state: &AppState, req: Request) -> Response {
         Redirect::to(&encode_ui_path("/ui/files", &parent)).into_response()
     } else {
         resp
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use breadcloud_storage::{Storage, TrashStore, VersionStore};
+    use tempfile::TempDir;
+
+    fn test_state() -> (TempDir, TempDir, TempDir, TempDir, AppState) {
+        let root = TempDir::new().unwrap();
+        let uploads = TempDir::new().unwrap();
+        let versions = TempDir::new().unwrap();
+        let trash = TempDir::new().unwrap();
+        let state = AppState::new(
+            Storage::new(root.path()),
+            Storage::new(uploads.path()),
+            VersionStore::new(versions.path()),
+            TrashStore::new(trash.path()),
+        );
+        (root, uploads, versions, trash, state)
+    }
+
+    #[tokio::test]
+    async fn mkdir_rejects_invalid_child_names() {
+        let (_root, _uploads, _versions, _trash, state) = test_state();
+
+        for name in ["..", "nested%2Fname", "name%00suffix"] {
+            let request = Request::builder()
+                .method("POST")
+                .body(Body::from(format!("dir=%2F&name={name}")))
+                .unwrap();
+            let response = mkdir(&state, request).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "accepted invalid folder name {name:?}"
+            );
+        }
     }
 }
