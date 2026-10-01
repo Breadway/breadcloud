@@ -109,14 +109,15 @@ const AUTH_CACHE_CAPACITY: usize = 4096;
 const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const AUTH_FAILURE_LIMIT: usize = 5;
 const AUTH_FAILURE_BUCKET_CAPACITY: usize = 8192;
+type PeerUser = (IpAddr, String);
 
 #[derive(Default)]
 struct AuthProtection {
     cache_hasher: RandomState,
     successful: HashMap<u64, (String, Instant)>,
-    failures_by_ip: HashMap<IpAddr, VecDeque<Instant>>,
+    failures_by_peer_user: HashMap<PeerUser, VecDeque<Instant>>,
     failures_by_user: HashMap<String, VecDeque<Instant>>,
-    in_flight_by_ip: HashMap<IpAddr, usize>,
+    in_flight_by_peer_user: HashMap<PeerUser, usize>,
     in_flight_by_user: HashMap<String, usize>,
     in_flight: usize,
 }
@@ -154,12 +155,13 @@ impl AuthProtection {
     }
 
     fn check_allowed(&mut self, ip: IpAddr, user: &str, now: Instant) -> Result<(), Duration> {
-        prune_failure_bucket(&mut self.failures_by_ip, &ip, now);
+        let peer_user = (ip, user.to_owned());
+        prune_failure_bucket(&mut self.failures_by_peer_user, &peer_user, now);
         prune_failure_bucket(&mut self.failures_by_user, &user.to_string(), now);
-        let ip_retry = blocked_for(&self.failures_by_ip, &ip, now);
+        let peer_user_retry = blocked_for(&self.failures_by_peer_user, &peer_user, now);
         let user_retry = blocked_for(&self.failures_by_user, &user.to_string(), now);
-        match (ip_retry, user_retry) {
-            (Some(ip), Some(user)) => Err(ip.max(user)),
+        match (peer_user_retry, user_retry) {
+            (Some(peer_user), Some(user)) => Err(peer_user.max(user)),
             (Some(retry), None) | (None, Some(retry)) => Err(retry),
             (None, None) => Ok(()),
         }
@@ -174,27 +176,36 @@ impl AuthProtection {
         now: Instant,
     ) -> Result<(), Duration> {
         self.check_allowed(ip, user, now)?;
-        let ip_count = self.failures_by_ip.get(&ip).map_or(0, VecDeque::len)
-            + self.in_flight_by_ip.get(&ip).copied().unwrap_or(0);
+        let peer_user = (ip, user.to_owned());
+        let peer_user_count = self
+            .failures_by_peer_user
+            .get(&peer_user)
+            .map_or(0, VecDeque::len)
+            + self
+                .in_flight_by_peer_user
+                .get(&peer_user)
+                .copied()
+                .unwrap_or(0);
         let user_count = self.failures_by_user.get(user).map_or(0, VecDeque::len)
             + self.in_flight_by_user.get(user).copied().unwrap_or(0);
-        if ip_count >= AUTH_FAILURE_LIMIT
+        if peer_user_count >= AUTH_FAILURE_LIMIT
             || user_count >= AUTH_FAILURE_LIMIT
             || self.in_flight >= AUTH_FAILURE_BUCKET_CAPACITY
         {
             return Err(AUTH_FAILURE_WINDOW);
         }
-        *self.in_flight_by_ip.entry(ip).or_default() += 1;
+        *self.in_flight_by_peer_user.entry(peer_user).or_default() += 1;
         *self.in_flight_by_user.entry(user.to_owned()).or_default() += 1;
         self.in_flight += 1;
         Ok(())
     }
 
     fn finish_verification(&mut self, ip: IpAddr, user: &str, success: bool, now: Instant) {
-        if let Some(count) = self.in_flight_by_ip.get_mut(&ip) {
+        let peer_user = (ip, user.to_owned());
+        if let Some(count) = self.in_flight_by_peer_user.get_mut(&peer_user) {
             *count -= 1;
             if *count == 0 {
-                self.in_flight_by_ip.remove(&ip);
+                self.in_flight_by_peer_user.remove(&peer_user);
             }
         }
         if let Some(count) = self.in_flight_by_user.get_mut(user) {
@@ -210,7 +221,7 @@ impl AuthProtection {
     }
 
     fn record_failure(&mut self, ip: IpAddr, user: &str, now: Instant) {
-        add_failure(&mut self.failures_by_ip, ip, now);
+        add_failure(&mut self.failures_by_peer_user, (ip, user.to_owned()), now);
         add_failure(&mut self.failures_by_user, user.to_string(), now);
     }
 }
@@ -312,10 +323,12 @@ impl AccountStore {
             .flatten()
     }
 
-    /// Authenticate a request while tracking failed attempts against both
-    /// the peer address and the supplied username. The Basic auth header
-    /// is never retained: successful checks are cached for 15 seconds
-    /// under a process-keyed fast hash, with a fixed cache capacity.
+    /// Authenticate a request while tracking failures against the peer and
+    /// supplied username together, and against the username across peers.
+    /// A reverse proxy can share one peer address across unrelated users, so
+    /// the peer budget is account-aware. Forwarded headers are not trusted.
+    /// The Basic auth header is never retained: successful checks are cached
+    /// for 15 seconds under a process-keyed fast hash, with a fixed capacity.
     pub fn authenticate_request_from(
         &self,
         headers: &HeaderMap,
@@ -350,9 +363,9 @@ impl AccountStore {
             return Ok(Some(username));
         }
 
-        // Parse enough to choose the per-user bucket before the expensive
-        // Argon2 verify. Malformed credentials still consume the per-IP
-        // budget, using an empty username bucket.
+        // Parse enough to choose the peer/user and per-user buckets before
+        // the expensive Argon2 verify. Malformed credentials use an empty
+        // username in the peer bucket.
         let parsed = value
             .strip_prefix("Basic ")
             .and_then(|encoded| {
@@ -474,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_authentication_is_limited_by_ip_and_username() {
+    fn failed_authentication_is_limited_by_peer_user_and_username() {
         let store = AccountStore::new(vec![Account::new("alice", "secret1", 100)]);
         let headers = headers_with_basic_auth("alice", "wrong");
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
@@ -483,12 +496,82 @@ mod tests {
         }
         assert!(store.authenticate_request_from(&headers, ip).is_err());
 
-        // The username bucket applies across source addresses, and the IP
-        // bucket applies across usernames.
+        // The username bucket applies across source addresses.
         let other_ip: IpAddr = "192.0.2.2".parse().unwrap();
         assert!(store.authenticate_request_from(&headers, other_ip).is_err());
-        let other_user = headers_with_basic_auth("bob", "wrong");
-        assert!(store.authenticate_request_from(&other_user, ip).is_err());
+    }
+
+    #[test]
+    fn users_sharing_a_proxy_peer_have_independent_limits_without_trusting_forwarded_headers() {
+        let store = AccountStore::new(vec![
+            Account::new("alice", "alice-secret", 100),
+            Account::new("bob", "bob-secret", 100),
+        ]);
+        let proxy_peer: IpAddr = "192.0.2.80".parse().unwrap();
+
+        for attempt in 0..AUTH_FAILURE_LIMIT {
+            let mut headers = headers_with_basic_auth("alice", "wrong");
+            headers.insert(
+                "X-Forwarded-For",
+                format!("198.51.100.{}", attempt + 1).parse().unwrap(),
+            );
+            assert_eq!(
+                store.authenticate_with_verifier(&headers, proxy_peer, |account, _| {
+                    assert_eq!(account.username, "alice");
+                    false
+                }),
+                Ok(None)
+            );
+        }
+
+        let mut blocked_alice = headers_with_basic_auth("alice", "wrong");
+        blocked_alice.insert("X-Forwarded-For", "203.0.113.10".parse().unwrap());
+        assert!(store
+            .authenticate_with_verifier(&blocked_alice, proxy_peer, |_, _| {
+                panic!("throttled request must not enter password verification")
+            })
+            .is_err());
+
+        let bob = headers_with_basic_auth("bob", "wrong");
+        for _ in 0..AUTH_FAILURE_LIMIT {
+            assert_eq!(
+                store.authenticate_with_verifier(&bob, proxy_peer, |account, _| {
+                    assert_eq!(account.username, "bob");
+                    false
+                }),
+                Ok(None)
+            );
+        }
+        assert!(store
+            .authenticate_with_verifier(&bob, proxy_peer, |_, _| {
+                panic!("throttled request must not enter password verification")
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn unknown_user_is_dummy_verified_then_throttled_per_peer_and_name() {
+        let store = AccountStore::new(vec![Account::new("alice", "secret1", 100)]);
+        let proxy_peer: IpAddr = "192.0.2.80".parse().unwrap();
+        let headers = headers_with_basic_auth("unknown", "wrong");
+        let mut verified = 0;
+
+        for _ in 0..AUTH_FAILURE_LIMIT {
+            assert_eq!(
+                store.authenticate_with_verifier(&headers, proxy_peer, |account, _| {
+                    assert!(account.username.is_empty());
+                    verified += 1;
+                    false
+                }),
+                Ok(None)
+            );
+        }
+        assert!(store
+            .authenticate_with_verifier(&headers, proxy_peer, |_, _| {
+                panic!("throttled unknown user must not enter password verification")
+            })
+            .is_err());
+        assert_eq!(verified, AUTH_FAILURE_LIMIT);
     }
 
     #[test]
@@ -530,6 +613,10 @@ mod tests {
             let protection = store.protection.lock().unwrap();
             assert_eq!(protection.in_flight, AUTH_FAILURE_LIMIT);
             assert_eq!(protection.in_flight_by_user["alice"], AUTH_FAILURE_LIMIT);
+            assert_eq!(
+                protection.in_flight_by_peer_user[&("192.0.2.1".parse().unwrap(), "alice".into())],
+                AUTH_FAILURE_LIMIT
+            );
         }
         barrier.wait();
         let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
@@ -543,7 +630,7 @@ mod tests {
         );
         let protection = store.protection.lock().unwrap();
         assert_eq!(protection.in_flight, 0);
-        assert!(protection.in_flight_by_ip.is_empty());
+        assert!(protection.in_flight_by_peer_user.is_empty());
         assert!(protection.in_flight_by_user.is_empty());
         assert_eq!(
             protection.failures_by_user["alice"].len(),
@@ -563,7 +650,8 @@ mod tests {
         assert!(protection
             .reserve_verification(other, "alice", now)
             .is_err());
-        assert!(protection.reserve_verification(ip, "bob", now).is_err());
+        protection.reserve_verification(ip, "bob", now).unwrap();
+        protection.finish_verification(ip, "bob", true, now);
         protection.finish_verification(ip, "alice", true, now);
         protection
             .reserve_verification(other, "alice", now)
