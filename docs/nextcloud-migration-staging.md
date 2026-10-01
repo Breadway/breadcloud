@@ -26,6 +26,8 @@ from Contacts settings ([Calendar guide](https://docs.nextcloud.com/server/lates
 Files can be enumerated and downloaded with authenticated WebDAV. Nextcloud
 exposes prior file versions through its own file-id based versions endpoint
 ([versions guide](https://docs.nextcloud.com/server/stable/developer_manual/client_apis/WebDAV/versions.html)).
+The WebDAV guide documents the authenticated `/remote.php/dav` endpoint,
+`PROPFIND`, and `GET` for objects ([WebDAV guide](https://docs.nextcloud.com/server/stable/developer_manual/client_apis/WebDAV/basic.html)).
 
 Breadcloud accepts ordinary WebDAV writes for current files, calendar objects,
 and contacts. Its version history is path based, created by overwriting an
@@ -74,15 +76,16 @@ before import. Never raise the production quota as part of this plan.
    Reject path traversal, duplicate normalized paths, and symlinks whose
    targets escape the export root. Retry interrupted downloads and verify the
    completed file against its recorded size and digest.
-6. Export each of the three calendars as a separate `.ics` file and the
-   contacts address book as `.vcf`. Keep each collection separate. Record the
-   collection name, object count, and a digest for each export. If a collection
-   export bundles multiple resources, split it into individual CardDAV contact
-   objects and CalDAV calendar objects for import. Keep all components that
-   share an event UID together so recurring overrides are not separated.
-   Validate that every event/contact has a stable UID and that recurring rules,
-   time zones, attendees, contact groups, and embedded attachments are
-   represented before accepting the export.
+6. For each of the three calendars and the contacts address book, enumerate
+   resource hrefs with authenticated `PROPFIND` at depth 1, then `GET` every
+   resource. Keep each source resource as its own object and record its source
+   href, ETag, size, UID, and digest in the private manifest. Also export each
+   calendar as `.ics` and the address book as `.vcf` through the UI as an
+   independent reconciliation copy. Keep collections separate. Confirm the
+   UI export's event/contact counts and UIDs match the DAV object list. Keep
+   all components that share an event UID together so recurring overrides are
+   not separated. Validate recurring rules, time zones, attendees, contact
+   groups, and embedded attachments before accepting the export.
 7. Enumerate retained file versions through Nextcloud's documented versions
    WebDAV endpoint. Save the returned metadata and each version payload under
    a private per-file history directory, keyed by source relative path and
@@ -102,7 +105,8 @@ before import. Never raise the production quota as part of this plan.
    the public service and its account untouched.
 2. Create the three target calendar collections and the contacts collection
    in the disposable instance. Import each calendar object and each vCard
-   object without flattening or rewriting UIDs. Keep recurrence exception
+   object without flattening or rewriting UIDs. Retain each source object's
+   resource mapping in the private manifest. Keep recurrence exception
    components with their matching master event. Stop on a conflict rather than
    overwriting a different object.
 3. Import current files under their original relative paths. Create parent
