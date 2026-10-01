@@ -82,18 +82,18 @@ pub async fn dispatch(webdav: AppState, req: Request) -> Response {
         (NotesRoute::Notes, "GET") => handlers::list(&webdav, &headers, &query).await,
         (NotesRoute::Notes, "POST") => match handlers::read_json_body(req).await {
             Ok(body) => handlers::create(&webdav, &body).await,
-            Err(resp) => resp,
+            Err(resp) => *resp,
         },
         (NotesRoute::Note(id), "GET") => handlers::get(&webdav, &id).await,
         (NotesRoute::Note(id), "PUT") => match handlers::read_json_body(req).await {
             Ok(body) => handlers::update(&webdav, &id, &headers, &body).await,
-            Err(resp) => resp,
+            Err(resp) => *resp,
         },
         (NotesRoute::Note(id), "DELETE") => handlers::delete(&webdav, &id).await,
         (NotesRoute::Settings, "GET") => handlers::settings_get().await,
         (NotesRoute::Settings, "PUT") => match handlers::read_json_body(req).await {
             Ok(body) => handlers::settings_put(&body).await,
-            Err(resp) => resp,
+            Err(resp) => *resp,
         },
         (NotesRoute::Attachment(id), "GET") => handlers::attachment_get(&webdav, &id, &query).await,
         (NotesRoute::Attachment(id), "POST") => {

@@ -288,9 +288,8 @@ async fn upload_with_limit(state: &AppState, req: Request, max_bytes: u64) -> Re
         None => None,
     };
 
-    if let Err(resp) = breadcloud_webdav::versioning::snapshot_before_overwrite(state, &dest).await
-    {
-        return resp;
+    if let Err(err) = breadcloud_webdav::versioning::snapshot_before_overwrite(state, &dest).await {
+        return breadcloud_webdav::error::storage_error_response(err);
     }
     match prepared.commit(&state.storage).await {
         Ok(_) => Redirect::to(&encode_ui_path("/ui/files", &parent)).into_response(),

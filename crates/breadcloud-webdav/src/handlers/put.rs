@@ -78,8 +78,8 @@ async fn handle_with_limit(
     // exist, which `write_bytes` enforces (409 Conflict otherwise).
     // Snapshot only after the body and quota have been accepted, and
     // immediately before the atomic replacement is committed.
-    if let Err(resp) = crate::versioning::snapshot_before_overwrite(state, path).await {
-        return resp;
+    if let Err(err) = crate::versioning::snapshot_before_overwrite(state, path).await {
+        return storage_error_response(err);
     }
     let (outcome, total, etag) = match prepared.commit(&state.storage).await {
         Ok(v) => v,
