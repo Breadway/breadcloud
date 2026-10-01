@@ -218,6 +218,14 @@ async fn restore(state: &AppState, id: &str, headers: &HeaderMap) -> Response {
         entry.original_path.clone()
     };
 
+    if dest_path.is_root() {
+        return (
+            StatusCode::FORBIDDEN,
+            "cannot restore a trash entry over the storage root",
+        )
+            .into_response();
+    }
+
     let overwrite = headers
         .get("Overwrite")
         .and_then(|v| v.to_str().ok())

@@ -1188,6 +1188,49 @@ async fn restore_with_explicit_overwrite_replaces_the_occupied_destination() {
 }
 
 #[tokio::test]
+async fn restore_rejects_the_storage_root_as_destination() {
+    let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app();
+
+    assert_eq!(
+        put(&app, "/keep.txt", "keep this file").await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        put(&app, "/a.txt", "trashed content").await,
+        StatusCode::CREATED
+    );
+    assert_eq!(delete(&app, "/a.txt").await, StatusCode::NO_CONTENT);
+
+    let (_status, xml) = propfind_trashbin(&app).await;
+    let href = extract_hrefs(&xml).into_iter().next().unwrap();
+
+    let restore = Request::builder()
+        .method("MOVE")
+        .uri(&href)
+        .header("Destination", "/")
+        .header("Overwrite", "T")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(restore).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let keep = Request::builder()
+        .method("GET")
+        .uri("/keep.txt")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(keep).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_string(response).await, "keep this file");
+
+    let (_status, xml) = propfind_trashbin(&app).await;
+    assert_eq!(xml.matches("<d:response>").count(), 1);
+    assert!(extract_hrefs(&xml).contains(&href));
+}
+
+#[tokio::test]
 async fn delete_on_trashbin_entry_purges_it_permanently() {
     let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app();
 
