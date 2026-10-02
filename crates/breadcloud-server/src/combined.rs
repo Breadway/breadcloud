@@ -186,11 +186,11 @@ fn is_browser_root_navigation(method: &Method, path: &str, headers: &HeaderMap) 
 async fn dispatch(State(state): State<CombinedState>, req: Request) -> Response {
     let path = req.uri().path().to_string();
 
-    let authed_user = req
-        .extensions()
-        .get::<AuthenticatedUser>()
-        .map(|u| u.0.clone())
-        .unwrap_or_else(|| state.default_user.clone());
+    let authed_user = match req.extensions().get::<AuthenticatedUser>() {
+        Some(user) => user.0.clone(),
+        None if state.accounts.is_empty() => state.default_user.clone(),
+        None => return unauthorized(),
+    };
 
     // CLOUD-11: the URL's own account segment (if it has one) is
     // client-supplied and must never be trusted on its own to pick whose
@@ -441,17 +441,17 @@ fn xml_escape(input: &str) -> String {
 async fn auth_gate(State(state): State<CombinedState>, mut req: Request, next: Next) -> Response {
     let path = req.uri().path();
 
-    // The same "first request, before the client has credentials to
-    // send" exemptions `breadcloud_webdav::auth` (status.php) and each
-    // protocol crate's own standalone router (`.well-known/caldav`,
-    // `.well-known/carddav`) carve out individually -- applied once here,
-    // since this combined app bypasses every crate's own auth layer in
-    // favor of this single shared gate.
-    if req.method() == Method::GET && path.ends_with("/status.php") {
-        return next.run(req).await;
+    // These discovery responses are static and do not need an account
+    // identity. Answer them here so unauthenticated requests never reach
+    // dispatch, where an account would otherwise have to be selected.
+    if req.method() == Method::GET && path == "/status.php" {
+        return breadcloud_webdav::handlers::discovery::status();
     }
-    if path == "/.well-known/caldav" || path == "/.well-known/carddav" {
-        return next.run(req).await;
+    if req.method() == Method::GET && path == "/.well-known/caldav" {
+        return breadcloud_caldav::handlers::discovery::well_known();
+    }
+    if req.method() == Method::GET && path == "/.well-known/carddav" {
+        return breadcloud_carddav::handlers::discovery::well_known();
     }
 
     if state.accounts.is_empty() {
@@ -850,6 +850,38 @@ mod tests {
             .unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn status_php_paths_do_not_bypass_auth_for_web_ui_files() {
+        let (dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
+
+        let file = dirs._storage.path().join("alice/site/status.php");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "private site content").unwrap();
+
+        let folder = dirs._storage.path().join("alice/status.php");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("secret.txt"), "private folder content").unwrap();
+
+        for uri in ["/ui/download/site/status.php", "/ui/files/status.php"] {
+            let req = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+
+        let status = Request::builder()
+            .method("GET")
+            .uri("/status.php")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(status).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_string(response).await.contains("\"installed\":true"));
     }
 
     /// The core file-isolation regression: what user A writes must be
