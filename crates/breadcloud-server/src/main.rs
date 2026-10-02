@@ -52,6 +52,24 @@ struct LoadedAccounts {
     default_user: String,
 }
 
+fn legacy_credentials(
+    username: Option<String>,
+    password: Option<String>,
+) -> Option<(String, String)> {
+    match (username, password) {
+        (Some(username), Some(password)) => Some((username, password)),
+        (None, None) => None,
+        (Some(_), None) => panic!("BREADCLOUD_USER is set but BREADCLOUD_PASS is not"),
+        (None, Some(_)) => panic!("BREADCLOUD_PASS is set but BREADCLOUD_USER is not"),
+    }
+}
+
+fn validate_open_mode_bind(accounts_configured: bool, addr: SocketAddr) {
+    if !accounts_configured && !addr.ip().is_loopback() {
+        panic!("open mode requires BREADCLOUD_BIND to use a loopback address");
+    }
+}
+
 /// Load the account set from environment variables, trying three shapes
 /// in order (see the workspace README's "Multi-user accounts" section for
 /// the full reasoning):
@@ -107,9 +125,10 @@ fn load_accounts() -> LoadedAccounts {
         };
     }
 
-    let legacy_user = std::env::var("BREADCLOUD_USER").ok();
-    let legacy_pass = std::env::var("BREADCLOUD_PASS").ok();
-    if let (Some(username), Some(password)) = (legacy_user, legacy_pass) {
+    if let Some((username, password)) = legacy_credentials(
+        std::env::var("BREADCLOUD_USER").ok(),
+        std::env::var("BREADCLOUD_PASS").ok(),
+    ) {
         let quota_bytes = DEFAULT_LEGACY_QUOTA_GIB * GIB;
         quota_by_user.insert(username.clone(), quota_bytes);
         let default_user = username.clone();
@@ -133,8 +152,7 @@ fn load_accounts() -> LoadedAccounts {
 /// unset), creating it if it does not exist and canonicalizing the
 /// result.
 fn resolve_root(env_var: &str, default: &str) -> PathBuf {
-    let root = std::env::var(env_var).unwrap_or_else(|_| default.to_string());
-    let root = PathBuf::from(root);
+    let root = root_path(std::env::var_os(env_var), default);
     if !root.exists() {
         std::fs::create_dir_all(&root).unwrap_or_else(|e| {
             panic!(
@@ -149,6 +167,12 @@ fn resolve_root(env_var: &str, default: &str) -> PathBuf {
             root.display()
         )
     })
+}
+
+fn root_path(configured: Option<std::ffi::OsString>, default: &str) -> PathBuf {
+    configured
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(default))
 }
 
 /// One account's subdirectory of `base` (CLOUD-11), or `base` itself when
@@ -179,18 +203,10 @@ async fn main() {
     // Staging area for in-progress chunked uploads (see
     // breadcloud_webdav::handlers::uploads). Kept out of BREADCLOUD_ROOT
     // entirely -- not just dot-hidden inside it -- so a PROPFIND of the
-    // real tree can never see someone's in-flight upload chunks. Falls
-    // back to the system temp dir rather than a sibling directory, unlike
-    // the roots below, since it never needs to persist across restarts.
-    let uploads_root = std::env::var("BREADCLOUD_UPLOADS_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("breadcloud-uploads"));
-    if !uploads_root.exists() {
-        std::fs::create_dir_all(&uploads_root).expect("failed to create uploads staging root");
-    }
-    let uploads_root = uploads_root
-        .canonicalize()
-        .expect("failed to resolve uploads staging root");
+    // real tree can never see someone's in-flight upload chunks. Its
+    // default is a sibling directory so chunks avoid tmpfs pressure,
+    // world-writable temporary paths, and systemd-tmpfiles cleanup.
+    let uploads_root = resolve_root("BREADCLOUD_UPLOADS_ROOT", "./breadcloud-uploads");
 
     // Per-file version history (CLOUD-4), soft-delete trash (CLOUD-5),
     // calendars (CLOUD-6), and addressbooks (CLOUD-7): all outside
@@ -198,6 +214,11 @@ async fn main() {
     // default to sibling directories (rather than the system temp dir)
     // since, unlike uploads staging, they need to persist across
     // restarts.
+    let assembly_root = resolve_root("BREADCLOUD_ASSEMBLY_ROOT", "./breadcloud-assembly");
+    if assembly_root.starts_with(&root) || root.starts_with(&assembly_root) {
+        panic!("BREADCLOUD_ASSEMBLY_ROOT must be outside BREADCLOUD_ROOT");
+    }
+
     let versions_root = resolve_root("BREADCLOUD_VERSIONS_ROOT", "./breadcloud-versions");
     let trash_root = resolve_root("BREADCLOUD_TRASH_ROOT", "./breadcloud-trash");
     let calendars_root = resolve_root("BREADCLOUD_CALENDARS_ROOT", "./breadcloud-calendars");
@@ -210,6 +231,7 @@ async fn main() {
         .expect("BREADCLOUD_BIND must be a valid address, e.g. 127.0.0.1:8080");
 
     let loaded = load_accounts();
+    validate_open_mode_bind(!loaded.accounts.is_empty(), addr);
     let usernames: Vec<String> = if loaded.accounts.is_empty() {
         vec![loaded.default_user.clone()]
     } else {
@@ -232,7 +254,12 @@ async fn main() {
             per_user_dir(&versions_root, username, loaded.nest_storage_per_user);
         let user_trash_root = per_user_dir(&trash_root, username, loaded.nest_storage_per_user);
 
-        let storage = Storage::new(user_root);
+        let user_assembly_root =
+            per_user_dir(&assembly_root, username, loaded.nest_storage_per_user);
+        let storage =
+            Storage::with_staging_root(user_root, user_assembly_root).unwrap_or_else(|error| {
+                panic!("invalid BREADCLOUD_ASSEMBLY_ROOT for {username}: {error}")
+            });
         let uploads = Storage::new(user_uploads_root);
         let versions = VersionStore::new(user_versions_root);
         let trash = TrashStore::new(user_trash_root);
@@ -327,5 +354,62 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
-    axum::serve(listener, app).await.expect("server error");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .expect("server error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{legacy_credentials, root_path, validate_open_mode_bind};
+    use std::ffi::OsString;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+
+    #[test]
+    fn legacy_credentials_require_both_values_or_neither() {
+        assert_eq!(
+            legacy_credentials(Some("alice".to_string()), Some("secret".to_string())),
+            Some(("alice".to_string(), "secret".to_string()))
+        );
+        assert_eq!(legacy_credentials(None, None), None);
+        assert!(
+            std::panic::catch_unwind(|| legacy_credentials(Some("alice".to_string()), None))
+                .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| legacy_credentials(None, Some("secret".to_string())))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn open_mode_is_limited_to_loopback_bind_addresses() {
+        let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let wildcard: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        validate_open_mode_bind(false, loopback);
+        assert!(std::panic::catch_unwind(|| validate_open_mode_bind(false, wildcard)).is_err());
+        validate_open_mode_bind(true, wildcard);
+    }
+
+    #[test]
+    fn uploads_root_default_is_a_sibling_not_system_temp() {
+        let uploads_root = root_path(None, "./breadcloud-uploads");
+
+        assert_eq!(uploads_root, PathBuf::from("./breadcloud-uploads"));
+        assert!(!uploads_root.starts_with(std::env::temp_dir()));
+    }
+
+    #[test]
+    fn uploads_root_environment_override_is_preserved() {
+        let uploads_root = root_path(
+            Some(OsString::from("/srv/breadcloud/uploads")),
+            "./breadcloud-uploads",
+        );
+
+        assert_eq!(uploads_root, PathBuf::from("/srv/breadcloud/uploads"));
+    }
 }

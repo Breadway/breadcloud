@@ -50,8 +50,9 @@
 //! way `MKCALENDAR` does for calendars. `breadcloud-server` only
 //! bootstraps a single `contacts` addressbook per user by default.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use tokio::fs;
 use tokio::sync::Mutex as AsyncMutex;
@@ -80,6 +81,7 @@ pub struct AddressbookInfo {
 pub struct AddressbookStore {
     root: PathBuf,
     write_lock: Arc<AsyncMutex<()>>,
+    resource_locks: Arc<AsyncMutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>>,
 }
 
 impl AddressbookStore {
@@ -87,7 +89,35 @@ impl AddressbookStore {
         AddressbookStore {
             root: root.into(),
             write_lock: Arc::new(AsyncMutex::new(())),
+            resource_locks: Arc::new(AsyncMutex::new(HashMap::new())),
         }
+    }
+
+    /// Serialize one resource's conditional mutation across requests and
+    /// store clones, including change recording. Weak entries keep the map
+    /// bounded by active resources rather than every resource ever written.
+    pub async fn resource_gate(
+        &self,
+        user: &str,
+        addressbook_id: &str,
+        object: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, StorageError> {
+        let user = Self::validate_segment(user)?;
+        let collection = Self::validate_segment(addressbook_id)?;
+        let object = Self::validate_segment(object)?;
+        let key = self.root.join(user).join(collection).join(object);
+        let lock = {
+            let mut locks = self.resource_locks.lock().await;
+            locks.retain(|_, value| value.strong_count() > 0);
+            if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(AsyncMutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        Ok(lock.lock_owned().await)
     }
 
     pub fn root(&self) -> &std::path::Path {
@@ -283,6 +313,9 @@ impl AddressbookStore {
     ) -> Result<String, StorageError> {
         let user = Self::validate_segment(user)?;
         let addressbook_id = Self::validate_segment(addressbook_id)?;
+        if uid.chars().any(char::is_control) {
+            return Err(crate::path::InvalidPath(uid.to_string()).into());
+        }
 
         let _guard = self.write_lock.lock().await;
 
@@ -307,7 +340,8 @@ impl AddressbookStore {
         file.flush().await?;
 
         let ctag = next.to_string();
-        fs::write(self.ctag_file(&user, &addressbook_id), &ctag).await?;
+        crate::write_file_atomically(&self.ctag_file(&user, &addressbook_id), ctag.as_bytes())
+            .await?;
         Ok(ctag)
     }
 
@@ -369,8 +403,7 @@ impl AddressbookStore {
     }
 
     /// Parse a sync-token this store previously handed out, same format
-    /// and same "unrecognized token means full resync, not an error"
-    /// stance as `CalendarStore::parse_sync_token`.
+    /// and validation behavior as `CalendarStore::parse_sync_token`.
     pub fn parse_sync_token(token: &str) -> Option<u64> {
         token
             .strip_prefix("breadcloud-sync:")
@@ -498,6 +531,31 @@ mod tests {
             .unwrap();
         assert_eq!(ctag2, "2");
         assert_eq!(store.ctag("dev", "contacts").await.unwrap(), "2");
+    }
+
+    #[tokio::test]
+    async fn record_change_rejects_control_characters_in_uid() {
+        let (_dir, store) = store();
+        store
+            .create_addressbook("dev", "contacts", "Contacts")
+            .await
+            .unwrap();
+
+        let err = store
+            .record_change("dev", "contacts", "bad\nuid", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::InvalidPath(_)));
+        assert_eq!(store.ctag("dev", "contacts").await.unwrap(), "0");
+
+        store
+            .record_change("dev", "contacts", "good-uid", false)
+            .await
+            .unwrap();
+        let log = fs::read_to_string(store.changelog_file("dev", "contacts"))
+            .await
+            .unwrap();
+        assert_eq!(log, "1\tC\tgood-uid\n");
     }
 
     #[tokio::test]

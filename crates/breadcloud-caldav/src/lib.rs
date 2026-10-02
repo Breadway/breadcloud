@@ -165,6 +165,7 @@ pub async fn dispatch(state: AppState, authenticated_user: Option<&str>, req: Re
     let Some(parsed) = CalPath::parse(&decoded) else {
         return (StatusCode::NOT_FOUND, "no such CalDAV resource").into_response();
     };
+    let headers = req.headers().clone();
 
     match (&parsed, method.as_str()) {
         (CalPath::Root, "PROPFIND") => {
@@ -192,7 +193,7 @@ pub async fn dispatch(state: AppState, authenticated_user: Option<&str>, req: Re
             handlers::event::put(&state, user, cal, obj, req).await
         }
         (CalPath::Event(user, cal, obj), "DELETE") => {
-            handlers::event::delete(&state, user, cal, obj).await
+            handlers::event::delete(&state, user, cal, obj, &headers).await
         }
         (CalPath::Event(user, cal, _), "PROPFIND") => {
             // A client PROPFINDing an individual event resource directly

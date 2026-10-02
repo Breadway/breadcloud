@@ -222,6 +222,16 @@ pub struct ContactEntry<'a> {
 /// `<d:response>` per matched/fetched contact, each 200 OK with
 /// `getetag`/`address-data` as requested.
 pub fn addressbook_object_multistatus(entries: &[ContactEntry], props: &PropSet) -> String {
+    addressbook_object_multistatus_with_missing(entries, &[], props)
+}
+
+/// REPORT response for `addressbook-multiget`, including a 404 response
+/// for each requested href that could not be resolved.
+pub fn addressbook_object_multistatus_with_missing(
+    entries: &[ContactEntry],
+    missing_hrefs: &[String],
+    props: &PropSet,
+) -> String {
     let mut buf = String::new();
     multistatus_open(&mut buf);
     for entry in entries {
@@ -241,6 +251,13 @@ pub fn addressbook_object_multistatus(entries: &[ContactEntry], props: &PropSet)
             }
         }
         render_response(&mut buf, &entry.href, &prop_list, &PropfindRequest::AllProp);
+    }
+    for href in missing_hrefs {
+        buf.push_str("  <d:response>\n    <d:href>");
+        buf.push_str(&escape(&encode_href(href)));
+        buf.push_str(
+            "</d:href>\n    <d:status>HTTP/1.1 404 Not Found</d:status>\n  </d:response>\n",
+        );
     }
     multistatus_close(&mut buf);
     buf
