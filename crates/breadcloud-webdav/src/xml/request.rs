@@ -1,5 +1,39 @@
 use quick_xml::events::Event;
-use quick_xml::reader::Reader;
+use quick_xml::name::ResolveResult;
+use quick_xml::reader::NsReader;
+
+/// A property name exactly as identified by its expanded XML name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestedProperty {
+    pub namespace: Option<String>,
+    pub local_name: String,
+}
+
+impl RequestedProperty {
+    fn from_resolved(namespace: ResolveResult<'_>, local_name: String) -> Option<Self> {
+        let namespace = match namespace {
+            ResolveResult::Bound(namespace) => {
+                // NsReader returns raw namespace attribute bytes, including XML
+                // references. Normalize literal attribute whitespace before
+                // decoding references, which must retain their referenced chars.
+                let raw = std::str::from_utf8(namespace.0).ok()?;
+                let normalized = raw.replace("\r\n", " ").replace(['\r', '\n', '\t'], " ");
+                let decoded = quick_xml::escape::unescape(&normalized).ok()?;
+                if !decoded.chars().all(|c| {
+                    matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
+                }) {
+                    return None;
+                }
+                Some(decoded.into_owned())
+            }
+            ResolveResult::Unbound | ResolveResult::Unknown(_) => None,
+        };
+        Some(Self {
+            namespace,
+            local_name,
+        })
+    }
+}
 
 /// What a PROPFIND request body asked for.
 ///
@@ -10,13 +44,13 @@ use quick_xml::reader::Reader;
 pub enum PropfindRequest {
     AllProp,
     PropName,
-    Prop(Vec<String>),
+    Prop(Vec<RequestedProperty>),
 }
 
-/// Parse a PROPFIND request body. Namespace-agnostic: property names are
-/// matched by local name only, since every property this server
-/// understands lives in the `DAV:` namespace and clients vary in which
-/// prefix they bind to it. An empty or unparseable body is treated as
+/// Parse a PROPFIND request body, retaining each requested property's
+/// namespace URI and local name. Prefixes are resolved because clients may
+/// bind different prefixes to the same namespace. An empty or unparseable
+/// body is treated as
 /// `allprop`, which is the safe default (RFC 4918 14.1: no body means the
 /// same as an `allprop` request in practice for the clients we target).
 pub fn parse_propfind_body(body: &[u8]) -> PropfindRequest {
@@ -24,23 +58,27 @@ pub fn parse_propfind_body(body: &[u8]) -> PropfindRequest {
         return PropfindRequest::AllProp;
     }
 
-    let mut reader = Reader::from_reader(body);
+    let mut reader = NsReader::from_reader(body);
     reader.config_mut().trim_text(true);
 
-    let mut names: Vec<String> = Vec::new();
+    let mut names: Vec<RequestedProperty> = Vec::new();
     let mut in_prop = false;
     let mut prop_child_depth: u32 = 0;
     let mut saw_allprop = false;
     let mut saw_propname = false;
 
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(e)) => {
-                let local = local_name(e.name().as_ref());
+    while let Ok((namespace, event)) = reader.read_resolved_event() {
+        match event {
+            Event::Start(e) => {
+                let local = local_name(e.local_name().as_ref());
                 if in_prop {
                     prop_child_depth += 1;
                     if prop_child_depth == 1 {
-                        names.push(local);
+                        let Some(property) = RequestedProperty::from_resolved(namespace, local)
+                        else {
+                            return PropfindRequest::AllProp;
+                        };
+                        names.push(property);
                     }
                 } else {
                     match local.as_str() {
@@ -51,11 +89,15 @@ pub fn parse_propfind_body(body: &[u8]) -> PropfindRequest {
                     }
                 }
             }
-            Ok(Event::Empty(e)) => {
-                let local = local_name(e.name().as_ref());
+            Event::Empty(e) => {
+                let local = local_name(e.local_name().as_ref());
                 if in_prop {
                     if prop_child_depth == 0 {
-                        names.push(local);
+                        let Some(property) = RequestedProperty::from_resolved(namespace, local)
+                        else {
+                            return PropfindRequest::AllProp;
+                        };
+                        names.push(property);
                     }
                 } else {
                     match local.as_str() {
@@ -65,8 +107,8 @@ pub fn parse_propfind_body(body: &[u8]) -> PropfindRequest {
                     }
                 }
             }
-            Ok(Event::End(e)) => {
-                let local = local_name(e.name().as_ref());
+            Event::End(e) => {
+                let local = local_name(e.local_name().as_ref());
                 if in_prop {
                     if local == "prop" && prop_child_depth == 0 {
                         in_prop = false;
@@ -75,8 +117,7 @@ pub fn parse_propfind_body(body: &[u8]) -> PropfindRequest {
                     }
                 }
             }
-            Ok(Event::Eof) => break,
-            Err(_) => break,
+            Event::Eof => break,
             _ => {}
         }
     }
@@ -138,18 +179,56 @@ mod tests {
         let parsed = parse_propfind_body(body);
         match parsed {
             PropfindRequest::Prop(names) => {
+                assert_eq!(names.len(), 5);
+                assert_eq!(names[0].namespace.as_deref(), Some("DAV:"));
+                assert_eq!(names[0].local_name, "getetag");
+                assert_eq!(names[1].local_name, "getlastmodified");
+                assert_eq!(names[2].local_name, "getcontentlength");
+                assert_eq!(names[3].local_name, "resourcetype");
                 assert_eq!(
-                    names,
-                    vec![
-                        "getetag",
-                        "getlastmodified",
-                        "getcontentlength",
-                        "resourcetype",
-                        "fileid"
-                    ]
+                    names[4].namespace.as_deref(),
+                    Some("http://owncloud.org/ns")
                 );
+                assert_eq!(names[4].local_name, "fileid");
             }
             other => panic!("expected Prop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn requested_property_keeps_default_namespace() {
+        let body = br#"<propfind xmlns="DAV:" xmlns:nc="http://nextcloud.org/ns"><prop><nc:has-preview/><getetag/></prop></propfind>"#;
+        let PropfindRequest::Prop(names) = parse_propfind_body(body) else {
+            panic!("expected Prop request");
+        };
+        assert_eq!(
+            names[0].namespace.as_deref(),
+            Some("http://nextcloud.org/ns")
+        );
+        assert_eq!(names[0].local_name, "has-preview");
+        assert_eq!(names[1].namespace.as_deref(), Some("DAV:"));
+        assert_eq!(names[1].local_name, "getetag");
+    }
+
+    #[test]
+    fn namespace_attribute_normalizes_literal_whitespace_before_references() {
+        let body = b"<d:propfind xmlns:d=\"DAV:\" xmlns:x=\"urn:a\r\nb\tc&#9;d\"><d:prop><x:custom/></d:prop></d:propfind>";
+        let PropfindRequest::Prop(names) = parse_propfind_body(body) else {
+            panic!("expected Prop request");
+        };
+        assert_eq!(names[0].namespace.as_deref(), Some("urn:a b c\td"));
+    }
+
+    #[test]
+    fn malformed_namespace_reference_uses_safe_fallback() {
+        for raw in ["urn:&undefined;", "urn:&#xZZ;", "urn:&#0;", "urn:&#1;"] {
+            let body = format!(
+                "<d:propfind xmlns:d=\"DAV:\" xmlns:x=\"{raw}\"><d:prop><x:custom/></d:prop></d:propfind>"
+            );
+            assert_eq!(
+                parse_propfind_body(body.as_bytes()),
+                PropfindRequest::AllProp
+            );
         }
     }
 }
