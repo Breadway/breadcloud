@@ -219,6 +219,28 @@ async fn put_without_uid_is_bad_request() {
 }
 
 #[tokio::test]
+async fn put_rejects_control_characters_in_event_names_before_writing() {
+    let (dir, app) = test_app().await;
+    for encoded_name in ["bad%0Aname.ics", "bad%09name.ics"] {
+        let response = put_event(
+            &app,
+            &format!("/remote.php/dav/calendars/dev/personal/{encoded_name}"),
+            &sample_event("evt-1", "20260115T090000Z"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let calendars = CalendarStore::new(dir.path());
+    assert_eq!(calendars.ctag("dev", "personal").await.unwrap(), "0");
+    let events = calendars.events_storage("dev", "personal").await.unwrap();
+    for name in ["bad\nname.ics", "bad\tname.ics"] {
+        let path = breadcloud_storage::DavPath::parse(&format!("/{name}")).unwrap();
+        assert!(!events.exists(&path).await);
+    }
+}
+
+#[tokio::test]
 async fn put_into_a_nonexistent_calendar_is_conflict() {
     let (_dir, app) = test_app().await;
     let ics = sample_event("evt-1", "20260115T090000Z");
@@ -359,6 +381,54 @@ async fn calendar_multiget_fetches_explicit_hrefs() {
 }
 
 #[tokio::test]
+async fn calendar_multiget_decodes_absolute_hrefs_and_reports_missing_objects() {
+    let (_dir, app) = test_app().await;
+    put_event(
+        &app,
+        "/remote.php/dav/calendars/dev/personal/space%20name.ics",
+        &sample_event("space", "20260115T090000Z"),
+    )
+    .await;
+
+    let report_body = r#"<?xml version="1.0"?>
+<c:calendar-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:getetag/><c:calendar-data/></d:prop>
+  <d:href>https://dav.example.test/remote.php/dav/calendars/dev/personal/space%20name.ics</d:href>
+  <d:href>https://dav.example.test/remote.php/dav/calendars/dev/personal/missing%20event.ics</d:href>
+</c:calendar-multiget>"#;
+    let req = Request::builder()
+        .method("REPORT")
+        .uri("/remote.php/dav/calendars/dev/personal/")
+        .body(Body::from(report_body))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status().as_u16(), 207);
+    let body = body_string(response).await;
+    assert!(body.contains("space%20name.ics"));
+    assert!(body.contains("SUMMARY:Test event space"));
+    assert!(body.contains("missing%20event.ics"));
+    assert!(body.contains("HTTP/1.1 404 Not Found"));
+}
+
+#[tokio::test]
+async fn calendar_multiget_reports_non_missing_storage_errors() {
+    let (dir, app) = test_app().await;
+    std::fs::create_dir_all(dir.path().join("dev/personal/events/directory.ics")).unwrap();
+    let report_body = r#"<?xml version="1.0"?>
+<c:calendar-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:getetag/></d:prop>
+  <d:href>/remote.php/dav/calendars/dev/personal/directory.ics</d:href>
+</c:calendar-multiget>"#;
+    let req = Request::builder()
+        .method("REPORT")
+        .uri("/remote.php/dav/calendars/dev/personal/")
+        .body(Body::from(report_body))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
 async fn sync_collection_initial_then_incremental() {
     let (_dir, app) = test_app().await;
     put_event(
@@ -424,6 +494,28 @@ async fn sync_collection_initial_then_incremental() {
     assert!(body.contains("two.ics"));
     assert!(body.contains("one.ics</d:href>\n    <d:status>HTTP/1.1 404 Not Found</d:status>"));
     assert!(body.contains("<d:sync-token>breadcloud-sync:3</d:sync-token>"));
+}
+
+#[tokio::test]
+async fn sync_collection_rejects_malformed_and_future_tokens() {
+    let (_dir, app) = test_app().await;
+    for token in ["not-a-sync-token", "breadcloud-sync:1"] {
+        let report = format!(
+            "<d:sync-collection xmlns:d=\"DAV:\"><d:sync-token>{token}</d:sync-token><d:prop><d:getetag/></d:prop></d:sync-collection>"
+        );
+        let req = Request::builder()
+            .method("REPORT")
+            .uri("/remote.php/dav/calendars/dev/personal/")
+            .body(Body::from(report))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "token: {token}");
+        let body = body_string(response).await;
+        assert!(
+            body.contains("<d:valid-sync-token/>"),
+            "token: {token}, body: {body}"
+        );
+    }
 }
 
 #[tokio::test]

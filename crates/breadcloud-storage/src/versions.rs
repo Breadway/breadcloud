@@ -137,6 +137,20 @@ impl VersionStore {
     /// that is about to replace it -- first creation is not a "previous
     /// version".
     pub async fn snapshot(&self, path: &DavPath, data: &[u8]) -> Result<VersionInfo, StorageError> {
+        let info = self.snapshot_pending(path, data).await?;
+        self.prune_path(path).await?;
+        Ok(info)
+    }
+
+    /// Capture a pending version without pruning older history yet. Write
+    /// handlers use this before their atomic replacement, then either call
+    /// [`VersionStore::prune_path`] after success or
+    /// [`VersionStore::delete_version`] after failure.
+    pub async fn snapshot_pending(
+        &self,
+        path: &DavPath,
+        data: &[u8],
+    ) -> Result<VersionInfo, StorageError> {
         let dir = self.dir_for(path);
         fs::create_dir_all(&dir).await?;
 
@@ -151,8 +165,29 @@ impl VersionStore {
             modified: SystemTime::now(),
         };
 
-        self.prune(&dir).await?;
         Ok(info)
+    }
+
+    /// Apply this store's retention caps to one path after its overwrite
+    /// has successfully committed.
+    pub async fn prune_path(&self, path: &DavPath) -> Result<(), StorageError> {
+        self.prune(&self.dir_for(path)).await
+    }
+
+    /// Remove a pending snapshot after the corresponding write failed.
+    pub async fn delete_version(
+        &self,
+        path: &DavPath,
+        version_id: &str,
+    ) -> Result<(), StorageError> {
+        if version_id.len() != 20 || !version_id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(StorageError::Conflict("invalid version id".into()));
+        }
+        match fs::remove_file(self.dir_for(path).join(version_id)).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// A zero-padded (fixed-width, so lexicographic order matches numeric

@@ -1,5 +1,5 @@
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
@@ -15,7 +15,7 @@ pub async fn require_auth(State(state): State<AppState>, req: Request, next: Nex
     // "add account" flow uses it to confirm there is a Nextcloud-shaped
     // server at this URL at all). Gating it behind auth would break that
     // flow for every real client, mirall included.
-    if req.uri().path().ends_with("/status.php") {
+    if req.method() == Method::GET && req.uri().path() == "/status.php" {
         return next.run(req).await;
     }
 

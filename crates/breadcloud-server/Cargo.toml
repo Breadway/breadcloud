@@ -25,3 +25,4 @@ tempfile = "3"
 http-body-util = "0.1"
 tower = { version = "0.4", features = ["util"] }
 base64 = "0.22"
+tokio-util = { version = "0.7", features = ["io"] }
