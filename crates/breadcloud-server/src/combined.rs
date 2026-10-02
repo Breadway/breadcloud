@@ -324,7 +324,19 @@ async fn dispatch(State(state): State<CombinedState>, req: Request) -> Response 
     // segment of its own to validate, so this is the one place the
     // authenticated identity alone decides whose principal gets
     // advertised.
-    let want_principal = req.method().as_str() == "PROPFIND" && path == "/";
+    // The bare-root principal splice is only needed for the discovery
+    // request, which asks about this resource alone. A missing Depth
+    // header defaults to infinity, so buffering that response here can
+    // consume the whole tree and exceed add_href_prop's bounded buffer.
+    // Leave broader listings untouched so their original streaming body
+    // reaches the client intact.
+    let want_principal = req.method().as_str() == "PROPFIND"
+        && path == "/"
+        && req
+            .headers()
+            .get("Depth")
+            .and_then(|value| value.to_str().ok())
+            == Some("0");
     let principal_href =
         want_principal.then(|| breadcloud_caldav::principal_href_for(&authed_user));
     let response = breadcloud_webdav::dispatch(webdav_state, req).await;
@@ -729,15 +741,31 @@ mod tests {
         );
     }
 
-    // The injection targets only the root resource's own response block,
-    // so a Depth: 1 listing (which lists children too, none here) still
-    // carries exactly one current-user-principal, not one per entry.
+    // Broader listings are left untouched so the principal splice cannot
+    // force an unbounded tree listing through its small response buffer.
     #[tokio::test]
-    async fn current_user_principal_appears_exactly_once_at_depth_one() {
+    async fn depth_one_bare_root_propfind_is_not_buffered_for_principal_splice() {
         let (_dirs, app) = test_app().await;
         let response = propfind(&app, "/", "1").await;
         let xml = body_string(response).await;
-        assert_eq!(xml.matches("<d:current-user-principal>").count(), 1);
+        assert!(xml.contains("<d:multistatus"));
+        assert!(!xml.contains("<d:current-user-principal>"));
+    }
+
+    #[tokio::test]
+    async fn bare_root_propfind_without_depth_keeps_default_infinity_response() {
+        let (_dirs, app) = test_app().await;
+        let req = Request::builder()
+            .method("PROPFIND")
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::from_u16(207).unwrap());
+
+        let xml = body_string(response).await;
+        assert!(xml.contains("<d:multistatus"));
+        assert!(!xml.contains("<d:current-user-principal>"));
     }
 
     // A PROPFIND on some other WebDAV path is untouched: no
