@@ -31,6 +31,7 @@
 //! leave partial chunk files where a sync client might mistake them for
 //! real content.
 
+use futures_util::StreamExt;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -46,10 +47,8 @@ use crate::preconditions;
 use crate::state::AppState;
 use crate::xml::{build_multistatus, PropfindRequest, ResourceEntry};
 
-/// Safety cap on one buffered chunk. Real clients keep individual chunks
-/// well under this (historically single-digit to low tens of MB); it
-/// exists to bound memory, not to match any particular client's chunk
-/// size.
+/// Maximum size of one chunk body. Chunk bodies are streamed to disk, so
+/// this bounds staging storage rather than process memory.
 const MAX_CHUNK_BYTES: usize = 512 * 1024 * 1024;
 const STALE_TRANSFER_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -138,29 +137,65 @@ async fn handle_chunk(
     chunk_path: &DavPath,
     req: Request,
 ) -> Response {
+    handle_chunk_with_limit(
+        state,
+        method,
+        headers,
+        chunk_path,
+        req,
+        MAX_CHUNK_BYTES as u64,
+    )
+    .await
+}
+
+async fn handle_chunk_with_limit(
+    state: &AppState,
+    method: &Method,
+    headers: &HeaderMap,
+    chunk_path: &DavPath,
+    req: Request,
+    max_bytes: u64,
+) -> Response {
     match method.as_str() {
         "PUT" => {
-            let bytes = match axum::body::to_bytes(req.into_body(), MAX_CHUNK_BYTES).await {
-                Ok(b) => b,
-                Err(_) => {
-                    return (StatusCode::BAD_REQUEST, "could not read chunk body").into_response()
-                }
+            let mut prepared = match state.uploads.prepare_write(chunk_path).await {
+                Ok(prepared) => prepared,
+                Err(err) => return storage_error_response(err),
             };
+            let mut body = req.into_body().into_data_stream();
+            while let Some(chunk) = body.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(_) => {
+                        return (StatusCode::BAD_REQUEST, "could not read chunk body")
+                            .into_response()
+                    }
+                };
+                if prepared.total().saturating_add(chunk.len() as u64) > max_bytes {
+                    return (StatusCode::PAYLOAD_TOO_LARGE, "chunk too large").into_response();
+                }
+                if let Err(err) = prepared.write_chunk(&chunk).await {
+                    return storage_error_response(err);
+                }
+            }
+            // Chunk bytes are staged outside the counted tree, so this gate
+            // still sees the pre-write usage of committed chunks; it holds
+            // the staging mutex until the commit below finishes.
             let _quota_guard = match state
                 .uploads
                 .quota_gate(
                     state.upload_staging_limit_bytes,
                     chunk_path,
-                    bytes.len() as u64,
+                    prepared.total(),
                 )
                 .await
             {
                 Ok(guard) => guard,
                 Err(err) => return storage_error_response(err),
             };
-            match state.uploads.write_bytes(chunk_path, &bytes).await {
-                Ok((WriteOutcome::Created, _)) => StatusCode::CREATED.into_response(),
-                Ok((WriteOutcome::Overwritten, _)) => StatusCode::NO_CONTENT.into_response(),
+            match prepared.commit(&state.uploads).await {
+                Ok((WriteOutcome::Created, _, _)) => StatusCode::CREATED.into_response(),
+                Ok((WriteOutcome::Overwritten, _, _)) => StatusCode::NO_CONTENT.into_response(),
                 Err(err) => storage_error_response(err),
             }
         }
@@ -480,5 +515,80 @@ mod tests {
             .unwrap();
 
         assert!(!state.uploads.exists(&transfer_dir).await);
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    fn state() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let live = dir.path().join("live");
+        let uploads = dir.path().join("uploads");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&uploads).unwrap();
+        let state = AppState::new(
+            breadcloud_storage::Storage::new(live),
+            breadcloud_storage::Storage::new(uploads),
+            breadcloud_storage::VersionStore::new(dir.path().join("versions")),
+            breadcloud_storage::TrashStore::new(dir.path().join("trash")),
+        );
+        (dir, state)
+    }
+    fn assert_no_staging(dir: &std::path::Path) {
+        for name in [".live-assembly-staging", ".uploads-assembly-staging"] {
+            let stage = dir.join(name);
+            if stage.exists() {
+                assert_eq!(std::fs::read_dir(stage).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_and_interrupted_streams_preserve_existing_content() {
+        let (dir, state) = state();
+        let path = DavPath::parse("/dev/transfer/1").unwrap();
+        state
+            .uploads
+            .mkcol(&DavPath::parse("/dev").unwrap())
+            .await
+            .unwrap();
+        state
+            .uploads
+            .mkcol(&DavPath::parse("/dev/transfer").unwrap())
+            .await
+            .unwrap();
+        let storage = &state.uploads;
+        storage.write_bytes(&path, b"old bytes").await.unwrap();
+        for interrupted in [false, true] {
+            let chunks = if interrupted {
+                vec![
+                    Ok(bytes::Bytes::from_static(b"new")),
+                    Err(std::io::Error::other("connection interrupted")),
+                ]
+            } else {
+                vec![
+                    Ok(bytes::Bytes::from_static(b"new")),
+                    Ok(bytes::Bytes::from_static(b" data")),
+                ]
+            };
+            let body = Body::from_stream(futures_util::stream::iter(chunks));
+            let req = Request::builder().method("PUT").body(body).unwrap();
+            let response =
+                handle_chunk_with_limit(&state, &Method::PUT, &HeaderMap::new(), &path, req, 4)
+                    .await;
+            assert_eq!(
+                response.status(),
+                if interrupted {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                }
+            );
+            assert_eq!(storage.read_bytes(&path).await.unwrap(), b"old bytes");
+            assert!(state.versions.list(&path).await.unwrap().is_empty());
+            assert_no_staging(dir.path());
+        }
     }
 }

@@ -139,6 +139,89 @@ pub struct PreparedAssembly {
     hash: blake3::Hash,
 }
 
+/// A streamed file replacement staged outside the live tree and ready to
+/// be committed atomically. Dropping an uncommitted write removes its
+/// temporary file.
+pub struct PreparedWrite {
+    dest_fs: Option<PathBuf>,
+    tmp_path: PathBuf,
+    existed: bool,
+    total: u64,
+    hasher: blake3::Hasher,
+    file: Option<fs::File>,
+    committed: bool,
+}
+
+impl PreparedWrite {
+    pub fn existed(&self) -> bool {
+        self.existed
+    }
+
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// Append one body chunk without buffering the complete upload.
+    pub async fn write_chunk(&mut self, bytes: &[u8]) -> Result<(), StorageError> {
+        let file = self.file.as_mut().expect("prepared write file is open");
+        file.write_all(bytes).await?;
+        self.hasher.update(bytes);
+        self.total += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Choose the final destination after parsing a multipart request.
+    pub async fn for_destination(
+        mut self,
+        storage: &Storage,
+        path: &DavPath,
+    ) -> Result<Self, StorageError> {
+        let (dest_fs, existed) = storage.write_destination(path).await?;
+        self.dest_fs = Some(dest_fs);
+        self.existed = existed;
+        Ok(self)
+    }
+
+    /// Atomically replace the destination with the staged content.
+    pub async fn commit(
+        mut self,
+        storage: &Storage,
+    ) -> Result<(WriteOutcome, u64, String), StorageError> {
+        let dest_fs = self.dest_fs.as_ref().ok_or_else(|| {
+            StorageError::Conflict("upload destination has not been selected".into())
+        })?;
+        let mut file = self.file.take().expect("prepared write file is open");
+        file.flush().await?;
+        drop(file);
+        fs::rename(&self.tmp_path, dest_fs).await?;
+        self.committed = true;
+
+        let len = self.total;
+        let etag = format_etag(self.hasher.finalize());
+        if let Ok(meta) = fs::metadata(dest_fs).await {
+            storage.seed_etag_cache(dest_fs, &to_metadata(&meta), etag.clone());
+        }
+        Ok((
+            if self.existed {
+                WriteOutcome::Overwritten
+            } else {
+                WriteOutcome::Created
+            },
+            len,
+            etag,
+        ))
+    }
+}
+
+impl Drop for PreparedWrite {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.file.take();
+            let _ = std::fs::remove_file(&self.tmp_path);
+        }
+    }
+}
+
 impl PreparedAssembly {
     /// Whether the destination already had content that committing this
     /// assembly will overwrite. `false` means this is a first creation,
@@ -346,19 +429,37 @@ impl Storage {
 
     /// Write `data` to `path` (PUT). The parent collection must already
     /// exist and be a collection, otherwise this returns `Conflict` (RFC
-    /// 4918 9.7.1). Writes go to a temp file in the same directory and
-    /// are then renamed into place, so a concurrent GET never observes a
-    /// partially-written file.
+    /// 4918 9.7.1). Writes are streamed to a sibling staging directory
+    /// and then renamed into place, so quota scans do not count partial
+    /// content and a concurrent GET never sees a partial file.
     ///
     /// Returns the content-derived etag of the written data alongside the
-    /// outcome, computed from `data` directly (no extra disk read) and
-    /// seeded into the etag cache so the next GET/PROPFIND/HEAD of this
-    /// path is a cache hit rather than a rehash.
+    /// outcome, computed while writing (no extra disk read) and seeded
+    /// into the etag cache so the next GET/PROPFIND/HEAD of this path is a
+    /// cache hit rather than a rehash.
     pub async fn write_bytes(
         &self,
         path: &DavPath,
         data: &[u8],
     ) -> Result<(WriteOutcome, String), StorageError> {
+        let mut prepared = self.prepare_write(path).await?;
+        prepared.write_chunk(data).await?;
+        let (outcome, _, etag) = prepared.commit(self).await?;
+        Ok((outcome, etag))
+    }
+
+    /// Prepare a streamed replacement. The temporary file is kept in a
+    /// sibling staging directory so quota scans of the live tree do not
+    /// count a partially received upload as existing content.
+    pub async fn prepare_write(&self, path: &DavPath) -> Result<PreparedWrite, StorageError> {
+        let (fs_path, existed) = self.write_destination(path).await?;
+        let mut prepared = self.prepare_upload().await?;
+        prepared.dest_fs = Some(fs_path);
+        prepared.existed = existed;
+        Ok(prepared)
+    }
+
+    async fn write_destination(&self, path: &DavPath) -> Result<(PathBuf, bool), StorageError> {
         let parent_dav = path
             .parent()
             .ok_or_else(|| StorageError::Conflict("cannot write to the storage root".into()))?;
@@ -378,36 +479,36 @@ impl Storage {
             Ok(_) => true,
             Err(_) => false,
         };
-
-        let etag = format_etag(blake3::hash(data));
-
-        let tmp_path = parent_fs.join(format!(".breadcloud-tmp-{}", tmp_suffix()));
-        fs::write(&tmp_path, data).await?;
-        if let Err(e) = fs::rename(&tmp_path, &fs_path).await {
-            let _ = fs::remove_file(&tmp_path).await;
-            return Err(e.into());
-        }
-
-        if let Ok(meta) = fs::metadata(&fs_path).await {
-            self.seed_etag_cache(&fs_path, &to_metadata(&meta), etag.clone());
-        }
-
-        Ok((
-            if existed {
-                WriteOutcome::Overwritten
-            } else {
-                WriteOutcome::Created
-            },
-            etag,
-        ))
+        Ok((fs_path, existed))
     }
 
-    /// Read a file's full content into memory. Used by version
-    /// snapshotting (CLOUD-4), which needs the previous content of a file
-    /// immediately before an overwrite replaces it. Not used for serving
-    /// GET (`handlers::get` streams instead: target files can be large,
-    /// and GET is on the hot path for concurrent downloads in a way a
-    /// pre-overwrite snapshot is not).
+    /// Stage an upload without choosing a destination until all fields arrive.
+    pub async fn prepare_upload(&self) -> Result<PreparedWrite, StorageError> {
+        fs::create_dir_all(&self.staging_root).await?;
+        let tmp_path = self
+            .staging_root
+            .join(format!(".breadcloud-write-{}", tmp_suffix()));
+        // Construct the cleanup owner before the next await. An async open
+        // can finish on Tokio's blocking pool after its future is cancelled,
+        // creating an orphan that no PreparedWrite ever owns.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        Ok(PreparedWrite {
+            dest_fs: None,
+            tmp_path,
+            existed: false,
+            total: 0,
+            hasher: blake3::Hasher::new(),
+            file: Some(fs::File::from_std(file)),
+            committed: false,
+        })
+    }
+
+    /// Read a file's full content into memory. Suitable for small
+    /// application data; large file serving and version snapshots use
+    /// streaming/copy APIs instead.
     pub async fn read_bytes(&self, path: &DavPath) -> Result<Vec<u8>, StorageError> {
         let (mut file, meta) = self.open(path).await?;
         let mut buf = Vec::with_capacity(meta.len as usize);
@@ -1551,6 +1652,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detached_write_needs_a_destination_and_cleans_up_on_drop() {
+        let (_dir, storage) = storage().await;
+        let mut prepared = storage.prepare_upload().await.unwrap();
+        prepared.write_chunk(b"partial bytes").await.unwrap();
+        let stage = prepared.tmp_path.clone();
+        assert!(stage.exists());
+        assert!(matches!(
+            prepared.commit(&storage).await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(!stage.exists());
+        let mut cancelled = storage.prepare_upload().await.unwrap();
+        cancelled.write_chunk(b"interrupted").await.unwrap();
+        let stage = cancelled.tmp_path.clone();
+        drop(cancelled);
+        assert!(!stage.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_staged_commit_preserves_live_destination() {
+        let (_dir, storage) = storage().await;
+        let path = DavPath::parse("/file.txt").unwrap();
+        storage.write_bytes(&path, b"old bytes").await.unwrap();
+        let mut prepared = storage.prepare_write(&path).await.unwrap();
+        prepared.write_chunk(b"new bytes").await.unwrap();
+        let stage = prepared.tmp_path.clone();
+        fs::remove_file(&stage).await.unwrap();
+        assert!(prepared.commit(&storage).await.is_err());
+        assert_eq!(storage.read_bytes(&path).await.unwrap(), b"old bytes");
+        assert!(!stage.exists());
+    }
+
+    #[tokio::test]
     async fn write_existing_file_reports_overwritten() {
         let (_dir, storage) = storage().await;
         let path = DavPath::parse("/hello.txt").unwrap();
@@ -1559,6 +1693,25 @@ mod tests {
         assert_eq!(outcome, WriteOutcome::Overwritten);
         let meta = storage.metadata(&path).await.unwrap();
         assert_eq!(meta.len, 11);
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_write_keeps_old_content_until_commit() {
+        let (_dir, storage) = storage().await;
+        let path = DavPath::parse("/hello.txt").unwrap();
+        storage.write_bytes(&path, b"old").await.unwrap();
+
+        let mut prepared = storage.prepare_write(&path).await.unwrap();
+        prepared.write_chunk(b"new ").await.unwrap();
+        prepared.write_chunk(b"content").await.unwrap();
+        assert_eq!(prepared.total(), 11);
+        assert_eq!(storage.read_bytes(&path).await.unwrap(), b"old");
+
+        let (outcome, total, etag) = prepared.commit(&storage).await.unwrap();
+        assert_eq!(outcome, WriteOutcome::Overwritten);
+        assert_eq!(total, 11);
+        assert!(!etag.is_empty());
+        assert_eq!(storage.read_bytes(&path).await.unwrap(), b"new content");
     }
 
     #[tokio::test]

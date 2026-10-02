@@ -168,6 +168,39 @@ impl VersionStore {
         Ok(info)
     }
 
+    /// Copy a live file into version history without reading its full
+    /// contents into memory. The version is created unpruned so a write
+    /// handler can discard it if the replacement write fails; the handler
+    /// calls [`VersionStore::prune_path`] once the write commits.
+    pub async fn snapshot_file_pending(
+        &self,
+        path: &DavPath,
+        source: &Path,
+    ) -> Result<VersionInfo, StorageError> {
+        let dir = self.dir_for(path);
+        fs::create_dir_all(&dir).await?;
+        let (id, claimed) = self.create_version_file_at(&dir, timestamp_nanos()).await?;
+        drop(claimed);
+        let destination = dir.join(&id);
+        let temporary = dir.join(format!(".pending-{id}"));
+        if let Err(err) = fs::copy(source, &temporary).await {
+            let _ = fs::remove_file(&temporary).await;
+            let _ = fs::remove_file(&destination).await;
+            return Err(err.into());
+        }
+        if let Err(err) = fs::rename(&temporary, &destination).await {
+            let _ = fs::remove_file(&temporary).await;
+            let _ = fs::remove_file(&destination).await;
+            return Err(err.into());
+        }
+        let len = fs::metadata(&destination).await?.len();
+        Ok(VersionInfo {
+            id,
+            len,
+            modified: SystemTime::now(),
+        })
+    }
+
     /// Apply this store's retention caps to one path after its overwrite
     /// has successfully committed.
     pub async fn prune_path(&self, path: &DavPath) -> Result<(), StorageError> {
@@ -387,8 +420,15 @@ async fn read_entries(dir: &Path) -> std::io::Result<Vec<VersionInfo>> {
         if !meta.is_file() {
             continue;
         }
+        let id = entry.file_name().to_string_lossy().into_owned();
+        // Version ids are always 20-digit nanosecond timestamps. Skip
+        // anything else (a `.pending-` staging file from an in-flight
+        // copy, for example) so history never exposes a partial write.
+        if id.len() != 20 || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
         out.push(VersionInfo {
-            id: entry.file_name().to_string_lossy().into_owned(),
+            id,
             len: meta.len(),
             modified: meta.modified().unwrap_or(UNIX_EPOCH),
         });
@@ -442,6 +482,18 @@ mod tests {
         assert_eq!(versions.len(), 2);
         // Oldest first.
         assert!(versions[0].id < versions[1].id);
+    }
+
+    #[tokio::test]
+    async fn failed_snapshot_copy_leaves_no_partial_history() {
+        let (dir, store) = store(10, 1024);
+        let path = DavPath::parse("/file.txt").unwrap();
+        assert!(store
+            .snapshot_file_pending(&path, &dir.path().join("missing-source"))
+            .await
+            .is_err());
+        assert!(store.list(&path).await.unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(store.dir_for(&path)).unwrap().count(), 0);
     }
 
     #[tokio::test]

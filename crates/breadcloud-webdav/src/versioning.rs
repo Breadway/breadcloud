@@ -20,26 +20,28 @@ use crate::state::AppState;
 /// Call before writing new content to `path`. If `path` already names a
 /// file, its current content is captured as a new version before the
 /// caller's write can replace it. Returns a storage error only for a
-/// genuine I/O failure reading the existing content
+/// genuine I/O failure copying the existing content
 /// or writing the snapshot -- callers should short-circuit the request
 /// with it rather than proceeding with an overwrite that could not be
-/// safely versioned.
+/// safely versioned. The copy is streamed from the live file (no full
+/// read into memory) and created pending; callers finalize it with
+/// [`finish_snapshot`] after their write commits or remove it with
+/// [`discard_snapshot`] after a failed write.
 pub async fn snapshot_before_overwrite(
     state: &AppState,
     path: &DavPath,
 ) -> Result<Option<VersionInfo>, StorageError> {
-    let existing = match state.storage.read_bytes(path).await {
-        Ok(bytes) => bytes,
+    match state.storage.metadata(path).await {
         // First creation: nothing to snapshot.
-        Err(StorageError::NotFound) => return Ok(None),
-        Err(err) => return Err(err),
-    };
-
-    state
-        .versions
-        .snapshot_pending(path, &existing)
-        .await
-        .map(Some)
+        Err(StorageError::NotFound) => Ok(None),
+        Err(err) => Err(err),
+        Ok(metadata) if metadata.is_dir() => Err(StorageError::IsADirectory),
+        Ok(_) => state
+            .versions
+            .snapshot_file_pending(path, &state.storage.resolve(path))
+            .await
+            .map(Some),
+    }
 }
 
 /// Finalize retention only after the replacement write commits. Pruning is

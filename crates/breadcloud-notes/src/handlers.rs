@@ -14,7 +14,7 @@
 //! exactly like any other PUT, because it *is* one, at the storage layer.
 
 use axum::body::Body;
-use axum::extract::{FromRequest, Request};
+use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use breadcloud_storage::{DavPath, StorageError};
@@ -523,10 +523,18 @@ const MAX_ATTACHMENT_BYTES: usize = 200 * 1024 * 1024;
 /// `POST /attachment/{noteid}`: real Nextcloud sends this as
 /// `multipart/form-data` with the file in a field named `file`
 /// (`IRequest::getUploadedFile('file')`, confirmed in
-/// `NotesApiController::uploadFile`) -- parsed here with axum's own
-/// `Multipart` extractor, the same one `breadcloud-webui::files::upload`
-/// already uses for its own (different-shaped) upload form.
+/// `NotesApiController::uploadFile`). The body is parsed as a stream and
+/// file bytes go directly to storage staging.
 pub async fn attachment_upload(state: &AppState, note_id: &str, req: Request) -> Response {
+    attachment_upload_with_limit(state, note_id, req, MAX_ATTACHMENT_BYTES as u64).await
+}
+
+async fn attachment_upload_with_limit(
+    state: &AppState,
+    note_id: &str,
+    req: Request,
+    max_bytes: u64,
+) -> Response {
     let Some((note_path, _)) = (match resolve(state, note_id).await {
         Ok(v) => v,
         Err(err) => return with_api_versions_header(note_storage_error(err)),
@@ -534,72 +542,121 @@ pub async fn attachment_upload(state: &AppState, note_id: &str, req: Request) ->
         return with_api_versions_header(not_found());
     };
 
-    let mut multipart = match axum::extract::Multipart::from_request(req, &()).await {
-        Ok(m) => m,
+    let content_type = match req
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(value) => value.to_owned(),
+        None => {
+            return with_api_versions_header(
+                (StatusCode::BAD_REQUEST, "missing multipart content type").into_response(),
+            )
+        }
+    };
+    let boundary = match multer::parse_boundary(&content_type) {
+        Ok(boundary) => boundary,
         Err(err) => {
             return with_api_versions_header(
                 (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
             )
         }
     };
+    let constraints = multer::Constraints::new().size_limit(
+        multer::SizeLimit::new()
+            .whole_stream(max_bytes + 1024 * 1024)
+            .per_field(64 * 1024)
+            .for_field("file", max_bytes),
+    );
+    let mut multipart = multer::Multipart::with_constraints(
+        req.into_body().into_data_stream(),
+        boundary,
+        constraints,
+    );
 
-    let mut file_name: Option<String> = None;
-    let mut data: Vec<u8> = Vec::new();
+    let mut uploaded: Option<(String, DavPath, breadcloud_storage::PreparedWrite)> = None;
+    let attachment_dir = match note_path
+        .parent()
+        .unwrap_or_else(notes_root)
+        .child(&note::attachment_dir_name(note_id))
+    {
+        Ok(dir) => dir,
+        Err(_) => return with_api_versions_header(error_response(StatusCode::BAD_REQUEST)),
+    };
     loop {
-        let field = match multipart.next_field().await {
+        let mut field = match multipart.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
-            Err(err) => {
-                return with_api_versions_header(
-                    (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-                )
-            }
+            Err(err) => return with_api_versions_header(multipart_error_response(err)),
         };
         if field.name() != Some("file") {
             continue;
         }
-        file_name = field.file_name().map(str::to_string);
-        data = match field.bytes().await {
-            Ok(b) if b.len() > MAX_ATTACHMENT_BYTES => {
-                return with_api_versions_header(
-                    (StatusCode::PAYLOAD_TOO_LARGE, "attachment too large").into_response(),
-                )
-            }
-            Ok(b) => b.to_vec(),
-            Err(err) => {
-                return with_api_versions_header(
-                    (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-                )
-            }
+        if uploaded.is_some() {
+            return with_api_versions_header(error_response(StatusCode::BAD_REQUEST));
+        }
+        let Some(file_name) = field.file_name().map(str::to_string) else {
+            return with_api_versions_header(error_response(StatusCode::BAD_REQUEST));
         };
+        if file_name.is_empty() {
+            return with_api_versions_header(error_response(StatusCode::BAD_REQUEST));
+        }
+        let sanitized = note::sanitize_attachment_name(&file_name);
+        let dest = match attachment_dir.child(&sanitized) {
+            Ok(dest) => dest,
+            Err(_) => return with_api_versions_header(error_response(StatusCode::BAD_REQUEST)),
+        };
+        let mut prepared = match state.storage.prepare_upload().await {
+            Ok(prepared) => prepared,
+            Err(err) => return with_api_versions_header(note_storage_error(err)),
+        };
+        loop {
+            match field.chunk().await {
+                Ok(Some(chunk)) => {
+                    if prepared.total().saturating_add(chunk.len() as u64) > max_bytes {
+                        return with_api_versions_header(
+                            (StatusCode::PAYLOAD_TOO_LARGE, "attachment too large").into_response(),
+                        );
+                    }
+                    if let Err(err) = prepared.write_chunk(&chunk).await {
+                        return with_api_versions_header(note_storage_error(err));
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => return with_api_versions_header(multipart_error_response(err)),
+            }
+        }
+        uploaded = Some((sanitized, dest, prepared));
     }
-    let Some(file_name) = file_name.filter(|n| !n.is_empty()) else {
+    let Some((sanitized, dest, prepared)) = uploaded else {
         return with_api_versions_header(error_response(StatusCode::BAD_REQUEST));
     };
-
-    let sanitized = note::sanitize_attachment_name(&file_name);
-    let dir = note_path
-        .parent()
-        .unwrap_or_else(notes_root)
-        .child(&note::attachment_dir_name(note_id));
-    let dir = match dir {
-        Ok(dir) => dir,
-        Err(_) => return with_api_versions_header(error_response(StatusCode::BAD_REQUEST)),
-    };
-    if let Err(err) = ensure_category_dir(state, &dir).await {
+    if let Err(err) = ensure_category_dir(state, &attachment_dir).await {
         return with_api_versions_header(note_storage_error(err));
     }
-    let dest = match dir.child(&sanitized) {
-        Ok(path) => path,
-        Err(_) => return with_api_versions_header(error_response(StatusCode::BAD_REQUEST)),
+    let prepared = match prepared.for_destination(&state.storage, &dest).await {
+        Ok(prepared) => prepared,
+        Err(err) => return with_api_versions_header(note_storage_error(err)),
     };
-    match write_note_content(state, &dest, &data).await {
+    match commit_note_write(state, &dest, prepared).await {
         Ok(()) => with_api_versions_header(json_response(
             StatusCode::OK,
             json!({"filename": format!("{}/{}", note::attachment_dir_name(note_id), sanitized)}),
         )),
         Err(resp) => with_api_versions_header(*resp),
     }
+}
+
+fn multipart_error_response(err: multer::Error) -> Response {
+    let status = if matches!(
+        &err,
+        multer::Error::FieldSizeExceeded { .. } | multer::Error::StreamSizeExceeded { .. }
+    ) {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (status, err.to_string()).into_response()
 }
 
 fn attachment_path(note_path: &DavPath, note_id: &str, raw_name: &str) -> Option<DavPath> {
@@ -624,12 +681,27 @@ async fn write_note_content(
     path: &DavPath,
     data: &[u8],
 ) -> Result<(), Box<Response>> {
+    let mut prepared = state
+        .storage
+        .prepare_write(path)
+        .await
+        .map_err(note_storage_error)?;
+    prepared
+        .write_chunk(data)
+        .await
+        .map_err(note_storage_error)?;
+    commit_note_write(state, path, prepared).await
+}
+
+async fn commit_note_write(
+    state: &AppState,
+    path: &DavPath,
+    prepared: breadcloud_storage::PreparedWrite,
+) -> Result<(), Box<Response>> {
+    let total = prepared.total();
+
     let _quota_guard = match state.quota_limit_bytes {
-        Some(limit) => match state
-            .storage
-            .quota_gate(limit, path, data.len() as u64)
-            .await
-        {
+        Some(limit) => match state.storage.quota_gate(limit, path, total).await {
             Ok(guard) => Some(guard),
             Err(err) => return Err(Box::new(note_storage_error(err))),
         },
@@ -641,7 +713,7 @@ async fn write_note_content(
         .await
         .map_err(|err| Box::new(note_storage_error(err)))?;
 
-    if let Err(err) = state.storage.write_bytes(path, data).await {
+    if let Err(err) = prepared.commit(&state.storage).await {
         breadcloud_webdav::versioning::discard_snapshot(state, path, pending_snapshot).await;
         return Err(Box::new(note_storage_error(err)));
     }
@@ -651,7 +723,7 @@ async fn write_note_content(
         state.owner_label(),
         &path.to_request_path(),
         breadcloud_events::FileOp::Put,
-        Some(data.len() as u64),
+        Some(total),
     );
     Ok(())
 }
@@ -764,4 +836,87 @@ pub async fn read_json_body(req: Request) -> Result<Vec<u8>, Box<Response>> {
                 with_api_versions_header(error_response(StatusCode::BAD_REQUEST)).into_response(),
             )
         })
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    fn state() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let live = dir.path().join("live");
+        let uploads = dir.path().join("uploads");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&uploads).unwrap();
+        let state = AppState::new(
+            breadcloud_storage::Storage::new(live),
+            breadcloud_storage::Storage::new(uploads),
+            breadcloud_storage::VersionStore::new(dir.path().join("versions")),
+            breadcloud_storage::TrashStore::new(dir.path().join("trash")),
+        );
+        (dir, state)
+    }
+    fn assert_no_staging(dir: &std::path::Path) {
+        for name in [".live-assembly-staging", ".uploads-assembly-staging"] {
+            let stage = dir.join(name);
+            if stage.exists() {
+                assert_eq!(std::fs::read_dir(stage).unwrap().count(), 0);
+            }
+        }
+    }
+
+    fn multipart(parts: &[(&str, Option<&str>, &str)], complete: bool) -> Request {
+        let mut body = String::new();
+        for (name, file, value) in parts {
+            body.push_str(&format!(
+                "--testboundary\r\nContent-Disposition: form-data; name=\"{name}\""
+            ));
+            if let Some(file) = file {
+                body.push_str(&format!("; filename=\"{file}\""));
+            }
+            body.push_str(&format!("\r\n\r\n{value}\r\n"));
+        }
+        if complete {
+            body.push_str("--testboundary--\r\n");
+        }
+        Request::builder()
+            .method("POST")
+            .header("Content-Type", "multipart/form-data; boundary=testboundary")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn attachment_limits_and_malformed_streams_preserve_existing_bytes() {
+        let (dir, state) = state();
+        let response = create(&state, br#"{"title":"recipe","content":"bread"}"#).await;
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = json["id"].as_str().unwrap();
+        let first = multipart(&[("file", Some("photo.jpg"), "old bytes")], true);
+        assert_eq!(
+            attachment_upload_with_limit(&state, id, first, 32)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let path = DavPath::parse(&format!("/Notes/.attachments.{id}/photo.jpg")).unwrap();
+        for (complete, limit, status) in [
+            (true, 4, StatusCode::PAYLOAD_TOO_LARGE),
+            (false, 32, StatusCode::BAD_REQUEST),
+        ] {
+            let request = multipart(&[("file", Some("photo.jpg"), "new bytes")], complete);
+            assert_eq!(
+                attachment_upload_with_limit(&state, id, request, limit)
+                    .await
+                    .status(),
+                status
+            );
+            assert_eq!(state.storage.read_bytes(&path).await.unwrap(), b"old bytes");
+            assert!(state.versions.list(&path).await.unwrap().is_empty());
+            assert_no_staging(dir.path());
+        }
+    }
 }

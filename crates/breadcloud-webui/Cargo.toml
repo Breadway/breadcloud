@@ -11,6 +11,7 @@ breadcloud-caldav = { path = "../breadcloud-caldav" }
 axum = { version = "0.7", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }
 percent-encoding = "2"
+multer = "3"
 
 [dev-dependencies]
 tempfile = "3"
