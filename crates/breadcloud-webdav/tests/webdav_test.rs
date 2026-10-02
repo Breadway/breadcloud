@@ -57,6 +57,48 @@ async fn put_then_get_roundtrips_content() {
 }
 
 #[tokio::test]
+async fn active_file_gets_are_sandboxed_and_downloaded_as_attachments() {
+    let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app();
+
+    for path in ["/page.html", "/image.svg"] {
+        assert_eq!(
+            put(&app, path, "<script>alert(1)</script>").await,
+            StatusCode::CREATED
+        );
+        let request = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(response.headers()["content-security-policy"], "sandbox");
+        assert_eq!(response.headers()["content-disposition"], "attachment");
+    }
+}
+
+#[tokio::test]
+async fn directory_listing_prefixes_file_links_and_is_sandboxed() {
+    let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app();
+    assert_eq!(
+        put(&app, "/javascript:alert(1)", "file").await,
+        StatusCode::CREATED
+    );
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(response.headers()["content-security-policy"], "sandbox");
+    let listing = body_string(response).await;
+    assert!(listing.contains("href=\"./javascript:alert(1)\""));
+}
+
+#[tokio::test]
 async fn put_overwrite_returns_no_content() {
     let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app();
 
