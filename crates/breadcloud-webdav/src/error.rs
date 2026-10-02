@@ -8,7 +8,12 @@ use breadcloud_storage::StorageError;
 /// themselves before falling back here.
 pub fn storage_error_response(err: StorageError) -> Response {
     let status = default_status(&err);
-    (status, err.to_string()).into_response()
+    if status.is_server_error() {
+        tracing::error!(error = %err, "storage request failed");
+        (status, "Internal server error").into_response()
+    } else {
+        (status, err.to_string()).into_response()
+    }
 }
 
 fn default_status(err: &StorageError) -> StatusCode {
@@ -47,4 +52,53 @@ pub fn multi_status() -> StatusCode {
 /// has no named constant for it.
 pub fn insufficient_storage() -> StatusCode {
     StatusCode::from_u16(507).expect("507 is a valid HTTP status code")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use axum::body::to_bytes;
+    use breadcloud_storage::StorageError;
+
+    use super::storage_error_response;
+
+    #[tokio::test]
+    async fn internal_storage_errors_hide_paths_from_response_body() {
+        let errors = [
+            StorageError::Io(std::io::Error::other("failed at /srv/breadcloud/data/file")),
+            StorageError::RecoveryFailed {
+                primary: Box::new(StorageError::Io(std::io::Error::other("rename failed"))),
+                stranded_src: Some(PathBuf::from("/srv/breadcloud/data/.stage-123")),
+                stranded_dest: Some(PathBuf::from("/srv/breadcloud/data/.backup-456")),
+            },
+        ];
+
+        for err in errors {
+            let response = storage_error_response(err);
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert_eq!(body, "Internal server error");
+            assert!(!body.contains("/srv/breadcloud"));
+        }
+    }
+
+    #[tokio::test]
+    async fn client_errors_keep_their_existing_message() {
+        let response = storage_error_response(StorageError::InvalidPath(
+            breadcloud_storage::path::InvalidPath("bad path".to_string()),
+        ));
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            "invalid path: bad path"
+        );
+    }
 }
