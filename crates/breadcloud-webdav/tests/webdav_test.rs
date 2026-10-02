@@ -1938,6 +1938,66 @@ async fn trash_cap_enforcement_evicts_the_oldest_deletion_once_the_size_cap_is_e
     assert!(xml.contains("<nc:trashbin-original-location>/b.txt</nc:trashbin-original-location>"));
 }
 
+// ---- OCS stub endpoints (CLOUD-29) ----------------------------------------
+
+/// An app for account `alice` with a 1000-byte quota, so the `cloud/user`
+/// tests have a real owner and a deterministic quota to assert on.
+fn ocs_app() -> (TempDir, TempDir, TempDir, TempDir, axum::Router) {
+    let dir = TempDir::new().unwrap();
+    let uploads_dir = TempDir::new().unwrap();
+    let versions_dir = TempDir::new().unwrap();
+    let trash_dir = TempDir::new().unwrap();
+    let state = AppState::new(
+        Storage::new(dir.path()),
+        Storage::new(uploads_dir.path()),
+        VersionStore::new(versions_dir.path()),
+        TrashStore::new(trash_dir.path()),
+    )
+    .with_owner("alice")
+    .with_quota_limit(1000);
+    (dir, uploads_dir, versions_dir, trash_dir, router(state))
+}
+
+async fn get_json(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    let status = response.status();
+    let body = body_string(response).await;
+    (
+        status,
+        serde_json::from_str(&body).expect("OCS body is JSON"),
+    )
+}
+
+#[tokio::test]
+async fn empty_list_stubs_answer_200_with_an_empty_data_list_not_404() {
+    let (_a, _b, _c, _d, app) = ocs_app();
+    for uri in [
+        "/ocs/v2.php/apps/notifications/api/v2/notifications",
+        "/ocs/v2.php/apps/notifications/api/v2/notifications/",
+        "/ocs/v2.php/apps/activity/api/v2/activity",
+        "/ocs/v2.php/apps/activity/api/v2/activity/all",
+        "/nextcloud/ocs/v2.php/apps/activity/api/v2/activity",
+    ] {
+        let (status, json) = get_json(&app, uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(json["ocs"]["meta"]["status"], "ok", "{uri}");
+        assert_eq!(json["ocs"]["meta"]["statuscode"], 200, "{uri}");
+        assert_eq!(json["ocs"]["data"], serde_json::json!([]), "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn direct_editing_reports_no_editors_or_creators() {
+    let (_a, _b, _c, _d, app) = ocs_app();
+    let (status, json) = get_json(&app, "/ocs/v2.php/apps/files/api/v1/directEditing").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json["ocs"]["data"],
+        serde_json::json!({ "editors": {}, "creators": {} })
+    );
+}
+
 #[tokio::test]
 async fn copy_overwrite_retains_destination_file_version() {
     let (root, _uploads, version_root, _trash, app) = test_app();
@@ -1973,6 +2033,106 @@ async fn copy_overwrite_retains_destination_file_version() {
             .unwrap(),
         b"new"
     );
+}
+
+#[tokio::test]
+async fn ocs_success_code_is_100_on_v1_and_200_on_v2() {
+    let (_a, _b, _c, _d, app) = ocs_app();
+    let (_, v1) = get_json(&app, "/ocs/v1.php/cloud/capabilities").await;
+    let (_, v2) = get_json(&app, "/ocs/v2.php/cloud/capabilities").await;
+    assert_eq!(v1["ocs"]["meta"]["statuscode"], 100);
+    assert_eq!(v2["ocs"]["meta"]["statuscode"], 200);
+}
+
+#[tokio::test]
+async fn capabilities_explicitly_disable_the_features_breadcloud_lacks() {
+    let (_a, _b, _c, _d, app) = ocs_app();
+    let (status, json) = get_json(&app, "/ocs/v1.php/cloud/capabilities").await;
+    assert_eq!(status, StatusCode::OK);
+    let caps = &json["ocs"]["data"]["capabilities"];
+
+    // Present and false, not merely absent.
+    assert_eq!(caps["files_sharing"]["api_enabled"], false);
+    assert_eq!(caps["files_sharing"]["public"]["enabled"], false);
+    assert_eq!(caps["files_sharing"]["resharing"], false);
+    assert_eq!(caps["files_sharing"]["federation"]["outgoing"], false);
+    assert_eq!(
+        caps["notifications"]["ocs-endpoints"],
+        serde_json::json!([])
+    );
+    assert_eq!(caps["activity"]["apiv2"], serde_json::json!([]));
+
+    // Theming: honest product name, and no logo/background URLs a client
+    // would try (and fail) to fetch.
+    assert_eq!(caps["theming"]["name"], "breadcloud");
+    assert!(caps["theming"].get("logo").is_none());
+    assert!(caps["theming"].get("background").is_none());
+
+    // What was already advertised is unchanged.
+    assert_eq!(caps["dav"]["chunking"], "1.0");
+    assert_eq!(caps["files"]["versioning"], true);
+}
+
+#[tokio::test]
+async fn cloud_user_reports_identity_and_quota() {
+    let (_a, _b, _c, _d, app) = ocs_app();
+    assert_eq!(
+        put(&app, "/a.txt", &"x".repeat(250)).await,
+        StatusCode::CREATED
+    );
+
+    let (status, json) = get_json(&app, "/ocs/v1.php/cloud/user").await;
+    assert_eq!(status, StatusCode::OK);
+    let data = &json["ocs"]["data"];
+    assert_eq!(data["id"], "alice");
+    assert_eq!(data["display-name"], "alice");
+    assert_eq!(data["enabled"], true);
+    assert!(data["email"].is_null());
+    assert_eq!(data["quota"]["used"], 250);
+    assert_eq!(data["quota"]["free"], 750);
+    assert_eq!(data["quota"]["total"], 1000);
+    assert_eq!(data["quota"]["relative"], 25.0);
+    assert_eq!(data["quota"]["quota"], 1000);
+}
+
+#[tokio::test]
+async fn cloud_users_by_own_id_matches_cloud_user() {
+    let (_a, _b, _c, _d, app) = ocs_app();
+    let (_, me) = get_json(&app, "/ocs/v2.php/cloud/user").await;
+    let (status, by_id) = get_json(&app, "/ocs/v2.php/cloud/users/alice").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(by_id, me);
+}
+
+#[tokio::test]
+async fn cloud_users_for_another_account_is_forbidden_not_answered_as_the_caller() {
+    let (_a, _b, _c, _d, app) = ocs_app();
+    // Existing-looking and made-up ids must be indistinguishable.
+    for id in ["bob", "nobody-by-this-name"] {
+        let (status, json) = get_json(&app, &format!("/ocs/v2.php/cloud/users/{id}")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{id}");
+        assert_eq!(json["ocs"]["meta"]["status"], "failure", "{id}");
+        assert!(json["ocs"]["data"].is_null(), "{id}");
+    }
+    // v1 carries the failure in the envelope, HTTP stays 200.
+    let (status, json) = get_json(&app, "/ocs/v1.php/cloud/users/bob").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["ocs"]["meta"]["statuscode"], 997);
+}
+
+#[tokio::test]
+async fn cloud_users_with_a_nested_or_empty_id_is_not_treated_as_a_user_lookup() {
+    let (_a, _b, _c, _d, app) = ocs_app();
+    for uri in [
+        "/ocs/v2.php/cloud/users/",
+        "/ocs/v2.php/cloud/users/alice/groups",
+    ] {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let status = app.clone().oneshot(req).await.unwrap().status();
+        // Falls through to the DAV tree (a nonexistent path), never to the
+        // caller's own user record.
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+    }
 }
 
 #[tokio::test]

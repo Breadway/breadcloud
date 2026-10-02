@@ -122,14 +122,8 @@ pub async fn dispatch(state: AppState, req: Request) -> Response {
         if raw_path.ends_with("/status.php") {
             return handlers::discovery::status();
         }
-        if raw_path.contains("/ocs/v1.php/cloud/capabilities")
-            || raw_path.contains("/ocs/v2.php/cloud/capabilities")
-        {
-            return handlers::discovery::capabilities();
-        }
-        if raw_path.contains("/ocs/v1.php/cloud/user")
-            || raw_path.contains("/ocs/v2.php/cloud/user")
-        {
+        if let Some((version, route)) = handlers::discovery::route(&raw_path) {
+            use handlers::discovery::{self as d, OcsRoute};
             // `owner` (CLOUD-11: which account this already-resolved
             // `AppState` belongs to) takes priority over `auth`'s
             // configured username: in the real combined server, auth
@@ -143,7 +137,29 @@ pub async fn dispatch(state: AppState, req: Request) -> Response {
                 .as_deref()
                 .or_else(|| state.auth.as_ref().map(|a| a.username.as_str()))
                 .unwrap_or("anonymous");
-            return handlers::discovery::user(username);
+            return match route {
+                OcsRoute::Capabilities => d::capabilities(version),
+                OcsRoute::CurrentUser => {
+                    let quota = state
+                        .storage
+                        .quota_report(state.quota_limit_bytes)
+                        .await
+                        .ok();
+                    d::user(version, username, quota, state.quota_limit_bytes)
+                }
+                OcsRoute::User(id) if id == username => {
+                    let quota = state
+                        .storage
+                        .quota_report(state.quota_limit_bytes)
+                        .await
+                        .ok();
+                    d::user(version, username, quota, state.quota_limit_bytes)
+                }
+                OcsRoute::User(_) => d::user_forbidden(version),
+                OcsRoute::Notifications => d::notifications(version),
+                OcsRoute::Activity => d::activity(version),
+                OcsRoute::DirectEditing => d::direct_editing(version),
+            };
         }
     }
 
