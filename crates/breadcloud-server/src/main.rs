@@ -52,6 +52,24 @@ struct LoadedAccounts {
     default_user: String,
 }
 
+fn legacy_credentials(
+    username: Option<String>,
+    password: Option<String>,
+) -> Option<(String, String)> {
+    match (username, password) {
+        (Some(username), Some(password)) => Some((username, password)),
+        (None, None) => None,
+        (Some(_), None) => panic!("BREADCLOUD_USER is set but BREADCLOUD_PASS is not"),
+        (None, Some(_)) => panic!("BREADCLOUD_PASS is set but BREADCLOUD_USER is not"),
+    }
+}
+
+fn validate_open_mode_bind(accounts_configured: bool, addr: SocketAddr) {
+    if !accounts_configured && !addr.ip().is_loopback() {
+        panic!("open mode requires BREADCLOUD_BIND to use a loopback address");
+    }
+}
+
 /// Load the account set from environment variables, trying three shapes
 /// in order (see the workspace README's "Multi-user accounts" section for
 /// the full reasoning):
@@ -107,9 +125,10 @@ fn load_accounts() -> LoadedAccounts {
         };
     }
 
-    let legacy_user = std::env::var("BREADCLOUD_USER").ok();
-    let legacy_pass = std::env::var("BREADCLOUD_PASS").ok();
-    if let (Some(username), Some(password)) = (legacy_user, legacy_pass) {
+    if let Some((username, password)) = legacy_credentials(
+        std::env::var("BREADCLOUD_USER").ok(),
+        std::env::var("BREADCLOUD_PASS").ok(),
+    ) {
         let quota_bytes = DEFAULT_LEGACY_QUOTA_GIB * GIB;
         quota_by_user.insert(username.clone(), quota_bytes);
         let default_user = username.clone();
@@ -212,6 +231,7 @@ async fn main() {
         .expect("BREADCLOUD_BIND must be a valid address, e.g. 127.0.0.1:8080");
 
     let loaded = load_accounts();
+    validate_open_mode_bind(!loaded.accounts.is_empty(), addr);
     let usernames: Vec<String> = if loaded.accounts.is_empty() {
         vec![loaded.default_user.clone()]
     } else {
@@ -339,9 +359,36 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::root_path;
+    use super::{legacy_credentials, root_path, validate_open_mode_bind};
     use std::ffi::OsString;
+    use std::net::SocketAddr;
     use std::path::PathBuf;
+
+    #[test]
+    fn legacy_credentials_require_both_values_or_neither() {
+        assert_eq!(
+            legacy_credentials(Some("alice".to_string()), Some("secret".to_string())),
+            Some(("alice".to_string(), "secret".to_string()))
+        );
+        assert_eq!(legacy_credentials(None, None), None);
+        assert!(
+            std::panic::catch_unwind(|| legacy_credentials(Some("alice".to_string()), None))
+                .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| legacy_credentials(None, Some("secret".to_string())))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn open_mode_is_limited_to_loopback_bind_addresses() {
+        let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let wildcard: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        validate_open_mode_bind(false, loopback);
+        assert!(std::panic::catch_unwind(|| validate_open_mode_bind(false, wildcard)).is_err());
+        validate_open_mode_bind(true, wildcard);
+    }
 
     #[test]
     fn uploads_root_default_is_a_sibling_not_system_temp() {
