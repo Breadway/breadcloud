@@ -16,7 +16,7 @@
 //! adding a second browsing surface for it here would be scope beyond
 //! what "minimal" asks for.
 
-use axum::extract::{FromRequest, Multipart, Request};
+use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use breadcloud_storage::{DavPath, StorageError};
@@ -28,21 +28,8 @@ use crate::template::{
     FOLDER_ICON,
 };
 
-/// Safety cap on a UI-uploaded file, matching the plain PUT path's own
-/// buffered-body cap (`breadcloud_webdav::handlers::put::MAX_BODY_BYTES`,
-/// not exported, so this is the same figure re-stated rather than
-/// imported -- a browser file upload only ever exercises this path, never
-/// the chunked-upload one real desktop sync clients use for anything
-/// this large in practice).
-///
-/// `pub` (re-exported at the crate root) so `breadcloud-server::combined`
-/// can size its `DefaultBodyLimit` layer to match this exactly, rather
-/// than a second hand-copied constant: axum applies its own 2 MiB default
-/// body-size limit to any request read through a `DefaultBodyLimit`-aware
-/// extractor (`Multipart::from_request` below is the one such extractor
-/// anywhere in this workspace, see `combined.rs`'s own layer for the
-/// rest of that reasoning), silently overriding this cap unless the
-/// combined router raises it to match.
+/// Maximum size of a UI-uploaded file. Multipart data is streamed to a
+/// temporary file and this limit is enforced as each chunk arrives.
 pub const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024 * 1024;
 
 pub async fn browse(state: &AppState, user: &str, path: &DavPath) -> Response {
@@ -191,89 +178,149 @@ pub async fn download(state: &AppState, path: &DavPath) -> Response {
 }
 
 pub async fn upload(state: &AppState, req: Request) -> Response {
-    let mut multipart = match Multipart::from_request(req, &()).await {
-        Ok(m) => m,
+    upload_with_limit(state, req, MAX_UPLOAD_BYTES as u64).await
+}
+
+async fn upload_with_limit(state: &AppState, req: Request, max_bytes: u64) -> Response {
+    let content_type = match req
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(value) => value.to_owned(),
+        None => return (StatusCode::BAD_REQUEST, "missing multipart content type").into_response(),
+    };
+    let boundary = match multer::parse_boundary(&content_type) {
+        Ok(boundary) => boundary,
         Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
     };
+    let constraints = multer::Constraints::new().size_limit(
+        multer::SizeLimit::new()
+            .whole_stream(max_bytes + 1024 * 1024)
+            .per_field(64 * 1024)
+            .for_field("file", max_bytes),
+    );
+    let mut multipart = multer::Multipart::with_constraints(
+        req.into_body().into_data_stream(),
+        boundary,
+        constraints,
+    );
 
-    let mut dir = String::from("/");
-    let mut file_name: Option<String> = None;
-    let mut data: Option<Vec<u8>> = None;
+    let mut dir: Option<String> = None;
+    let mut prepared: Option<(String, breadcloud_storage::PreparedWrite)> = None;
 
     loop {
         let mut field = match multipart.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
-            Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+            Err(err) => return multipart_error_response(err),
         };
         let field_name = field.name().unwrap_or("").to_string();
         match field_name.as_str() {
             "dir" => {
-                dir = field.text().await.unwrap_or_default();
+                if dir.is_some() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "only one target folder may be supplied",
+                    )
+                        .into_response();
+                }
+                dir = Some(match field.text().await {
+                    Ok(dir) => dir,
+                    Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+                });
             }
             "file" => {
-                file_name = field.file_name().map(str::to_string);
-                // Read chunk-by-chunk (rather than `field.bytes()`, which
-                // buffers the whole field before this function ever gets
-                // a size to check) so an oversized upload is rejected as
-                // soon as it crosses the cap, not after it has already
-                // been buffered in full.
-                let mut buf: Vec<u8> = Vec::new();
+                if prepared.is_some() {
+                    return (StatusCode::BAD_REQUEST, "only one file may be uploaded")
+                        .into_response();
+                }
+                let Some(file_name) = field.file_name().map(str::to_string) else {
+                    return (StatusCode::BAD_REQUEST, "no file selected").into_response();
+                };
+                if file_name.is_empty() {
+                    return (StatusCode::BAD_REQUEST, "no file selected").into_response();
+                }
+                let leaf = file_name.rsplit(['/', '\\']).next().unwrap_or(&file_name);
+                let mut write = match state.storage.prepare_upload().await {
+                    Ok(write) => write,
+                    Err(err) => return breadcloud_webdav::error::storage_error_response(err),
+                };
                 loop {
                     match field.chunk().await {
                         Ok(Some(chunk)) => {
-                            if buf.len() + chunk.len() > MAX_UPLOAD_BYTES {
+                            if write.total().saturating_add(chunk.len() as u64) > max_bytes {
                                 return (StatusCode::PAYLOAD_TOO_LARGE, "file too large")
                                     .into_response();
                             }
-                            buf.extend_from_slice(&chunk);
+                            if let Err(err) = write.write_chunk(&chunk).await {
+                                return breadcloud_webdav::error::storage_error_response(err);
+                            }
                         }
                         Ok(None) => break,
-                        Err(err) => {
-                            return (StatusCode::BAD_REQUEST, err.to_string()).into_response()
-                        }
+                        Err(err) => return multipart_error_response(err),
                     }
                 }
-                data = Some(buf);
+                prepared = Some((leaf.to_owned(), write));
             }
             _ => {}
         }
     }
 
-    let Some(file_name) = file_name.filter(|n| !n.is_empty()) else {
+    let Some((leaf, prepared)) = prepared else {
         return (StatusCode::BAD_REQUEST, "no file selected").into_response();
     };
-    // A browser sends only the leaf name in `filename`, but treat it as
-    // untrusted anyway and take the last path segment only, same
-    // defense-in-depth `DavPath::parse` already applies to every other
-    // path this server accepts from a client.
-    let leaf = file_name.rsplit(['/', '\\']).next().unwrap_or(&file_name);
-    let Ok(parent) = DavPath::parse(&dir) else {
+    let Ok(parent) = DavPath::parse(dir.as_deref().unwrap_or("/")) else {
         return (StatusCode::BAD_REQUEST, "invalid target folder").into_response();
     };
-    let dest = parent.child(leaf);
-    let data = data.unwrap_or_default();
-
-    if let Err(err) = breadcloud_webdav::versioning::snapshot_before_overwrite(state, &dest).await {
-        return breadcloud_webdav::error::storage_error_response(err);
-    }
+    let dest = match parent.child(&leaf) {
+        Ok(path) => path,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid file name").into_response(),
+    };
+    let prepared = match prepared.for_destination(&state.storage, &dest).await {
+        Ok(write) => write,
+        Err(err) => return breadcloud_webdav::error::storage_error_response(err),
+    };
+    let total = prepared.total();
 
     let _quota_guard = match state.quota_limit_bytes {
-        Some(limit) => match state
-            .storage
-            .quota_gate(limit, &dest, data.len() as u64)
-            .await
-        {
+        Some(limit) => match state.storage.quota_gate(limit, &dest, total).await {
             Ok(guard) => Some(guard),
             Err(err) => return breadcloud_webdav::error::storage_error_response(err),
         },
         None => None,
     };
 
-    match state.storage.write_bytes(&dest, &data).await {
-        Ok(_) => Redirect::to(&encode_ui_path("/ui/files", &parent)).into_response(),
-        Err(err) => breadcloud_webdav::error::storage_error_response(err),
+    // Take a version only after the upload body is valid and the quota
+    // gate accepted it, immediately before replacing the live file.
+    let pending_snapshot =
+        match breadcloud_webdav::versioning::snapshot_before_overwrite(state, &dest).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => return breadcloud_webdav::error::storage_error_response(err),
+        };
+
+    match prepared.commit(&state.storage).await {
+        Ok(_) => {
+            breadcloud_webdav::versioning::finish_snapshot(state, &dest, pending_snapshot).await;
+            Redirect::to(&encode_ui_path("/ui/files", &parent)).into_response()
+        }
+        Err(err) => {
+            breadcloud_webdav::versioning::discard_snapshot(state, &dest, pending_snapshot).await;
+            breadcloud_webdav::error::storage_error_response(err)
+        }
     }
+}
+
+fn multipart_error_response(err: multer::Error) -> Response {
+    let status = if matches!(
+        &err,
+        multer::Error::FieldSizeExceeded { .. } | multer::Error::StreamSizeExceeded { .. }
+    ) {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (status, err.to_string()).into_response()
 }
 
 pub async fn mkdir(state: &AppState, req: Request) -> Response {
@@ -289,13 +336,10 @@ pub async fn mkdir(state: &AppState, req: Request) -> Response {
     let Ok(parent) = DavPath::parse(&dir) else {
         return (StatusCode::BAD_REQUEST, "invalid target folder").into_response();
     };
-    // Reject an embedded separator rather than letting it silently
-    // address a nested path: this form field is meant to name one new
-    // child of `parent`, not a multi-segment path.
-    if name.contains('/') {
-        return (StatusCode::BAD_REQUEST, "folder name cannot contain '/'").into_response();
-    }
-    let target = parent.child(name);
+    let target = match parent.child(name) {
+        Ok(path) => path,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid folder name").into_response(),
+    };
 
     let resp = breadcloud_webdav::handlers::mkcol::handle(state, &target).await;
     if resp.status().is_success() {
@@ -324,5 +368,192 @@ pub async fn delete(state: &AppState, req: Request) -> Response {
         Redirect::to(&encode_ui_path("/ui/files", &parent)).into_response()
     } else {
         resp
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    fn state() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let live = dir.path().join("live");
+        let uploads = dir.path().join("uploads");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&uploads).unwrap();
+        let state = AppState::new(
+            breadcloud_storage::Storage::new(live),
+            breadcloud_storage::Storage::new(uploads),
+            breadcloud_storage::VersionStore::new(dir.path().join("versions")),
+            breadcloud_storage::TrashStore::new(dir.path().join("trash")),
+        );
+        (dir, state)
+    }
+    fn assert_no_staging(dir: &std::path::Path) {
+        for name in [".live-assembly-staging", ".uploads-assembly-staging"] {
+            let stage = dir.join(name);
+            if stage.exists() {
+                assert_eq!(std::fs::read_dir(stage).unwrap().count(), 0);
+            }
+        }
+    }
+
+    fn multipart(parts: &[(&str, Option<&str>, &str)], complete: bool) -> Request {
+        let mut body = String::new();
+        for (name, file, value) in parts {
+            body.push_str(&format!(
+                "--testboundary\r\nContent-Disposition: form-data; name=\"{name}\""
+            ));
+            if let Some(file) = file {
+                body.push_str(&format!("; filename=\"{file}\""));
+            }
+            body.push_str(&format!("\r\n\r\n{value}\r\n"));
+        }
+        if complete {
+            body.push_str("--testboundary--\r\n");
+        }
+        Request::builder()
+            .method("POST")
+            .header("Content-Type", "multipart/form-data; boundary=testboundary")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn file_before_folder_uploads_to_final_folder() {
+        let (dir, state) = state();
+        state
+            .storage
+            .mkcol(&DavPath::parse("/target").unwrap())
+            .await
+            .unwrap();
+        let req = multipart(
+            &[
+                ("file", Some("photo.jpg"), "new bytes"),
+                ("dir", None, "/target"),
+            ],
+            true,
+        );
+        let response = upload_with_limit(&state, req, 32).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers()["location"], "/ui/files/target");
+        assert_eq!(
+            state
+                .storage
+                .read_bytes(&DavPath::parse("/target/photo.jpg").unwrap())
+                .await
+                .unwrap(),
+            b"new bytes"
+        );
+        assert!(
+            !state
+                .storage
+                .exists(&DavPath::parse("/photo.jpg").unwrap())
+                .await
+        );
+        assert_no_staging(dir.path());
+    }
+    #[tokio::test]
+    async fn rejected_multipart_preserves_destination_and_history() {
+        let (dir, state) = state();
+        state
+            .storage
+            .mkcol(&DavPath::parse("/target").unwrap())
+            .await
+            .unwrap();
+        let path = DavPath::parse("/target/file.txt").unwrap();
+        state
+            .storage
+            .write_bytes(&path, b"old bytes")
+            .await
+            .unwrap();
+        let cases = [
+            (
+                vec![
+                    ("dir", None, "/target"),
+                    ("file", Some("file.txt"), "new bytes"),
+                ],
+                true,
+                4,
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                vec![
+                    ("dir", None, "/target"),
+                    ("file", Some("file.txt"), "new bytes"),
+                ],
+                false,
+                32,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                vec![
+                    ("file", Some("file.txt"), "new bytes"),
+                    ("dir", None, "/target"),
+                    ("dir", None, "/"),
+                ],
+                true,
+                32,
+                StatusCode::BAD_REQUEST,
+            ),
+        ];
+        for (parts, complete, limit, status) in cases {
+            assert_eq!(
+                upload_with_limit(&state, multipart(&parts, complete), limit)
+                    .await
+                    .status(),
+                status
+            );
+            assert_eq!(state.storage.read_bytes(&path).await.unwrap(), b"old bytes");
+            assert!(
+                !state
+                    .storage
+                    .exists(&DavPath::parse("/file.txt").unwrap())
+                    .await
+            );
+            assert!(state.versions.list(&path).await.unwrap().is_empty());
+            assert_no_staging(dir.path());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use breadcloud_storage::{Storage, TrashStore, VersionStore};
+    use tempfile::TempDir;
+
+    fn test_state() -> (TempDir, TempDir, TempDir, TempDir, AppState) {
+        let root = TempDir::new().unwrap();
+        let uploads = TempDir::new().unwrap();
+        let versions = TempDir::new().unwrap();
+        let trash = TempDir::new().unwrap();
+        let state = AppState::new(
+            Storage::new(root.path()),
+            Storage::new(uploads.path()),
+            VersionStore::new(versions.path()),
+            TrashStore::new(trash.path()),
+        );
+        (root, uploads, versions, trash, state)
+    }
+
+    #[tokio::test]
+    async fn mkdir_rejects_invalid_child_names() {
+        let (_root, _uploads, _versions, _trash, state) = test_state();
+
+        for name in ["..", "nested%2Fname", "name%00suffix"] {
+            let request = Request::builder()
+                .method("POST")
+                .body(Body::from(format!("dir=%2F&name={name}")))
+                .unwrap();
+            let response = mkdir(&state, request).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "accepted invalid folder name {name:?}"
+            );
+        }
     }
 }

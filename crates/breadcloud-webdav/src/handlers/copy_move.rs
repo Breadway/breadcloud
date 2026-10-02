@@ -1,7 +1,7 @@
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use breadcloud_storage::{DavPath, StorageError, WriteOutcome};
+use breadcloud_storage::{DavPath, EntryKind, StorageError, TrashEntry, WriteOutcome};
 use percent_encoding::percent_decode_str;
 
 use crate::error::storage_error_response;
@@ -36,24 +36,83 @@ pub async fn handle(
         .map(|v| !v.eq_ignore_ascii_case("F"))
         .unwrap_or(true);
 
-    let result = if copy {
-        state.storage.copy_to(source, &destination, overwrite).await
-    } else {
-        state.storage.move_to(source, &destination, overwrite).await
+    // COPY under a quota keeps the serialization PUT and chunk finalization
+    // use: hold the account's quota mutex across staging and commit so a
+    // concurrent write cannot slip past the check. The guard lives until
+    // commit_relocation returns.
+    let quota_guard = match (copy, state.quota_limit_bytes) {
+        (true, Some(limit)) => match state
+            .storage
+            .copy_quota_gate(limit, source, &destination)
+            .await
+        {
+            Ok(guard) => Some(guard),
+            Err(error) => return storage_error_response(error),
+        },
+        _ => None,
     };
+
+    let prepared = match state
+        .storage
+        .prepare_relocation(source, &destination, overwrite, copy)
+        .await
+    {
+        Ok(prepared) => prepared,
+        Err(StorageError::AlreadyExists) => {
+            return (
+                StatusCode::PRECONDITION_FAILED,
+                "destination exists and Overwrite is F",
+            )
+                .into_response()
+        }
+        Err(error) => return storage_error_response(error),
+    };
+    let mut retained = None;
+    if prepared.existed() {
+        let destination_meta = match state.storage.metadata(&destination).await {
+            Ok(meta) => meta,
+            Err(error) => {
+                prepared.discard().await;
+                return storage_error_response(error);
+            }
+        };
+        if copy && !prepared.source_is_dir() && !destination_meta.is_dir() {
+            // File COPY keeps destination history just like PUT. MOVE and
+            // collection replacements retain the displaced resource in trash.
+            if let Err(error) =
+                crate::versioning::snapshot_before_overwrite(state, &destination).await
+            {
+                prepared.discard().await;
+                return storage_error_response(error);
+            }
+        } else {
+            match retain_destination(state, &destination, destination_meta.is_dir()).await {
+                Ok(entry) => retained = Some(entry),
+                Err(error) => {
+                    prepared.discard().await;
+                    return storage_error_response(error);
+                }
+            }
+        }
+    }
+    let result = state.storage.commit_relocation(prepared).await;
+    drop(quota_guard);
+    if let Some(entry) = retained {
+        if result.is_err() {
+            if let Err(error) = restore_retained(state, &entry, &destination).await {
+                return storage_error_response(error);
+            }
+        } else if let Err(error) = state.trash.enforce_caps().await {
+            tracing::warn!("trash caps failed after replacement: {error}");
+        }
+    }
 
     match result {
         Ok(outcome) => {
-            // Version history (CLOUD-4) follows a rename, but not a copy:
-            // a COPY produces an independent new resource with no history
-            // of its own, matching the fact that the copied bytes have no
-            // prior overwrite events at the destination path. On MOVE,
-            // if the destination already had its own version history
-            // (because a file there is being replaced or removed by this
-            // same move), that history is discarded first -- it belonged
-            // to content this move is removing. Best-effort: a failure
-            // here is logged but does not turn an already-successful
-            // MOVE/COPY into an error response.
+            // Version history follows MOVE's source. Displaced destination
+            // history was retained with its payload in trash before commit.
+            // COPY keeps existing destination versions and snapshots the
+            // prior file content, just like PUT.
             if !copy {
                 if let Err(err) = state.versions.move_all(source, &destination).await {
                     tracing::warn!(
@@ -100,6 +159,68 @@ pub async fn handle(
             .into_response(),
         Err(err) => storage_error_response(err),
     }
+}
+
+async fn retain_destination(
+    state: &AppState,
+    path: &DavPath,
+    is_dir: bool,
+) -> Result<TrashEntry, StorageError> {
+    let size = if is_dir {
+        state
+            .storage
+            .list_recursive(path)
+            .await?
+            .iter()
+            .filter(|entry| !entry.metadata.is_dir())
+            .map(|entry| entry.metadata.len)
+            .sum()
+    } else {
+        state.storage.metadata(path).await?.len
+    };
+    let kind = if is_dir {
+        EntryKind::Directory
+    } else {
+        EntryKind::File
+    };
+    let entry = state
+        .trash
+        .trash(&state.storage.resolve(path), path, kind, size)
+        .await?;
+    if let Err(error) = state
+        .versions
+        .move_out(path, &state.trash.versions_dir(&entry.id))
+        .await
+    {
+        // Failed move_out normally leaves history at its original path.
+        // Restore payload alone, preserving stranded data on RecoveryFailed.
+        if matches!(error, StorageError::RecoveryFailed { .. }) {
+            return Err(error);
+        }
+        state
+            .trash
+            .restore_payload(&entry.id, &state.storage.resolve(path))
+            .await?;
+        state.trash.finish_restore(&entry.id).await?;
+        return Err(error);
+    }
+    Ok(entry)
+}
+
+async fn restore_retained(
+    state: &AppState,
+    entry: &TrashEntry,
+    destination: &DavPath,
+) -> Result<(), StorageError> {
+    state
+        .trash
+        .restore_payload(&entry.id, &state.storage.resolve(destination))
+        .await?;
+    state
+        .versions
+        .move_in(destination, &state.trash.versions_dir(&entry.id))
+        .await?;
+    state.trash.finish_restore(&entry.id).await
 }
 
 /// Extract, percent-decode, strip any DAV mount prefix from, and parse

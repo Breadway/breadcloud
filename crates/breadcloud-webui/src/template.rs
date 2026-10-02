@@ -125,7 +125,10 @@ pub fn breadcrumbs(path: &DavPath) -> String {
     out.push_str(r#"<a href="/ui/files/">files</a>"#);
     let mut built = DavPath::root();
     for seg in path.segments() {
-        built = built.child(seg);
+        // These segments came from an already validated `DavPath`.
+        built = built
+            .child(seg)
+            .expect("DavPath segments are safe child names");
         out.push_str(r#"<span class="crumb-sep">/</span>"#);
         // Same two-step encoding `files.rs`'s row links need: percent-
         // encode for the URL, then HTML-attribute-escape the result
