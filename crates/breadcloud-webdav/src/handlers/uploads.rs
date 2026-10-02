@@ -31,7 +31,9 @@
 //! leave partial chunk files where a sync client might mistake them for
 //! real content.
 
+use futures_util::StreamExt;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 use axum::body::Body;
 use axum::extract::Request;
@@ -45,11 +47,10 @@ use crate::preconditions;
 use crate::state::AppState;
 use crate::xml::{build_multistatus, PropfindRequest, ResourceEntry};
 
-/// Safety cap on one buffered chunk. Real clients keep individual chunks
-/// well under this (historically single-digit to low tens of MB); it
-/// exists to bound memory, not to match any particular client's chunk
-/// size.
+/// Maximum size of one chunk body. Chunk bodies are streamed to disk, so
+/// this bounds staging storage rather than process memory.
 const MAX_CHUNK_BYTES: usize = 512 * 1024 * 1024;
+const STALE_TRANSFER_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 const UPLOADS_PREFIX: &str = "/remote.php/dav/uploads";
 
@@ -97,7 +98,16 @@ async fn handle_transfer_collection(
                 }
             }
             match state.uploads.mkcol(transfer_dir).await {
-                Ok(()) => StatusCode::CREATED.into_response(),
+                Ok(()) => {
+                    if let Some(user_dir) = transfer_dir.parent() {
+                        if let Err(err) =
+                            expire_stale_transfers(state, &user_dir, STALE_TRANSFER_AGE).await
+                        {
+                            tracing::warn!("failed to expire stale chunked uploads: {err}");
+                        }
+                    }
+                    StatusCode::CREATED.into_response()
+                }
                 Err(StorageError::AlreadyExists) => (
                     StatusCode::METHOD_NOT_ALLOWED,
                     "transfer collection already exists",
@@ -127,17 +137,65 @@ async fn handle_chunk(
     chunk_path: &DavPath,
     req: Request,
 ) -> Response {
+    handle_chunk_with_limit(
+        state,
+        method,
+        headers,
+        chunk_path,
+        req,
+        MAX_CHUNK_BYTES as u64,
+    )
+    .await
+}
+
+async fn handle_chunk_with_limit(
+    state: &AppState,
+    method: &Method,
+    headers: &HeaderMap,
+    chunk_path: &DavPath,
+    req: Request,
+    max_bytes: u64,
+) -> Response {
     match method.as_str() {
         "PUT" => {
-            let bytes = match axum::body::to_bytes(req.into_body(), MAX_CHUNK_BYTES).await {
-                Ok(b) => b,
-                Err(_) => {
-                    return (StatusCode::BAD_REQUEST, "could not read chunk body").into_response()
-                }
+            let mut prepared = match state.uploads.prepare_write(chunk_path).await {
+                Ok(prepared) => prepared,
+                Err(err) => return storage_error_response(err),
             };
-            match state.uploads.write_bytes(chunk_path, &bytes).await {
-                Ok((WriteOutcome::Created, _)) => StatusCode::CREATED.into_response(),
-                Ok((WriteOutcome::Overwritten, _)) => StatusCode::NO_CONTENT.into_response(),
+            let mut body = req.into_body().into_data_stream();
+            while let Some(chunk) = body.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(_) => {
+                        return (StatusCode::BAD_REQUEST, "could not read chunk body")
+                            .into_response()
+                    }
+                };
+                if prepared.total().saturating_add(chunk.len() as u64) > max_bytes {
+                    return (StatusCode::PAYLOAD_TOO_LARGE, "chunk too large").into_response();
+                }
+                if let Err(err) = prepared.write_chunk(&chunk).await {
+                    return storage_error_response(err);
+                }
+            }
+            // Chunk bytes are staged outside the counted tree, so this gate
+            // still sees the pre-write usage of committed chunks; it holds
+            // the staging mutex until the commit below finishes.
+            let _quota_guard = match state
+                .uploads
+                .quota_gate(
+                    state.upload_staging_limit_bytes,
+                    chunk_path,
+                    prepared.total(),
+                )
+                .await
+            {
+                Ok(guard) => guard,
+                Err(err) => return storage_error_response(err),
+            };
+            match prepared.commit(&state.uploads).await {
+                Ok((WriteOutcome::Created, _, _)) => StatusCode::CREATED.into_response(),
+                Ok((WriteOutcome::Overwritten, _, _)) => StatusCode::NO_CONTENT.into_response(),
                 Err(err) => storage_error_response(err),
             }
         }
@@ -160,6 +218,37 @@ async fn handle_chunk(
         )
             .into_response(),
     }
+}
+
+/// Remove transfer collections with no activity for a week. Chunk mtimes
+/// are included because overwriting an existing chunk does not necessarily
+/// update the parent directory mtime.
+async fn expire_stale_transfers(
+    state: &AppState,
+    user_dir: &DavPath,
+    max_age: Duration,
+) -> Result<(), StorageError> {
+    let transfers = match state.uploads.list_dir(user_dir).await {
+        Ok(transfers) => transfers,
+        Err(StorageError::NotFound) => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let cutoff = SystemTime::now()
+        .checked_sub(max_age)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    for transfer in transfers
+        .into_iter()
+        .filter(|entry| entry.metadata.is_dir())
+    {
+        let mut last_activity = transfer.metadata.modified;
+        for child in state.uploads.list_recursive(&transfer.path).await? {
+            last_activity = last_activity.max(child.metadata.modified);
+        }
+        if last_activity < cutoff {
+            state.uploads.delete(&transfer.path).await?;
+        }
+    }
+    Ok(())
 }
 
 /// PROPFIND on a transfer collection: reports the chunks already landed
@@ -330,13 +419,17 @@ async fn finalize(state: &AppState, transfer_dir: &DavPath, headers: &HeaderMap)
     // is about to reject. Most files in a real synced dataset take this
     // chunked path rather than plain PUT (see CLOUD-3), so skipping this
     // here would leave versioning working only for small files.
-    if let Err(err) = crate::versioning::snapshot_before_overwrite(state, &dest).await {
-        prepared.discard().await;
-        return storage_error_response(err);
-    }
+    let pending_snapshot = match crate::versioning::snapshot_before_overwrite(state, &dest).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            prepared.discard().await;
+            return storage_error_response(err);
+        }
+    };
 
     match state.storage.commit_assemble(prepared).await {
         Ok((outcome, total, etag)) => {
+            crate::versioning::finish_snapshot(state, &dest, pending_snapshot).await;
             let mtime_accepted = match crate::mtime::parse_oc_mtime(headers) {
                 Some(mtime) => crate::mtime::apply(state.storage.resolve(&dest), mtime),
                 None => false,
@@ -383,6 +476,119 @@ async fn finalize(state: &AppState, transfer_dir: &DavPath, headers: &HeaderMap)
             }
             builder.body(Body::empty()).unwrap()
         }
-        Err(err) => storage_error_response(err),
+        Err(err) => {
+            crate::versioning::discard_snapshot(state, &dest, pending_snapshot).await;
+            storage_error_response(err)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expire_stale_transfers;
+    use crate::state::AppState;
+    use breadcloud_storage::{DavPath, Storage, TrashStore, VersionStore};
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn stale_transfer_collections_are_removed() {
+        let storage_dir = TempDir::new().unwrap();
+        let uploads_dir = TempDir::new().unwrap();
+        let versions_dir = TempDir::new().unwrap();
+        let trash_dir = TempDir::new().unwrap();
+        let state = AppState::new(
+            Storage::new(storage_dir.path()),
+            Storage::new(uploads_dir.path()),
+            VersionStore::new(versions_dir.path()),
+            TrashStore::new(trash_dir.path()),
+        );
+        let user_dir = DavPath::parse("/alice").unwrap();
+        let transfer_dir = DavPath::parse("/alice/old-transfer").unwrap();
+        let chunk = DavPath::parse("/alice/old-transfer/1").unwrap();
+        state.uploads.mkcol(&user_dir).await.unwrap();
+        state.uploads.mkcol(&transfer_dir).await.unwrap();
+        state.uploads.write_bytes(&chunk, b"staged").await.unwrap();
+
+        expire_stale_transfers(&state, &user_dir, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(!state.uploads.exists(&transfer_dir).await);
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+
+    fn state() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let live = dir.path().join("live");
+        let uploads = dir.path().join("uploads");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&uploads).unwrap();
+        let state = AppState::new(
+            breadcloud_storage::Storage::new(live),
+            breadcloud_storage::Storage::new(uploads),
+            breadcloud_storage::VersionStore::new(dir.path().join("versions")),
+            breadcloud_storage::TrashStore::new(dir.path().join("trash")),
+        );
+        (dir, state)
+    }
+    fn assert_no_staging(dir: &std::path::Path) {
+        for name in [".live-assembly-staging", ".uploads-assembly-staging"] {
+            let stage = dir.join(name);
+            if stage.exists() {
+                assert_eq!(std::fs::read_dir(stage).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_and_interrupted_streams_preserve_existing_content() {
+        let (dir, state) = state();
+        let path = DavPath::parse("/dev/transfer/1").unwrap();
+        state
+            .uploads
+            .mkcol(&DavPath::parse("/dev").unwrap())
+            .await
+            .unwrap();
+        state
+            .uploads
+            .mkcol(&DavPath::parse("/dev/transfer").unwrap())
+            .await
+            .unwrap();
+        let storage = &state.uploads;
+        storage.write_bytes(&path, b"old bytes").await.unwrap();
+        for interrupted in [false, true] {
+            let chunks = if interrupted {
+                vec![
+                    Ok(bytes::Bytes::from_static(b"new")),
+                    Err(std::io::Error::other("connection interrupted")),
+                ]
+            } else {
+                vec![
+                    Ok(bytes::Bytes::from_static(b"new")),
+                    Ok(bytes::Bytes::from_static(b" data")),
+                ]
+            };
+            let body = Body::from_stream(futures_util::stream::iter(chunks));
+            let req = Request::builder().method("PUT").body(body).unwrap();
+            let response =
+                handle_chunk_with_limit(&state, &Method::PUT, &HeaderMap::new(), &path, req, 4)
+                    .await;
+            assert_eq!(
+                response.status(),
+                if interrupted {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                }
+            );
+            assert_eq!(storage.read_bytes(&path).await.unwrap(), b"old bytes");
+            assert!(state.versions.list(&path).await.unwrap().is_empty());
+            assert_no_staging(dir.path());
+        }
     }
 }

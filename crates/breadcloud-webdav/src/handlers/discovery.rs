@@ -51,8 +51,10 @@ pub fn status() -> Response {
 /// knows this server accepts NG chunked uploads (see
 /// `crate::handlers::uploads`), and `files.versioning: true` now that
 /// overwrites are captured into version history (CLOUD-4, see
-/// `crate::versioning` and `crate::handlers::versions`) -- `undelete`
-/// stays `false` since there is no trash yet (a separate, later issue).
+/// `crate::versioning` and `crate::handlers::versions`). `undelete`
+/// stays `false`: CLOUD-5 provides a minimal trash DAV endpoint using
+/// opaque IDs, but it does not implement Nextcloud's trashbin protocol.
+/// Advertising undelete would invite unsupported Nextcloud client probes.
 pub fn capabilities() -> Response {
     (
         StatusCode::OK,

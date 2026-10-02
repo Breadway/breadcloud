@@ -1,15 +1,19 @@
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use breadcloud_storage::{DavPath, WriteOutcome};
 use breadcloud_webdav::error::storage_error_response;
+use breadcloud_webdav::preconditions;
 
 use crate::handlers::read_body;
 use crate::state::AppState;
 use crate::vcard;
 
 fn dav_path(obj: &str) -> Option<DavPath> {
+    if obj.chars().any(char::is_control) {
+        return None;
+    }
     DavPath::parse(&format!("/{obj}")).ok()
 }
 
@@ -72,11 +76,6 @@ pub async fn put(
         return (StatusCode::BAD_REQUEST, "invalid resource name").into_response();
     };
 
-    let bytes = read_body(req).await;
-    if vcard::extract_uid(&bytes).is_none() {
-        return (StatusCode::BAD_REQUEST, "vCard has no UID").into_response();
-    }
-
     let contacts = match state
         .addressbooks
         .contacts_storage(user, addressbook_id)
@@ -85,6 +84,25 @@ pub async fn put(
         Ok(c) => c,
         Err(err) => return storage_error_response(err),
     };
+    let headers = req.headers().clone();
+    let bytes = read_body(req).await;
+    if vcard::extract_uid(&bytes).is_none() {
+        return (StatusCode::BAD_REQUEST, "vCard has no UID").into_response();
+    }
+    let _resource_gate = match state
+        .addressbooks
+        .resource_gate(user, addressbook_id, obj)
+        .await
+    {
+        Ok(guard) => guard,
+        Err(error) => return storage_error_response(error),
+    };
+    if let Some(conflict) =
+        preconditions::check_storage(&contacts, Some(user), &path, &headers).await
+    {
+        return conflict;
+    }
+
     let (outcome, etag) = match contacts.write_bytes(&path, &bytes).await {
         Ok(v) => v,
         Err(err) => return storage_error_response(err),
@@ -118,7 +136,13 @@ pub async fn put(
 /// through trash: trash is a file-tree concept, and a contact is a
 /// deliberately separate, simpler resource model with no versioning or
 /// soft-delete asked for by this issue.
-pub async fn delete(state: &AppState, user: &str, addressbook_id: &str, obj: &str) -> Response {
+pub async fn delete(
+    state: &AppState,
+    user: &str,
+    addressbook_id: &str,
+    obj: &str,
+    headers: &HeaderMap,
+) -> Response {
     let contacts = match state
         .addressbooks
         .contacts_storage(user, addressbook_id)
@@ -130,6 +154,19 @@ pub async fn delete(state: &AppState, user: &str, addressbook_id: &str, obj: &st
     let Some(path) = dav_path(obj) else {
         return (StatusCode::BAD_REQUEST, "invalid resource name").into_response();
     };
+    let _resource_gate = match state
+        .addressbooks
+        .resource_gate(user, addressbook_id, obj)
+        .await
+    {
+        Ok(guard) => guard,
+        Err(error) => return storage_error_response(error),
+    };
+    if let Some(conflict) =
+        preconditions::check_storage(&contacts, Some(user), &path, headers).await
+    {
+        return conflict;
+    }
     match contacts.delete(&path).await {
         Ok(()) => {
             if let Err(err) = state

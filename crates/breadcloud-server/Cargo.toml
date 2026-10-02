@@ -27,3 +27,4 @@ http-body-util = "0.1"
 tower = { version = "0.4", features = ["util"] }
 base64 = "0.22"
 serde_json = "1"
+tokio-util = { version = "0.7", features = ["io"] }

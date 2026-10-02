@@ -57,6 +57,48 @@ async fn put_then_get_roundtrips_content() {
 }
 
 #[tokio::test]
+async fn active_file_gets_are_sandboxed_and_downloaded_as_attachments() {
+    let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app();
+
+    for path in ["/page.html", "/image.svg"] {
+        assert_eq!(
+            put(&app, path, "<script>alert(1)</script>").await,
+            StatusCode::CREATED
+        );
+        let request = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(response.headers()["content-security-policy"], "sandbox");
+        assert_eq!(response.headers()["content-disposition"], "attachment");
+    }
+}
+
+#[tokio::test]
+async fn directory_listing_prefixes_file_links_and_is_sandboxed() {
+    let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app();
+    assert_eq!(
+        put(&app, "/javascript:alert(1)", "file").await,
+        StatusCode::CREATED
+    );
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(response.headers()["content-security-policy"], "sandbox");
+    let listing = body_string(response).await;
+    assert!(listing.contains("href=\"./javascript:alert(1)\""));
+}
+
+#[tokio::test]
 async fn put_overwrite_returns_no_content() {
     let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app();
 
@@ -204,6 +246,40 @@ async fn propfind_depth_1_lists_children() {
 }
 
 #[tokio::test]
+async fn propfind_infinity_is_rejected_with_finite_depth_error() {
+    let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app();
+
+    let propfind = Request::builder()
+        .method("PROPFIND")
+        .uri("/")
+        .header("Depth", "infinity")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(propfind).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        body_string(response).await,
+        "<d:error xmlns:d=\"DAV:\"><d:propfind-finite-depth/></d:error>"
+    );
+}
+
+#[tokio::test]
+async fn propfind_without_depth_header_is_rejected_as_infinity() {
+    let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app();
+
+    let propfind = Request::builder()
+        .method("PROPFIND")
+        .uri("/")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(propfind).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(body_string(response)
+        .await
+        .contains("propfind-finite-depth"));
+}
+
+#[tokio::test]
 async fn move_renames_resource() {
     let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app();
 
@@ -309,6 +385,36 @@ async fn copy_duplicates_resource_and_leaves_source_intact() {
     assert_eq!(
         app.oneshot(get_copy).await.unwrap().status(),
         StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn copy_is_rejected_when_source_would_exceed_quota() {
+    let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app_with_quota(1000);
+    assert_eq!(
+        put(&app, "/source.bin", &"x".repeat(600)).await,
+        StatusCode::CREATED
+    );
+
+    let copy = Request::builder()
+        .method("COPY")
+        .uri("/source.bin")
+        .header("Destination", "/copy.bin")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(copy).await.unwrap().status(),
+        StatusCode::from_u16(507).unwrap()
+    );
+
+    let get = Request::builder()
+        .method("GET")
+        .uri("/copy.bin")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.oneshot(get).await.unwrap().status(),
+        StatusCode::NOT_FOUND
     );
 }
 
@@ -441,6 +547,129 @@ fn test_app_with_quota(limit_bytes: u64) -> (TempDir, TempDir, TempDir, TempDir,
     (dir, uploads_dir, versions_dir, trash_dir, router(state))
 }
 
+fn test_app_with_staging_limit(
+    limit_bytes: u64,
+) -> (TempDir, TempDir, TempDir, TempDir, axum::Router) {
+    let dir = TempDir::new().unwrap();
+    let uploads_dir = TempDir::new().unwrap();
+    let versions_dir = TempDir::new().unwrap();
+    let trash_dir = TempDir::new().unwrap();
+    let state = AppState::new(
+        Storage::new(dir.path()),
+        Storage::new(uploads_dir.path()),
+        VersionStore::new(versions_dir.path()),
+        TrashStore::new(trash_dir.path()),
+    )
+    .with_upload_staging_limit_bytes(limit_bytes);
+    (dir, uploads_dir, versions_dir, trash_dir, router(state))
+}
+
+#[tokio::test]
+async fn staged_chunk_bytes_are_capped_across_transfers_for_one_user() {
+    let (_dir, uploads_dir, _versions_dir, _trash_dir, app) = test_app_with_staging_limit(10);
+    for transfer in ["txn1", "txn2"] {
+        let mkcol = Request::builder()
+            .method("MKCOL")
+            .uri(format!("/remote.php/dav/uploads/alice/{transfer}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(mkcol).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+    }
+
+    let first_chunk = Request::builder()
+        .method("PUT")
+        .uri("/remote.php/dav/uploads/alice/txn1/1")
+        .body(Body::from(vec![b'x'; 8]))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(first_chunk).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    let over_limit_chunk = Request::builder()
+        .method("PUT")
+        .uri("/remote.php/dav/uploads/alice/txn2/1")
+        .body(Body::from(vec![b'y'; 4]))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(over_limit_chunk).await.unwrap().status(),
+        StatusCode::from_u16(507).unwrap()
+    );
+    assert_eq!(
+        Storage::new(uploads_dir.path()).used_bytes().await.unwrap(),
+        8
+    );
+}
+
+#[tokio::test]
+async fn mkcol_expires_only_transfers_inactive_for_seven_days() {
+    use std::time::{Duration, SystemTime};
+
+    let (_dir, uploads_dir, _versions_dir, _trash_dir, app) = test_app();
+    let old = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+    for transfer in ["stale", "active-chunk", "recent"] {
+        let mkcol = Request::builder()
+            .method("MKCOL")
+            .uri(format!("/remote.php/dav/uploads/alice/{transfer}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(mkcol).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+    }
+    for transfer in ["stale", "active-chunk"] {
+        let chunk = Request::builder()
+            .method("PUT")
+            .uri(format!("/remote.php/dav/uploads/alice/{transfer}/1"))
+            .body(Body::from("chunk"))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(chunk).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+    }
+    // Backdate both collections and chunks, then overwrite one old chunk.
+    // Its current mtime must keep that otherwise old transfer alive.
+    for transfer in ["stale", "active-chunk"] {
+        let path = uploads_dir.path().join("alice").join(transfer);
+        std::fs::File::open(path.join("1"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    let overwrite = Request::builder()
+        .method("PUT")
+        .uri("/remote.php/dav/uploads/alice/active-chunk/1")
+        .body(Body::from("new chunk"))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(overwrite).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    let trigger = Request::builder()
+        .method("MKCOL")
+        .uri("/remote.php/dav/uploads/alice/new")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.oneshot(trigger).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    let user = uploads_dir.path().join("alice");
+    assert!(!user.join("stale").exists());
+    assert!(user.join("active-chunk/1").exists());
+    assert!(user.join("recent").exists());
+    assert!(user.join("new").exists());
+}
+
 /// CLOUD-11 round 3: `prepare_assemble` used to stage the fully assembled
 /// content inside the account's live storage root before the quota check
 /// ran, so `used_bytes`'s recursive walk counted those staged bytes once
@@ -551,6 +780,43 @@ async fn chunked_finalize_over_quota_is_still_rejected() {
 }
 
 #[tokio::test]
+async fn trash_restore_is_rejected_when_it_would_exceed_quota() {
+    let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app_with_quota(1000);
+    assert_eq!(
+        put(&app, "/old.bin", &"o".repeat(700)).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(delete(&app, "/old.bin").await, StatusCode::NO_CONTENT);
+    assert_eq!(
+        put(&app, "/new.bin", &"n".repeat(500)).await,
+        StatusCode::CREATED
+    );
+
+    let (_status, xml) = propfind_trashbin(&app).await;
+    let href = extract_hrefs(&xml).into_iter().next().unwrap();
+    let restore = Request::builder()
+        .method("MOVE")
+        .uri(href)
+        .header("Destination", "/restored.bin")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(restore).await.unwrap().status(),
+        StatusCode::from_u16(507).unwrap()
+    );
+
+    let get = Request::builder()
+        .method("GET")
+        .uri("/restored.bin")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.oneshot(get).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
 async fn basic_auth_rejects_missing_and_wrong_credentials() {
     let dir = TempDir::new().unwrap();
     let uploads_dir = TempDir::new().unwrap();
@@ -592,6 +858,64 @@ async fn basic_auth_rejects_missing_and_wrong_credentials() {
         .unwrap();
     let response = app.oneshot(right_auth).await.unwrap();
     assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn status_discovery_exemption_only_allows_get_on_exact_path() {
+    let dir = TempDir::new().unwrap();
+    let uploads_dir = TempDir::new().unwrap();
+    let versions_dir = TempDir::new().unwrap();
+    let trash_dir = TempDir::new().unwrap();
+    let storage = Storage::new(dir.path());
+    let uploads = Storage::new(uploads_dir.path());
+    let versions = VersionStore::new(versions_dir.path());
+    let trash = TrashStore::new(trash_dir.path());
+    let state = AppState::new(storage, uploads, versions, trash).with_auth("alice", "secret");
+    let app = router(state);
+
+    let status_get = Request::builder()
+        .method("GET")
+        .uri("/status.php")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(status_get).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let status_put = Request::builder()
+        .method("PUT")
+        .uri("/status.php")
+        .body(Body::from("unauthenticated"))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(status_put).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let nested_status_get = Request::builder()
+        .method("GET")
+        .uri("/anything/status.php")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(nested_status_get)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let nested_status_put = Request::builder()
+        .method("PUT")
+        .uri("/anything/status.php")
+        .body(Body::from("unauthenticated"))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(nested_status_put).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[tokio::test]
@@ -1188,6 +1512,49 @@ async fn restore_with_explicit_overwrite_replaces_the_occupied_destination() {
 }
 
 #[tokio::test]
+async fn restore_rejects_the_storage_root_as_destination() {
+    let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app();
+
+    assert_eq!(
+        put(&app, "/keep.txt", "keep this file").await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        put(&app, "/a.txt", "trashed content").await,
+        StatusCode::CREATED
+    );
+    assert_eq!(delete(&app, "/a.txt").await, StatusCode::NO_CONTENT);
+
+    let (_status, xml) = propfind_trashbin(&app).await;
+    let href = extract_hrefs(&xml).into_iter().next().unwrap();
+
+    let restore = Request::builder()
+        .method("MOVE")
+        .uri(&href)
+        .header("Destination", "/")
+        .header("Overwrite", "T")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(restore).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let keep = Request::builder()
+        .method("GET")
+        .uri("/keep.txt")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(keep).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_string(response).await, "keep this file");
+
+    let (_status, xml) = propfind_trashbin(&app).await;
+    assert_eq!(xml.matches("<d:response>").count(), 1);
+    assert!(extract_hrefs(&xml).contains(&href));
+}
+
+#[tokio::test]
 async fn delete_on_trashbin_entry_purges_it_permanently() {
     let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app();
 
@@ -1569,4 +1936,126 @@ async fn trash_cap_enforcement_evicts_the_oldest_deletion_once_the_size_cap_is_e
     let (_status, xml) = propfind_trashbin(&app).await;
     assert_eq!(xml.matches("<d:response>").count(), 1);
     assert!(xml.contains("<nc:trashbin-original-location>/b.txt</nc:trashbin-original-location>"));
+}
+
+#[tokio::test]
+async fn copy_overwrite_retains_destination_file_version() {
+    let (root, _uploads, version_root, _trash, app) = test_app();
+    tokio::fs::write(root.path().join("source"), b"new")
+        .await
+        .unwrap();
+    tokio::fs::write(root.path().join("destination"), b"old")
+        .await
+        .unwrap();
+    let request = Request::builder()
+        .method("COPY")
+        .uri("/source")
+        .header("Destination", "/destination")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.oneshot(request).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    let versions = VersionStore::new(version_root.path());
+    let path = breadcloud_storage::DavPath::parse("/destination").unwrap();
+    let history = versions.list(&path).await.unwrap();
+    assert_eq!(history.len(), 1);
+    let (mut file, _) = versions.read(&path, &history[0].id).await.unwrap();
+    let mut previous = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut file, &mut previous)
+        .await
+        .unwrap();
+    assert_eq!(previous, b"old");
+    assert_eq!(
+        tokio::fs::read(root.path().join("destination"))
+            .await
+            .unwrap(),
+        b"new"
+    );
+}
+
+#[tokio::test]
+async fn move_overwrite_retains_replaced_content_and_history_in_trash() {
+    let (root, _uploads, version_root, trash_root, app) = test_app();
+    tokio::fs::write(root.path().join("source"), b"new")
+        .await
+        .unwrap();
+    tokio::fs::write(root.path().join("destination"), b"old")
+        .await
+        .unwrap();
+    let path = breadcloud_storage::DavPath::parse("/destination").unwrap();
+    let versions = VersionStore::new(version_root.path());
+    versions.snapshot(&path, b"older").await.unwrap();
+    let request = Request::builder()
+        .method("MOVE")
+        .uri("/source")
+        .header("Destination", "/destination")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.oneshot(request).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    let trash = TrashStore::new(trash_root.path());
+    let entries = trash.list().await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].original_path, path);
+    assert_eq!(
+        tokio::fs::read(trash.payload_path(&entries[0].id))
+            .await
+            .unwrap(),
+        b"old"
+    );
+    assert!(trash.versions_dir(&entries[0].id).exists());
+    assert!(!root.path().join("source").exists());
+    assert_eq!(
+        tokio::fs::read(root.path().join("destination"))
+            .await
+            .unwrap(),
+        b"new"
+    );
+}
+
+#[tokio::test]
+async fn copy_collection_overwrite_retains_replaced_collection_in_trash() {
+    let (root, _uploads, _versions, trash_root, app) = test_app();
+    tokio::fs::create_dir(root.path().join("source"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir(root.path().join("destination"))
+        .await
+        .unwrap();
+    tokio::fs::write(root.path().join("source/new"), b"new")
+        .await
+        .unwrap();
+    tokio::fs::write(root.path().join("destination/old"), b"old")
+        .await
+        .unwrap();
+    let request = Request::builder()
+        .method("COPY")
+        .uri("/source")
+        .header("Destination", "/destination")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.oneshot(request).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    let trash = TrashStore::new(trash_root.path());
+    let entries = trash.list().await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        tokio::fs::read(trash.payload_path(&entries[0].id).join("old"))
+            .await
+            .unwrap(),
+        b"old"
+    );
+    assert!(!root.path().join("destination/old").exists());
+    assert_eq!(
+        tokio::fs::read(root.path().join("destination/new"))
+            .await
+            .unwrap(),
+        b"new"
+    );
 }

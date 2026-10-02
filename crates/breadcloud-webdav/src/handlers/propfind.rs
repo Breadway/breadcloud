@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use breadcloud_storage::DavPath;
 
@@ -38,6 +38,15 @@ pub async fn handle(
     req: Request,
 ) -> Response {
     let depth = parse_depth(headers);
+    if matches!(depth, Depth::Infinity) {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .body(Body::from(
+                "<d:error xmlns:d=\"DAV:\"><d:propfind-finite-depth/></d:error>",
+            ))
+            .unwrap();
+    }
 
     let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_PROPFIND_BODY_BYTES).await {
         Ok(b) => b,
