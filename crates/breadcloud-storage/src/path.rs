@@ -66,11 +66,23 @@ impl DavPath {
         Some(DavPath { segments })
     }
 
-    /// A path for a child of this collection.
-    pub fn child(&self, name: &str) -> DavPath {
+    /// A path for a single child of this collection.
+    ///
+    /// `name` must be one non-empty path segment. Separators, dot segments,
+    /// and NUL bytes are rejected so a child can never introduce a path
+    /// component that was not validated by [`DavPath::parse`].
+    pub fn child(&self, name: &str) -> Result<DavPath, InvalidPath> {
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\0')
+        {
+            return Err(InvalidPath(name.to_string()));
+        }
         let mut segments = self.segments.clone();
         segments.push(name.to_string());
-        DavPath { segments }
+        Ok(DavPath { segments })
     }
 
     /// Render as a `/`-separated absolute path, e.g. `/foo/bar.txt`. Root
@@ -138,7 +150,23 @@ mod tests {
         let p = DavPath::parse("/a/b/c").unwrap();
         let parent = p.parent().unwrap();
         assert_eq!(parent.to_request_path(), "/a/b");
-        assert_eq!(parent.child("c"), p);
+        assert_eq!(parent.child("c").unwrap(), p);
+    }
+
+    #[test]
+    fn child_rejects_invalid_segments() {
+        let parent = DavPath::parse("/safe").unwrap();
+        for name in ["", ".", "..", "nested/name", "name\0suffix"] {
+            assert!(
+                parent.child(name).is_err(),
+                "accepted child segment {name:?}"
+            );
+        }
+
+        assert_eq!(
+            parent.child("valid-name").unwrap().to_request_path(),
+            "/safe/valid-name"
+        );
     }
 
     #[test]

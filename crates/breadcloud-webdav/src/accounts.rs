@@ -21,6 +21,27 @@ use axum::http::HeaderMap;
 use base64::Engine;
 use rand_core::OsRng;
 
+const DUMMY_PASSWORD: &str = "breadcloud-unknown-account-placeholder";
+
+fn hash_password(password: &str) -> String {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .expect("argon2 hashing a non-empty password should never fail")
+        .to_string()
+}
+
+fn verify_password(password_hash: &str, password: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(password_hash) else {
+        // Stored hashes are produced by `hash_password`. A malformed hash
+        // must fail closed instead of panicking or accepting a password.
+        return false;
+    };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
+}
+
 /// One account: a username, an argon2id password hash, and a storage
 /// quota in bytes.
 ///
@@ -50,29 +71,15 @@ impl Account {
     /// `breadcloud_storage::Storage::check_quota`/`quota_report` for where
     /// it actually gets enforced and reported.
     pub fn new(username: impl Into<String>, password: &str, quota_bytes: u64) -> Self {
-        let salt = SaltString::generate(&mut OsRng);
-        let password_hash = Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
-            .expect("argon2 hashing a non-empty password should never fail")
-            .to_string();
         Account {
             username: username.into(),
-            password_hash,
+            password_hash: hash_password(password),
             quota_bytes,
         }
     }
 
     fn verify(&self, password: &str) -> bool {
-        let Ok(parsed) = PasswordHash::new(&self.password_hash) else {
-            // The hash this account was built with is not well-formed
-            // argon2 PHC output. This should be unreachable (the only
-            // constructor always produces a valid one), but a malformed
-            // hash must fail closed, not panic or accept anything.
-            return false;
-        };
-        Argon2::default()
-            .verify_password(password.as_bytes(), &parsed)
-            .is_ok()
+        verify_password(&self.password_hash, password)
     }
 }
 
@@ -81,9 +88,16 @@ impl Account {
 /// unauthenticated local-dev mode `breadcloud_webdav::auth` and this
 /// crate's callers have always supported, preserved unchanged by
 /// CLOUD-11 (see `breadcloud-server`'s `main.rs`).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AccountStore {
     accounts: HashMap<String, Account>,
+    dummy_password_hash: String,
+}
+
+impl Default for AccountStore {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
 }
 
 impl AccountStore {
@@ -93,6 +107,9 @@ impl AccountStore {
                 .into_iter()
                 .map(|a| (a.username.clone(), a))
                 .collect(),
+            // Generate once so the first unknown-user request has the same
+            // verification cost as later requests. This hash never grants access.
+            dummy_password_hash: hash_password(DUMMY_PASSWORD),
         }
     }
 
@@ -130,7 +147,13 @@ impl AccountStore {
             .ok()?;
         let text = String::from_utf8(decoded).ok()?;
         let (user, pass) = text.split_once(':')?;
-        let account = self.accounts.get(user)?;
+        let Some(account) = self.accounts.get(user) else {
+            // Keep unknown usernames on the same password-hash path as
+            // known usernames with a wrong password, without revealing
+            // whether a matching account exists through response timing.
+            verify_password(&self.dummy_password_hash, pass);
+            return None;
+        };
         if account.verify(pass) {
             Some(account.username.clone())
         } else {

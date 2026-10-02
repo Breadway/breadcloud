@@ -23,6 +23,8 @@ pub async fn handle(state: &AppState, path: &DavPath, head_only: bool) -> Respon
                 Response::builder()
                     .status(StatusCode::OK)
                     .header("Content-Type", "text/html; charset=utf-8")
+                    .header("X-Content-Type-Options", "nosniff")
+                    .header("Content-Security-Policy", "sandbox")
                     .body(Body::empty())
                     .unwrap()
             } else {
@@ -44,8 +46,16 @@ fn file_response(
         .status(StatusCode::OK)
         .header("Content-Length", metadata.len.to_string())
         .header("Content-Type", content_type_for(path))
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Content-Security-Policy", "sandbox")
         .header("ETag", etag)
         .header("Last-Modified", httpdate::fmt_http_date(metadata.modified));
+
+    let builder = if is_active_content(path) {
+        builder.header("Content-Disposition", "attachment")
+    } else {
+        builder
+    };
 
     if head_only {
         builder.body(Body::empty()).unwrap()
@@ -74,7 +84,9 @@ async fn directory_listing(state: &AppState, path: &DavPath) -> Response {
             for entry in entries {
                 let name = entry.path.name().unwrap_or("").to_string();
                 let is_dir = entry.metadata.is_dir();
-                let href = crate::xml::response::encode_segment(&name, is_dir);
+                // A relative path prefix prevents names such as
+                // `javascript:alert(1)` from being parsed as URL schemes.
+                let href = format!("./{}", crate::xml::response::encode_segment(&name, is_dir));
                 let label = if is_dir {
                     format!("{name}/")
                 } else {
@@ -89,11 +101,20 @@ async fn directory_listing(state: &AppState, path: &DavPath) -> Response {
             Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", "text/html; charset=utf-8")
+                .header("X-Content-Type-Options", "nosniff")
+                .header("Content-Security-Policy", "sandbox")
                 .body(Body::from(html))
                 .unwrap()
         }
         Err(err) => storage_error_response(err),
     }
+}
+
+fn is_active_content(path: &DavPath) -> bool {
+    matches!(
+        content_type_for(path).as_str(),
+        "text/html" | "application/xhtml+xml" | "image/svg+xml"
+    )
 }
 
 fn xml_escape_html(input: &str) -> String {

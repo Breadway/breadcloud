@@ -164,6 +164,7 @@ pub async fn dispatch(state: AppState, req: Request) -> Response {
     let Some(parsed) = CardPath::parse(&decoded) else {
         return (StatusCode::NOT_FOUND, "no such CardDAV resource").into_response();
     };
+    let headers = req.headers().clone();
 
     match (&parsed, method.as_str()) {
         (CardPath::AddressbooksHome(user), "PROPFIND") => {
@@ -185,7 +186,7 @@ pub async fn dispatch(state: AppState, req: Request) -> Response {
             handlers::contact::put(&state, user, book, obj, req).await
         }
         (CardPath::Contact(user, book, obj), "DELETE") => {
-            handlers::contact::delete(&state, user, book, obj).await
+            handlers::contact::delete(&state, user, book, obj, &headers).await
         }
         (CardPath::Contact(user, book, _), "PROPFIND") => {
             // Same "rare, but observed from a real client" allowance
