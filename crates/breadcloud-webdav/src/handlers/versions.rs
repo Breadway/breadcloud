@@ -71,16 +71,18 @@ pub async fn dispatch(
     let prefix = format!("/remote.php/dav/versions/{user}");
 
     match method.as_str() {
-        "PROPFIND" => propfind_versions(state, &to_dav_path(rest), &prefix).await,
+        "PROPFIND" => match to_dav_path(rest) {
+            Ok(file_path) => propfind_versions(state, &file_path, &prefix).await,
+            Err(_) => (StatusCode::BAD_REQUEST, "invalid versions path").into_response(),
+        },
         "GET" | "HEAD" => {
             let (file_segments, version_id) = rest.split_at(rest.len() - 1);
-            get_version(
-                state,
-                &to_dav_path(file_segments),
-                &version_id[0],
-                *method == Method::HEAD,
-            )
-            .await
+            match to_dav_path(file_segments) {
+                Ok(file_path) => {
+                    get_version(state, &file_path, &version_id[0], *method == Method::HEAD).await
+                }
+                Err(_) => (StatusCode::BAD_REQUEST, "invalid versions path").into_response(),
+            }
         }
         _ => (
             StatusCode::METHOD_NOT_ALLOWED,
@@ -90,8 +92,10 @@ pub async fn dispatch(
     }
 }
 
-fn to_dav_path(segments: &[String]) -> DavPath {
-    segments.iter().fold(DavPath::root(), |p, s| p.child(s))
+fn to_dav_path(segments: &[String]) -> Result<DavPath, breadcloud_storage::path::InvalidPath> {
+    segments
+        .iter()
+        .try_fold(DavPath::root(), |path, segment| path.child(segment))
 }
 
 /// Lists the retained versions of `file_path`, oldest first, as a plain

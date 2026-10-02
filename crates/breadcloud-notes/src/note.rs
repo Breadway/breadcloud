@@ -266,14 +266,14 @@ pub fn sanitize_category(raw: &str) -> String {
 
 /// The folder a note in `category` (already sanitized) lives under,
 /// relative to `Notes/`.
-pub fn category_dir(category: &str) -> DavPath {
+pub fn category_dir(category: &str) -> Result<DavPath, breadcloud_storage::path::InvalidPath> {
     let mut dir = notes_root();
     if !category.is_empty() {
         for seg in category.split('/') {
-            dir = dir.child(seg);
+            dir = dir.child(seg)?;
         }
     }
-    dir
+    Ok(dir)
 }
 
 /// Choose a filename for a note titled `title` inside `dir`, avoiding a
@@ -289,11 +289,11 @@ pub async fn generate_filename(
     dir: &DavPath,
     title: &str,
     keep_id: Option<&str>,
-) -> String {
+) -> Result<String, breadcloud_storage::path::InvalidPath> {
     let mut candidate_title = title.to_string();
     loop {
         let filename = format!("{candidate_title}{SUFFIX}");
-        let candidate_path = dir.child(&filename);
+        let candidate_path = dir.child(&filename)?;
         let taken = match storage.metadata(&candidate_path).await {
             Ok(_) => {
                 let candidate_id = breadcloud_webdav::fileid::for_path(&candidate_path);
@@ -302,7 +302,7 @@ pub async fn generate_filename(
             Err(_) => false,
         };
         if !taken {
-            return filename;
+            return Ok(filename);
         }
         candidate_title = increment_title_suffix(&candidate_title);
     }
@@ -399,9 +399,9 @@ mod tests {
 
     #[test]
     fn category_dir_builds_nested_path() {
-        let dir = category_dir("Work/Project");
+        let dir = category_dir("Work/Project").unwrap();
         assert_eq!(dir.to_request_path(), "/Notes/Work/Project");
-        assert_eq!(category_dir("").to_request_path(), "/Notes");
+        assert_eq!(category_dir("").unwrap().to_request_path(), "/Notes");
     }
 
     #[test]
@@ -418,11 +418,13 @@ mod tests {
         let notes_dir = notes_root();
         storage.mkcol(&notes_dir).await.unwrap();
         storage
-            .write_bytes(&notes_dir.child("todo.md"), b"one")
+            .write_bytes(&notes_dir.child("todo.md").unwrap(), b"one")
             .await
             .unwrap();
 
-        let name = generate_filename(&storage, &notes_dir, "todo", None).await;
+        let name = generate_filename(&storage, &notes_dir, "todo", None)
+            .await
+            .unwrap();
         assert_eq!(name, "todo (2).md");
     }
 
@@ -433,12 +435,14 @@ mod tests {
         let notes_dir = notes_root();
         storage.mkcol(&notes_dir).await.unwrap();
         storage
-            .write_bytes(&notes_dir.child("todo.md"), b"one")
+            .write_bytes(&notes_dir.child("todo.md").unwrap(), b"one")
             .await
             .unwrap();
-        let id = breadcloud_webdav::fileid::for_path(&notes_dir.child("todo.md"));
+        let id = breadcloud_webdav::fileid::for_path(&notes_dir.child("todo.md").unwrap());
 
-        let name = generate_filename(&storage, &notes_dir, "todo", Some(&id)).await;
+        let name = generate_filename(&storage, &notes_dir, "todo", Some(&id))
+            .await
+            .unwrap();
         assert_eq!(name, "todo.md");
     }
 }

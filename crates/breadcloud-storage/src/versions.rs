@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 
 use crate::error::StorageError;
 use crate::path::DavPath;
@@ -136,11 +137,27 @@ impl VersionStore {
     /// that is about to replace it -- first creation is not a "previous
     /// version".
     pub async fn snapshot(&self, path: &DavPath, data: &[u8]) -> Result<VersionInfo, StorageError> {
+        let info = self.snapshot_pending(path, data).await?;
+        self.prune_path(path).await?;
+        Ok(info)
+    }
+
+    /// Capture a pending version without pruning older history yet. Write
+    /// handlers use this before their atomic replacement, then either call
+    /// [`VersionStore::prune_path`] after success or
+    /// [`VersionStore::delete_version`] after failure.
+    pub async fn snapshot_pending(
+        &self,
+        path: &DavPath,
+        data: &[u8],
+    ) -> Result<VersionInfo, StorageError> {
         let dir = self.dir_for(path);
         fs::create_dir_all(&dir).await?;
 
-        let id = self.next_version_id(&dir).await?;
-        fs::write(dir.join(&id), data).await?;
+        let (id, mut file) = self.create_version_file_at(&dir, timestamp_nanos()).await?;
+        file.write_all(data).await?;
+        file.flush().await?;
+        drop(file);
 
         let info = VersionInfo {
             id,
@@ -148,55 +165,87 @@ impl VersionStore {
             modified: SystemTime::now(),
         };
 
-        self.prune(&dir).await?;
         Ok(info)
     }
 
     /// Copy a live file into version history without reading its full
-    /// contents into memory.
-    pub async fn snapshot_file(
+    /// contents into memory. The version is created unpruned so a write
+    /// handler can discard it if the replacement write fails; the handler
+    /// calls [`VersionStore::prune_path`] once the write commits.
+    pub async fn snapshot_file_pending(
         &self,
         path: &DavPath,
         source: &Path,
     ) -> Result<VersionInfo, StorageError> {
         let dir = self.dir_for(path);
         fs::create_dir_all(&dir).await?;
-        let id = self.next_version_id(&dir).await?;
+        let (id, claimed) = self.create_version_file_at(&dir, timestamp_nanos()).await?;
+        drop(claimed);
         let destination = dir.join(&id);
         let temporary = dir.join(format!(".pending-{id}"));
         if let Err(err) = fs::copy(source, &temporary).await {
             let _ = fs::remove_file(&temporary).await;
+            let _ = fs::remove_file(&destination).await;
             return Err(err.into());
         }
         if let Err(err) = fs::rename(&temporary, &destination).await {
             let _ = fs::remove_file(&temporary).await;
+            let _ = fs::remove_file(&destination).await;
             return Err(err.into());
         }
         let len = fs::metadata(&destination).await?.len();
-        let info = VersionInfo {
+        Ok(VersionInfo {
             id,
             len,
             modified: SystemTime::now(),
-        };
-        self.prune(&dir).await?;
-        Ok(info)
+        })
+    }
+
+    /// Apply this store's retention caps to one path after its overwrite
+    /// has successfully committed.
+    pub async fn prune_path(&self, path: &DavPath) -> Result<(), StorageError> {
+        self.prune(&self.dir_for(path)).await
+    }
+
+    /// Remove a pending snapshot after the corresponding write failed.
+    pub async fn delete_version(
+        &self,
+        path: &DavPath,
+        version_id: &str,
+    ) -> Result<(), StorageError> {
+        if version_id.len() != 20 || !version_id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(StorageError::Conflict("invalid version id".into()));
+        }
+        match fs::remove_file(self.dir_for(path).join(version_id)).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// A zero-padded (fixed-width, so lexicographic order matches numeric
     /// order) nanosecond timestamp. Bumped forward a nanosecond at a time
     /// on the rare collision (two snapshots of the same file landing in
     /// the same clock tick), so ids stay unique without a shared counter.
-    async fn next_version_id(&self, dir: &Path) -> Result<String, StorageError> {
-        let mut nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
+    async fn create_version_file_at(
+        &self,
+        dir: &Path,
+        mut nanos: u128,
+    ) -> Result<(String, fs::File), StorageError> {
         loop {
             let id = format!("{nanos:020}");
-            if fs::metadata(dir.join(&id)).await.is_err() {
-                return Ok(id);
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dir.join(&id))
+                .await
+            {
+                Ok(file) => return Ok((id, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    nanos += 1;
+                }
+                Err(error) => return Err(error.into()),
             }
-            nanos += 1;
         }
     }
 
@@ -371,8 +420,15 @@ async fn read_entries(dir: &Path) -> std::io::Result<Vec<VersionInfo>> {
         if !meta.is_file() {
             continue;
         }
+        let id = entry.file_name().to_string_lossy().into_owned();
+        // Version ids are always 20-digit nanosecond timestamps. Skip
+        // anything else (a `.pending-` staging file from an in-flight
+        // copy, for example) so history never exposes a partial write.
+        if id.len() != 20 || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
         out.push(VersionInfo {
-            id: entry.file_name().to_string_lossy().into_owned(),
+            id,
             len: meta.len(),
             modified: meta.modified().unwrap_or(UNIX_EPOCH),
         });
@@ -395,6 +451,13 @@ fn map_not_found(e: std::io::Error) -> StorageError {
     } else {
         StorageError::Io(e)
     }
+}
+
+fn timestamp_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
 }
 
 #[cfg(test)]
@@ -426,11 +489,44 @@ mod tests {
         let (dir, store) = store(10, 1024);
         let path = DavPath::parse("/file.txt").unwrap();
         assert!(store
-            .snapshot_file(&path, &dir.path().join("missing-source"))
+            .snapshot_file_pending(&path, &dir.path().join("missing-source"))
             .await
             .is_err());
         assert!(store.list(&path).await.unwrap().is_empty());
         assert_eq!(std::fs::read_dir(store.dir_for(&path)).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_version_claims_retry_the_same_timestamp_without_overwriting() {
+        let (_root, store) = store(10, 1024 * 1024);
+        let path = DavPath::parse("/a.txt").unwrap();
+        let dir = store.dir_for(&path);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let timestamp = 1_800_000_000_000_000_000u128;
+
+        let (first, second) = tokio::join!(
+            store.create_version_file_at(&dir, timestamp),
+            store.create_version_file_at(&dir, timestamp)
+        );
+        let (first_id, mut first_file) = first.unwrap();
+        let (second_id, mut second_file) = second.unwrap();
+        assert_ne!(first_id, second_id);
+
+        first_file.write_all(b"first snapshot").await.unwrap();
+        second_file.write_all(b"second snapshot").await.unwrap();
+        first_file.flush().await.unwrap();
+        second_file.flush().await.unwrap();
+        drop(first_file);
+        drop(second_file);
+
+        assert_eq!(
+            tokio::fs::read(dir.join(first_id)).await.unwrap(),
+            b"first snapshot"
+        );
+        assert_eq!(
+            tokio::fs::read(dir.join(second_id)).await.unwrap(),
+            b"second snapshot"
+        );
     }
 
     #[tokio::test]

@@ -144,24 +144,35 @@ pub struct EventSummary {
 /// but for a calendar view there is no day to place an unparseable event
 /// on, so it is left out instead).
 pub fn summarize(ics: &[u8]) -> Option<EventSummary> {
-    let uid = extract_uid(ics)?;
-    let summary = extract_summary(ics).unwrap_or_else(|| "(untitled)".to_string());
-
     let text = String::from_utf8_lossy(ics);
     let unfolded = unfold(&text);
+    let component = first_component_properties(&unfolded, &["VEVENT"])?;
+    let mut uid = None;
+    let mut summary = None;
     let mut dtstart_raw: Option<String> = None;
     let mut is_date_only = false;
-    for line in unfolded.lines() {
+    for line in component {
         let Some((name, value)) = split_line(line) else {
             continue;
         };
-        if property_name(name).eq_ignore_ascii_case("DTSTART") {
-            dtstart_raw = Some(value.trim().to_string());
-            is_date_only = name.to_ascii_uppercase().contains("VALUE=DATE")
-                && !name.to_ascii_uppercase().contains("VALUE=DATE-TIME");
-            break;
+        match property_name(name).to_ascii_uppercase().as_str() {
+            "UID" => uid = Some(value.trim().to_string()),
+            "SUMMARY" => {
+                let value = value.trim();
+                if !value.is_empty() {
+                    summary = Some(value.to_string());
+                }
+            }
+            "DTSTART" => {
+                dtstart_raw = Some(value.trim().to_string());
+                is_date_only = name.to_ascii_uppercase().contains("VALUE=DATE")
+                    && !name.to_ascii_uppercase().contains("VALUE=DATE-TIME");
+            }
+            _ => {}
         }
     }
+    let uid = uid?;
+    let summary = summary.unwrap_or_else(|| "(untitled)".to_string());
     let dtstart_raw = dtstart_raw?;
     let digits: String = dtstart_raw
         .chars()
@@ -210,10 +221,10 @@ pub fn has_component(ics: &[u8], component: &str) -> bool {
     })
 }
 
-/// Digits-only comparable form of an iCalendar `DATE` (`YYYYMMDD`) or
-/// `DATE-TIME` (`YYYYMMDDTHHMMSS[Z]`) value, ignoring any `TZID`
-/// parameter (see the module doc comment on why). A bare date is padded
-/// to midnight, so it compares correctly as the start of that day.
+/// Convert an iCalendar `DATE` (`YYYYMMDD`) or `DATE-TIME`
+/// (`YYYYMMDDTHHMMSS[Z]`) value to seconds from the Unix epoch, ignoring
+/// any `TZID` parameter (see the module doc comment on why). A bare date
+/// is treated as midnight at the start of that day.
 fn normalize_datetime(raw: &str) -> Option<i64> {
     let digits: String = raw
         .chars()
@@ -227,7 +238,84 @@ fn normalize_datetime(raw: &str) -> Option<i64> {
     while padded.len() < 14 {
         padded.push('0');
     }
-    padded.parse().ok()
+    let year = padded[0..4].parse::<i64>().ok()?;
+    let month = padded[4..6].parse::<i64>().ok()?;
+    let day = padded[6..8].parse::<i64>().ok()?;
+    let hour = padded[8..10].parse::<i64>().ok()?;
+    let minute = padded[10..12].parse::<i64>().ok()?;
+    let second = padded[12..14].parse::<i64>().ok()?;
+
+    if !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 if leap_year => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if day < 1 || day > days_in_month {
+        return None;
+    }
+
+    // Gregorian civil date to days since 1970-01-01. Keeping this local
+    // avoids adding a date library for a best-effort query pre-filter.
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = if adjusted_year >= 0 {
+        adjusted_year / 400
+    } else {
+        (adjusted_year - 399) / 400
+    };
+    let year_of_era = adjusted_year - era * 400;
+    let adjusted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * adjusted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// Properties at the top level of the first matching component. Nested
+/// components such as VALARM are excluded, as are sibling components such
+/// as VTIMEZONE.
+fn first_component_properties<'a>(unfolded: &'a str, wanted: &[&str]) -> Option<Vec<&'a str>> {
+    let mut stack = Vec::<String>::new();
+    let mut target_depth = None;
+    let mut properties = Vec::new();
+
+    for line in unfolded.lines() {
+        if let Some((name, value)) = split_line(line) {
+            let property = property_name(name);
+            if property.eq_ignore_ascii_case("BEGIN") {
+                stack.push(value.trim().to_ascii_uppercase());
+                if target_depth.is_none()
+                    && stack.len() == 2
+                    && wanted
+                        .iter()
+                        .any(|kind| stack[1].eq_ignore_ascii_case(kind))
+                {
+                    target_depth = Some(stack.len());
+                }
+                continue;
+            }
+            if property.eq_ignore_ascii_case("END") {
+                let depth = stack.len();
+                let closes_target = target_depth == Some(depth)
+                    && stack
+                        .last()
+                        .is_some_and(|component| component.eq_ignore_ascii_case(value.trim()));
+                stack.pop();
+                if closes_target {
+                    return Some(properties);
+                }
+                continue;
+            }
+            if target_depth == Some(stack.len()) {
+                properties.push(line);
+            }
+        }
+    }
+    None
 }
 
 /// Best-effort parse of an ISO 8601 duration as used in iCalendar
@@ -297,7 +385,10 @@ pub fn time_range_overlaps(ics: &[u8], start: Option<&str>, end: Option<&str>) -
     let text = String::from_utf8_lossy(ics);
     let unfolded = unfold(&text);
 
-    if unfolded.lines().any(|line| {
+    let Some(component) = first_component_properties(&unfolded, &["VEVENT", "VTODO"]) else {
+        return true;
+    };
+    if component.iter().any(|line| {
         line.split_once(':')
             .is_some_and(|(n, _)| property_name(n).eq_ignore_ascii_case("RRULE"))
     }) {
@@ -309,7 +400,7 @@ pub fn time_range_overlaps(ics: &[u8], start: Option<&str>, end: Option<&str>) -
     let mut duration_raw: Option<String> = None;
     let mut is_date_only = false;
 
-    for line in unfolded.lines() {
+    for line in component {
         let Some((name, value)) = split_line(line) else {
             continue;
         };
@@ -332,11 +423,11 @@ pub fn time_range_overlaps(ics: &[u8], start: Option<&str>, end: Option<&str>) -
     let dtend = if let Some(raw) = dtend_raw.as_deref() {
         normalize_datetime(raw)
     } else if let Some(raw) = duration_raw.as_deref() {
-        parse_duration_seconds(raw).map(|secs| dtstart + seconds_to_datetime_delta(secs))
+        parse_duration_seconds(raw).and_then(|secs| dtstart.checked_add(secs))
     } else if is_date_only {
         // All-day event with no explicit DTEND: RFC 5545 treats it as a
         // single day, i.e. ending at the start of the next day.
-        Some(dtstart + 1_000_000)
+        dtstart.checked_add(86_400)
     } else {
         // Zero-duration event: treat DTEND as DTSTART itself for overlap
         // purposes.
@@ -352,22 +443,6 @@ pub fn time_range_overlaps(ics: &[u8], start: Option<&str>, end: Option<&str>) -
     let starts_before_range_end = range_end.is_none_or(|re| dtstart < re);
     let ends_after_range_start = range_start.is_none_or(|rs| dtend > rs);
     starts_before_range_end && ends_after_range_start
-}
-
-/// Convert a second count into the same `YYYYMMDDHHMMSS`-shaped delta
-/// unit `normalize_datetime` uses, so `dtstart + delta` stays comparable.
-/// This is not real date arithmetic (it does not roll over
-/// months/leap-years correctly for very long durations) -- fine here
-/// since it is only ever added to a `DTSTART` already in that same
-/// digit-string form for a same-day-ish `DURATION` (the only case real
-/// exports use `DURATION` for at all instead of an explicit `DTEND`).
-fn seconds_to_datetime_delta(total_seconds: i64) -> i64 {
-    let days = total_seconds.div_euclid(86_400);
-    let rem = total_seconds.rem_euclid(86_400);
-    let hours = rem / 3_600;
-    let minutes = (rem % 3_600) / 60;
-    let seconds = rem % 60;
-    days * 1_000_000 + hours * 10_000 + minutes * 100 + seconds
 }
 
 #[cfg(test)]
@@ -534,6 +609,45 @@ mod tests {
             ics,
             Some("20260115T100000Z"),
             Some("20260115T110000Z")
+        ));
+    }
+
+    #[test]
+    fn timezone_properties_do_not_replace_or_expand_the_event() {
+        let ics = b"BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:Example/Zone\r\nBEGIN:STANDARD\r\nDTSTART:19700101T000000\r\nRRULE:FREQ=YEARLY\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:event-1\r\nDTSTART:20260115T090000\r\nDTEND:20260115T100000\r\nSUMMARY:Current event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let summary = summarize(ics).unwrap();
+        assert_eq!((summary.year, summary.month, summary.day), (2026, 1, 15));
+        assert_eq!(summary.summary, "Current event");
+        assert!(!time_range_overlaps(
+            ics,
+            Some("20260201T000000Z"),
+            Some("20260301T000000Z")
+        ));
+    }
+
+    #[test]
+    fn summarize_uses_properties_from_the_same_event() {
+        let ics = b"BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:task-1\r\nSUMMARY:Task summary\r\nDTSTART:20260110T090000Z\r\nEND:VTODO\r\nBEGIN:VEVENT\r\nUID:event-1\r\nSUMMARY:Event summary\r\nDTSTART:20260115T090000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let summary = summarize(ics).unwrap();
+        assert_eq!(summary.uid, "event-1");
+        assert_eq!(summary.summary, "Event summary");
+        assert_eq!((summary.year, summary.month, summary.day), (2026, 1, 15));
+    }
+
+    #[test]
+    fn duration_arithmetic_carries_minutes_hours_and_calendar_days() {
+        let ics = b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x\r\nDTSTART:20261231T234500Z\r\nDURATION:PT30M\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert!(time_range_overlaps(
+            ics,
+            Some("20270101T000000Z"),
+            Some("20270101T001000Z")
+        ));
+        assert!(!time_range_overlaps(
+            ics,
+            Some("20270101T001500Z"),
+            Some("20270101T020000Z")
         ));
     }
 }

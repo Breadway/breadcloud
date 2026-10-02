@@ -1,7 +1,11 @@
 use breadcloud_storage::{DavPath, Metadata, Quota};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
-use super::request::PropfindRequest;
+use super::request::{PropfindRequest, RequestedProperty};
+use std::collections::BTreeMap;
+
+const DAV_NAMESPACE: &str = "DAV:";
+const OWNCLOUD_NAMESPACE: &str = "http://owncloud.org/ns";
 
 /// Characters percent-encoded in an href path segment, beyond what
 /// `CONTROLS` already covers. Deliberately narrower than a full
@@ -57,9 +61,17 @@ pub fn build_multistatus(
     request: &PropfindRequest,
     prefix: &str,
 ) -> String {
+    let extension_prefixes = requested_namespace_prefixes(request);
     let mut body = String::new();
     body.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
-    body.push_str("<d:multistatus xmlns:d=\"DAV:\" xmlns:oc=\"http://owncloud.org/ns\">\n");
+    body.push_str("<d:multistatus xmlns:d=\"DAV:\" xmlns:oc=\"http://owncloud.org/ns\"");
+    for (namespace, prefix) in &extension_prefixes {
+        body.push_str(&format!(
+            " xmlns:{prefix}=\"{}\"",
+            xml_escape_attribute(namespace)
+        ));
+    }
+    body.push_str(">\n");
 
     for entry in resources {
         body.push_str("  <d:response>\n");
@@ -88,17 +100,24 @@ pub fn build_multistatus(
             }
             PropfindRequest::Prop(requested) => {
                 let applicable = applicable_props(entry);
-                let is_applicable = |n: &str| applicable.contains(&n);
+                let is_applicable = |property: &RequestedProperty| {
+                    let expected_namespace = if prop_namespace(&property.local_name) == "oc" {
+                        OWNCLOUD_NAMESPACE
+                    } else {
+                        DAV_NAMESPACE
+                    };
+                    property.namespace.as_deref() == Some(expected_namespace)
+                        && applicable.contains(&property.local_name.as_str())
+                };
 
                 let found: Vec<&str> = requested
                     .iter()
-                    .map(|s| s.as_str())
-                    .filter(|n| is_applicable(n))
+                    .filter(|property| is_applicable(property))
+                    .map(|property| property.local_name.as_str())
                     .collect();
-                let missing: Vec<&str> = requested
+                let missing: Vec<&RequestedProperty> = requested
                     .iter()
-                    .map(|s| s.as_str())
-                    .filter(|n| !is_applicable(n))
+                    .filter(|property| !is_applicable(property))
                     .collect();
 
                 if !found.is_empty() {
@@ -108,8 +127,11 @@ pub fn build_multistatus(
                 }
                 if !missing.is_empty() {
                     body.push_str("    <d:propstat>\n      <d:prop>\n");
-                    for name in missing {
-                        body.push_str(&format!("        <{}:{name}/>\n", prop_namespace(name)));
+                    for property in missing {
+                        body.push_str(&format!(
+                            "        <{}/>\n",
+                            property_qualified_name(property, &extension_prefixes)
+                        ));
                     }
                     body.push_str(
                         "      </d:prop>\n      <d:status>HTTP/1.1 404 Not Found</d:status>\n    </d:propstat>\n",
@@ -133,6 +155,42 @@ fn prop_namespace(name: &str) -> &'static str {
     match name {
         "fileid" | "id" | "permissions" => "oc",
         _ => "d",
+    }
+}
+
+fn requested_namespace_prefixes(request: &PropfindRequest) -> BTreeMap<String, String> {
+    let PropfindRequest::Prop(properties) = request else {
+        return BTreeMap::new();
+    };
+
+    let mut prefixes = BTreeMap::new();
+    for property in properties {
+        let Some(namespace) = property.namespace.as_ref() else {
+            continue;
+        };
+        if namespace == DAV_NAMESPACE || namespace == OWNCLOUD_NAMESPACE {
+            continue;
+        }
+        if !prefixes.contains_key(namespace) {
+            let prefix = format!("p{}", prefixes.len());
+            prefixes.insert(namespace.clone(), prefix);
+        }
+    }
+    prefixes
+}
+
+fn property_qualified_name(
+    property: &RequestedProperty,
+    extension_prefixes: &BTreeMap<String, String>,
+) -> String {
+    match property.namespace.as_deref() {
+        Some(DAV_NAMESPACE) => format!("d:{}", property.local_name),
+        Some(OWNCLOUD_NAMESPACE) => format!("oc:{}", property.local_name),
+        Some(namespace) => extension_prefixes
+            .get(namespace)
+            .map(|prefix| format!("{prefix}:{}", property.local_name))
+            .unwrap_or_else(|| property.local_name.clone()),
+        None => property.local_name.clone(),
     }
 }
 
@@ -297,6 +355,15 @@ pub fn encode_segment(name: &str, is_collection: bool) -> String {
     out
 }
 
+fn xml_escape_attribute(input: &str) -> String {
+    // Literal attribute whitespace would be normalized to spaces by clients.
+    // References retain the original characters in the namespace's URI.
+    xml_escape(input)
+        .replace('\t', "&#9;")
+        .replace('\n', "&#10;")
+        .replace('\r', "&#13;")
+}
+
 fn xml_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for c in input.chars() {
@@ -377,12 +444,95 @@ mod tests {
         // implement (there is no sharing yet); fileid and permissions
         // are both supported (see the tests below) so they no longer
         // belong in this list.
-        let request = PropfindRequest::Prop(vec!["getetag".to_string(), "share-types".to_string()]);
+        let request = PropfindRequest::Prop(vec![
+            RequestedProperty {
+                namespace: Some(DAV_NAMESPACE.to_string()),
+                local_name: "getetag".to_string(),
+            },
+            RequestedProperty {
+                namespace: Some(OWNCLOUD_NAMESPACE.to_string()),
+                local_name: "share-types".to_string(),
+            },
+        ]);
         let xml = build_multistatus(&entries, &request, "");
         assert!(xml.contains("<d:getetag>"));
-        assert!(xml.contains("<d:share-types/>"));
+        assert!(xml.contains("<oc:share-types/>"));
         assert!(xml.contains("404 Not Found"));
         assert!(xml.contains("200 OK"));
+    }
+
+    #[test]
+    fn unsupported_requested_prop_keeps_its_namespace() {
+        let entries = vec![file_entry("/docs/a.txt")];
+        let request = PropfindRequest::Prop(vec![RequestedProperty {
+            namespace: Some("http://nextcloud.org/ns".to_string()),
+            local_name: "has-preview".to_string(),
+        }]);
+        let xml = build_multistatus(&entries, &request, "");
+        assert!(xml.contains("xmlns:p0=\"http://nextcloud.org/ns\""));
+        assert!(xml.contains("<p0:has-preview/>"));
+        assert!(xml.contains("404 Not Found"));
+    }
+
+    #[test]
+    fn escaped_extension_namespace_round_trips_its_expanded_name() {
+        let request = super::super::request::parse_propfind_body(
+            br#"<d:propfind xmlns:d="DAV:" xmlns:x="urn:test?a&amp;b&#9;c"><d:prop><x:custom/></d:prop></d:propfind>"#,
+        );
+        let xml = build_multistatus(&[file_entry("/a.txt")], &request, "");
+        let mut reader = quick_xml::reader::NsReader::from_str(&xml);
+        let mut found = false;
+        loop {
+            let (namespace, event) = reader.read_resolved_event().unwrap();
+            match event {
+                quick_xml::events::Event::Empty(element)
+                    if element.local_name().as_ref() == b"custom" =>
+                {
+                    let quick_xml::name::ResolveResult::Bound(namespace) = namespace else {
+                        panic!("extension property has no namespace");
+                    };
+                    let raw = std::str::from_utf8(namespace.0).unwrap();
+                    assert_eq!(quick_xml::escape::unescape(raw).unwrap(), "urn:test?a&b\tc");
+                    assert!(!raw.contains('\t'));
+                    found = true;
+                }
+                quick_xml::events::Event::Eof => break,
+                _ => {}
+            }
+        }
+        assert!(found);
+        assert!(xml.contains("404 Not Found"));
+    }
+
+    #[test]
+    fn character_reference_dav_namespace_selects_supported_property() {
+        let request = super::super::request::parse_propfind_body(
+            br#"<d:propfind xmlns:d="DAV&#58;"><d:prop><d:getetag/></d:prop></d:propfind>"#,
+        );
+        let xml = build_multistatus(&[file_entry("/a.txt")], &request, "");
+        assert!(xml.contains("<d:getetag>&quot;deadbeef&quot;</d:getetag>"));
+        assert!(xml.contains("HTTP/1.1 200 OK"));
+        assert!(!xml.contains("404 Not Found"));
+    }
+
+    #[test]
+    fn unsupported_requested_props_with_multiple_namespaces_are_declared() {
+        let entries = vec![file_entry("/docs/a.txt")];
+        let request = PropfindRequest::Prop(vec![
+            RequestedProperty {
+                namespace: Some("urn:example:first".to_string()),
+                local_name: "alpha".to_string(),
+            },
+            RequestedProperty {
+                namespace: Some("urn:example:second".to_string()),
+                local_name: "beta".to_string(),
+            },
+        ]);
+        let xml = build_multistatus(&entries, &request, "");
+        assert!(xml.contains("xmlns:p0=\"urn:example:first\""));
+        assert!(xml.contains("xmlns:p1=\"urn:example:second\""));
+        assert!(xml.contains("<p0:alpha/>"));
+        assert!(xml.contains("<p1:beta/>"));
     }
 
     #[test]

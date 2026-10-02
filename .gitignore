@@ -1,3 +1,9 @@
 /target
 .env
 data/
+breadcloud-versions/
+breadcloud-trash/
+breadcloud-calendars/
+breadcloud-addressbooks/
+breadcloud-uploads/
+breadcloud-assembly/

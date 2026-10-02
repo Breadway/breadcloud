@@ -21,6 +21,12 @@ view) on that same combined server and the same account model, see "Web UI
 Notes OCS API (`breadcloud-notes`) as a JSON view over the same `Notes/`
 markdown files WebDAV already served, for the official Notes mobile app.
 
+Android setup, protocol preflight and the physical-device acceptance checklist
+are documented in [docs/android.md](docs/android.md).
+
+iPad account setup, optional password-free profiles and the document-provider
+acceptance checklist are documented in [docs/ipad.md](docs/ipad.md).
+
 ## Workspace layout
 
 A Cargo workspace, not a single binary, so later issues (the web UI) can add
@@ -307,14 +313,10 @@ each one now has a comment explaining why.
 `move_path` backs every cross-storage-root move in this codebase: both
 directions of `TrashStore`'s payload move, and both directions of
 `VersionStore`'s version-history move, including the rollback move a failed
-restore uses to undo an already-succeeded version-history move. It is not
-used by `VersionStore::move_all` (the version-history carry on an ordinary
-DAV `MOVE`), which intentionally discards a destination's own prior history
-outright -- correct there, since that destination's old history genuinely
-belongs to content the move is removing, not to a partial leftover of
-anything -- nor by `Storage::relocate` (`COPY`/`MOVE` within the served
-tree), which never crosses a storage root and has no separate source to
-protect a failure's data in. The plain snapshot-on-write path in
+restore uses to undo an already-succeeded version-history move. It also backs
+`Storage::relocate` after COPY staging. `VersionStore::move_all` carries source
+history after MOVE, while the replaced destination history has already been
+retained with the displaced payload in trash. The plain snapshot-on-write path in
 `breadcloud-webdav::versioning` was checked too and needs none of this: it
 only ever creates a new, uniquely-named version file, never replaces or
 discards existing content, so it has no analogous risk to begin with.
@@ -411,6 +413,9 @@ aren't in axum's built-in `MethodFilter`.
 
 Notable pieces:
 
+- `PROPFIND` supports `Depth: 0` and `Depth: 1`. An explicit or implicit
+  `Depth: infinity` is rejected with 403 and `DAV:propfind-finite-depth`.
+
 - `xml::request` parses a PROPFIND request body (`allprop` / `propname` /
   explicit `prop` list) by local element name only, ignoring XML namespace
   prefixes -- real clients bind the `DAV:` namespace to different prefixes,
@@ -481,23 +486,18 @@ Notable pieces:
   - **DELETE** moves the deleted resource's version history into trash
     alongside its content (see below) rather than purging it, since CLOUD-5
     added somewhere meaningful to keep it.
-  - **MOVE** carries the source's version history over to the new path
-    (`VersionStore::move_all`). If the destination already had its own
-    version history (a file there is being replaced or removed by the same
-    move), that history is discarded first: it belonged to content the move
-    is removing.
-  - **COPY** does not duplicate version history: a copy is a new,
-    independent resource with no overwrite events of its own yet.
-- `trash` coordinates soft-delete across `Storage`, `VersionStore`, and
-  `TrashStore` (CLOUD-5), the same way `versioning` coordinates `Storage` and
-  `VersionStore` for snapshot-on-overwrite. `handlers::delete` now calls
-  `trash::move_to_trash` instead of `Storage::delete`: it computes the
-  resource's size (recursively, for a directory), moves its filesystem
-  content into a new `TrashStore` entry, moves its version history into that
-  same entry, then enforces the retention caps. **MOVE never goes through
-  this**: `handlers::copy_move` never called into version or trash logic in
-  the first place (a rename is not a deletion), so there was nothing to
-  change there -- confirmed by an end-to-end test.
+  - **MOVE** carries source history to the new path. An overwritten
+    destination and its previous history are retained together in trash.
+  - **COPY** does not duplicate source history. File-over-file COPY snapshots
+    the previous destination content like PUT. Replaced collections and type
+    changes retain the displaced resource and history in trash.
+- MOVE/COPY validates the operation and fully stages COPY content before
+  retaining or replacing the destination. Replacement uses `move_path`, so
+  copy failure preserves the previous content. A failed replacement restores
+  a destination that was retained in trash; failed recovery preserves the
+  retained payload and reports an error. Retention caps run after replacement.
+- `trash` coordinates DELETE across `Storage`, `VersionStore`, and `TrashStore`:
+  the deleted resource and its history remain together until restored or purged.
 - `handlers::trashbin` is a minimal, Nextcloud-trashbin-inspired DAV surface
   at `/remote.php/dav/trashbin/<user>/...`: `PROPFIND` lists every trashed
   item (with `nc:trashbin-original-location` / `nc:trashbin-deletion-time`
@@ -935,8 +935,9 @@ Thin binary. Configuration is environment variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `BREADCLOUD_ROOT` | `./data` | Directory to serve (created if missing). Each account's own storage root (or `BREADCLOUD_ROOT` itself in single-account mode) also gets an automatic, non-configurable sibling directory named `.<dirname>-assembly-staging`, used only to stage a chunked upload's assembled content before it is quota-checked and committed (CLOUD-11); it never appears in a PROPFIND and is not meant to be browsed or backed up |
-| `BREADCLOUD_UPLOADS_ROOT` | system temp dir + `breadcloud-uploads` | Staging area for in-progress chunked uploads (created if missing). Deliberately outside `BREADCLOUD_ROOT`, not just dot-hidden inside it, so it can never appear in a PROPFIND of the served tree |
+| `BREADCLOUD_ROOT` | `./data` | Directory to serve (created if missing). |
+| `BREADCLOUD_ASSEMBLY_ROOT` | `./breadcloud-assembly` | Reserved assembly staging outside the served root. Must share its filesystem for atomic commits; startup validates access and rejects overlapping roots. Multi-account mode uses per-account subdirectories. |
+| `BREADCLOUD_UPLOADS_ROOT` | `./breadcloud-uploads` | Staging area for in-progress chunked uploads (created if missing). Deliberately outside `BREADCLOUD_ROOT`, not just dot-hidden inside it, so it can never appear in a PROPFIND of the served tree. The sibling-directory default avoids staging multi-GB uploads in a system temp directory that may be a tmpfs or subject to periodic cleanup |
 | `BREADCLOUD_VERSIONS_ROOT` | `./breadcloud-versions` | Per-file version history root (created if missing), outside `BREADCLOUD_ROOT` for the same reason as uploads staging. Unlike uploads staging this needs to persist across restarts, so it defaults to a sibling directory rather than the system temp dir |
 | `BREADCLOUD_TRASH_ROOT` | `./breadcloud-trash` | Soft-delete trash root (created if missing), outside `BREADCLOUD_ROOT` for the same reason as uploads staging and version history, and (like version history) needs to persist across restarts, so it also defaults to a sibling directory rather than the system temp dir |
 | `BREADCLOUD_CALENDARS_ROOT` | `./breadcloud-calendars` | Calendar storage root (created if missing), outside `BREADCLOUD_ROOT` for the same reason as uploads/versions/trash, and (like versions/trash) needs to persist across restarts, so it also defaults to a sibling directory rather than the system temp dir |

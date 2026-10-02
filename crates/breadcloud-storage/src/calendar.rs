@@ -55,8 +55,9 @@
 //! publishes its result via a rename or a single small `fs::write` of a
 //! file nothing else reads mid-write.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use tokio::fs;
 use tokio::sync::Mutex as AsyncMutex;
@@ -93,6 +94,7 @@ pub struct ChangeEntry {
 pub struct CalendarStore {
     root: PathBuf,
     write_lock: Arc<AsyncMutex<()>>,
+    resource_locks: Arc<AsyncMutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>>,
 }
 
 impl CalendarStore {
@@ -100,7 +102,35 @@ impl CalendarStore {
         CalendarStore {
             root: root.into(),
             write_lock: Arc::new(AsyncMutex::new(())),
+            resource_locks: Arc::new(AsyncMutex::new(HashMap::new())),
         }
+    }
+
+    /// Serialize one resource's conditional mutation across requests and
+    /// store clones, including change recording. Weak entries keep the map
+    /// bounded by active resources rather than every resource ever written.
+    pub async fn resource_gate(
+        &self,
+        user: &str,
+        calendar_id: &str,
+        object: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, StorageError> {
+        let user = Self::validate_segment(user)?;
+        let collection = Self::validate_segment(calendar_id)?;
+        let object = Self::validate_segment(object)?;
+        let key = self.root.join(user).join(collection).join(object);
+        let lock = {
+            let mut locks = self.resource_locks.lock().await;
+            locks.retain(|_, value| value.strong_count() > 0);
+            if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(AsyncMutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        Ok(lock.lock_owned().await)
     }
 
     pub fn root(&self) -> &std::path::Path {
@@ -311,6 +341,9 @@ impl CalendarStore {
     ) -> Result<String, StorageError> {
         let user = Self::validate_segment(user)?;
         let calendar_id = Self::validate_segment(calendar_id)?;
+        if uid.chars().any(char::is_control) {
+            return Err(crate::path::InvalidPath(uid.to_string()).into());
+        }
 
         let _guard = self.write_lock.lock().await;
 
@@ -338,7 +371,7 @@ impl CalendarStore {
         file.flush().await?;
 
         let ctag = next.to_string();
-        fs::write(self.ctag_file(&user, &calendar_id), &ctag).await?;
+        crate::write_file_atomically(&self.ctag_file(&user, &calendar_id), ctag.as_bytes()).await?;
         Ok(ctag)
     }
 
@@ -401,12 +434,8 @@ impl CalendarStore {
 
     /// Parse a sync-token this store previously handed out (a plain
     /// decimal ctag value) back into the sequence number
-    /// [`CalendarStore::changes_since`] expects. `None` for anything that
-    /// is not a plain non-negative integer -- callers treat that as "no
-    /// usable token, do a full initial sync" rather than an error, since
-    /// RFC 6578 has clients treat an unrecognized/expired token that way
-    /// too (a 403 with `valid-sync-token` asking for a fresh
-    /// no-sync-token request).
+    /// [`CalendarStore::changes_since`] expects. Callers reject tokens
+    /// that do not parse with RFC 6578's `valid-sync-token` precondition.
     pub fn parse_sync_token(token: &str) -> Option<u64> {
         token
             .strip_prefix("breadcloud-sync:")
@@ -537,6 +566,31 @@ mod tests {
             .unwrap();
         assert_eq!(ctag2, "2");
         assert_eq!(store.ctag("dev", "personal").await.unwrap(), "2");
+    }
+
+    #[tokio::test]
+    async fn record_change_rejects_control_characters_in_uid() {
+        let (_dir, store) = store();
+        store
+            .create_calendar("dev", "personal", "Personal", None)
+            .await
+            .unwrap();
+
+        let err = store
+            .record_change("dev", "personal", "bad\tuid", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::InvalidPath(_)));
+        assert_eq!(store.ctag("dev", "personal").await.unwrap(), "0");
+
+        store
+            .record_change("dev", "personal", "good-uid", false)
+            .await
+            .unwrap();
+        let log = fs::read_to_string(store.changelog_file("dev", "personal"))
+            .await
+            .unwrap();
+        assert_eq!(log, "1\tC\tgood-uid\n");
     }
 
     #[tokio::test]

@@ -73,17 +73,27 @@ async fn handle_with_limit(
         None => None,
     };
 
+    // Snapshot only after the request body has been read and quota has
+    // accepted the replacement, immediately before the write that can
+    // overwrite the current content. Rejected requests must not consume
+    // a version-history slot.
+    let pending_snapshot = match crate::versioning::snapshot_before_overwrite(state, path).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => return storage_error_response(err),
+    };
+
     // RFC 4918 9.7.1: PUT creates the resource if it does not exist and
     // overwrites it if it does; the parent collection must already
-    // exist, which `write_bytes` enforces (409 Conflict otherwise).
-    // Snapshot only after the body and quota have been accepted, and
-    // immediately before the atomic replacement is committed.
-    if let Err(err) = crate::versioning::snapshot_before_overwrite(state, path).await {
-        return storage_error_response(err);
-    }
+    // exist, which `prepare_write` enforces (409 Conflict otherwise).
     let (outcome, total, etag) = match prepared.commit(&state.storage).await {
-        Ok(v) => v,
-        Err(err) => return storage_error_response(err),
+        Ok(v) => {
+            crate::versioning::finish_snapshot(state, path, pending_snapshot).await;
+            v
+        }
+        Err(err) => {
+            crate::versioning::discard_snapshot(state, path, pending_snapshot).await;
+            return storage_error_response(err);
+        }
     };
 
     // CLOUD-13: this write landed, so it counts as a sync. Best-effort,
