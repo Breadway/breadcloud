@@ -19,7 +19,10 @@ minimal server-rendered web UI (file browser + read-only calendar month
 view) on that same combined server and the same account model, see "Web UI
 (CLOUD-12)" under `breadcloud-server` below; CLOUD-8 added the Nextcloud
 Notes OCS API (`breadcloud-notes`) as a JSON view over the same `Notes/`
-markdown files WebDAV already served, for the official Notes mobile app.
+markdown files WebDAV already served, for the official Notes mobile app;
+CLOUD-28 added Login Flow v2 (`breadcloud-login`), the poll-based,
+browser-driven account setup the official Nextcloud Desktop and Android
+apps default to -- see "Login Flow v2 (CLOUD-28)" below.
 
 Android setup, protocol preflight and the physical-device acceptance checklist
 are documented in [docs/android.md](docs/android.md).
@@ -40,7 +43,8 @@ crates/
   breadcloud-carddav/   CardDAV (RFC 6352) HTTP layer, built on axum
   breadcloud-webui/     minimal server-rendered web UI (file browser + calendar view), built on axum
   breadcloud-notes/     Nextcloud Notes OCS API (JSON view over the Notes/ file tree), built on axum
-  breadcloud-server/    binary: wires storage + webdav + caldav + carddav + webui + notes into one server
+  breadcloud-login/     Login Flow v2 (browser-based account setup), built on axum
+  breadcloud-server/    binary: wires storage + webdav + caldav + carddav + webui + notes + login into one server
 ```
 
 ### breadcloud-storage
@@ -928,6 +932,81 @@ capabilities probe a real Notes client makes before calling its API at
 all (`GET /ocs/v1.php/cloud/capabilities`) now advertises a `notes` key
 (`breadcloud-webdav`'s `discovery.rs`), matching real Nextcloud's own
 `Capabilities.php` shape (`api_version`, `version`, `notes_path`).
+
+### breadcloud-login (CLOUD-28)
+
+Nextcloud Login Flow v2: the poll-based, browser-driven account setup the
+official Nextcloud Desktop and Android apps default to for initial account
+setup. Without it, those clients cannot complete setup at all (CLOUD-9
+flagged exactly this for the official Android app). The real protocol
+(routes, JSON field names, status codes, the 1200-second/20-minute token
+lifetime, single-use-via-deletion) was read directly off `nextcloud/server`'s
+own source (`core/Controller/ClientFlowLoginV2Controller.php`,
+`core/Service/LoginFlowV2Service.php`, `core/Db/LoginFlowV2Mapper.php`), not
+reconstructed from memory, the same discipline CLOUD-6/7/8 each applied to
+their own protocols -- see `breadcloud-login`'s own crate-level doc comment
+for the exact routes and source references.
+
+**Four routes**, matching real Nextcloud's own path shapes so the official
+clients work unmodified: `POST /index.php/login/v2` (start a flow, no auth),
+`POST /login/v2/poll` (client polling, 404 while pending), `GET`/`POST
+/login/v2/flow/{token}` (the browser-facing login form and its submission).
+Wired into `breadcloud-server::combined` the same `owns_path`/`dispatch`
+pattern every other protocol crate uses, except this one runs *ahead of*
+CLOUD-11's shared Basic-auth gate rather than behind it -- `combined::auth_gate`
+carries an explicit exemption for these four paths, the same "first request,
+before the client has anything to send" reason `status.php` and
+`.well-known/*` are already exempted for.
+
+**Integrates with CLOUD-11's account model.** The browser-facing form's
+submission is checked via `breadcloud_webdav::AccountStore::authenticate` --
+the same username/password check `authenticate_request` (Basic auth) now
+also funnels through -- rather than a parallel credential path.
+
+**Security tradeoffs, documented rather than hidden:**
+
+- **The `appPassword` this flow hands back is the account's real password.**
+  Per the issue's own scoping note, breadcloud does not implement a separate,
+  per-device app-password mechanism (a second random credential,
+  independently revocable, that never equals the login password). This means
+  anyone who intercepts a poll response, or compromises the client that
+  requested it, gets full, standing access to the real account -- the same
+  blast radius as if the user had typed their password directly into that
+  client, not the narrower, independently-revocable blast radius a real app
+  password would give. Accepted deliberately, matching breadcloud's existing
+  "keep it simple" stance elsewhere (no roles, no sharing, no per-device
+  session tracking).
+- **Tokens** (the login token embedded in the browser URL, the poll token,
+  and the CSRF token) are each 256 bits of `OsRng` output, stored hashed
+  (BLAKE3) rather than in the clear, and expire after the same 1200-second
+  window real Nextcloud uses, checked lazily on every access.
+- **Single-use, enforced by deletion**: a granted flow is removed from the
+  store the instant a `poll` call successfully returns it, so a second poll
+  with the same token cannot succeed even if attempted concurrently with the
+  first.
+- **Resource-exhaustion bound**: `POST /index.php/login/v2` takes no
+  credentials, so `breadcloud-login::flow::FlowStore` refuses to create a new
+  flow once 100 (`MAX_PENDING_FLOWS`) are already outstanding, after reaping
+  expired ones -- a bound on outstanding server-side state, not on request
+  rate, but a bound all the same.
+- **CSRF**: the browser form carries a fixed, per-flow token that must match
+  on submission (a classic synchronizer-token check), and every page this
+  crate renders sends `X-Frame-Options: DENY` /
+  `Content-Security-Policy: frame-ancestors 'none'` against clickjacking.
+  This does not and cannot defend against a user being phished into opening
+  an *attacker-initiated* flow's legitimate login URL and typing their real
+  password into it -- that risk is inherent to login-flow-v2 itself
+  (identical in real Nextcloud) and is not a server-side-fixable gap.
+- **Standalone page styling**: the login form does not link
+  `breadcloud-webui`'s `/ui/style.css` (CLOUD-24), since that route sits
+  behind the same CLOUD-11 Basic-auth gate this page exists to get a client
+  past in the first place -- an unauthenticated browser fetching it would hit
+  a spurious auth prompt before ever seeing the login form. It carries a
+  small inline stylesheet that mirrors the same dark palette instead.
+- **Login flow v2 requires at least one configured account**: in open/dev
+  mode (no `BREADCLOUD_ACCOUNT_<n>_*` set at all), `POST /index.php/login/v2`
+  returns `501 Not Implemented` -- there is no real account for the flow to
+  grant access to.
 
 ### breadcloud-server
 

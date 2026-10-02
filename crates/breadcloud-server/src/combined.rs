@@ -68,6 +68,14 @@ struct CombinedState {
     webdav_by_user: Arc<HashMap<String, breadcloud_webdav::AppState>>,
     caldav: breadcloud_caldav::AppState,
     carddav: breadcloud_carddav::AppState,
+    /// Login Flow v2 (CLOUD-28): the in-memory store of in-flight login
+    /// flows. Built once here, not threaded through `router()`'s own
+    /// parameter list, since it needs no filesystem roots or other
+    /// per-deployment configuration -- unlike every other field on this
+    /// struct, there is nothing for `main.rs` to hand in. See
+    /// `breadcloud_login`'s own module doc for the full protocol and why
+    /// it runs ahead of [`auth_gate`] rather than behind it.
+    login: breadcloud_login::AppState,
     /// The account every request operates as when `accounts` is empty
     /// (no accounts configured at all -- the open, unauthenticated
     /// local-dev mode this server has always supported). Ignored
@@ -96,6 +104,7 @@ pub fn router(
         webdav_by_user: Arc::new(webdav_by_user),
         caldav,
         carddav,
+        login: breadcloud_login::AppState::new(),
         default_user: default_user.into(),
     };
     Router::new()
@@ -184,6 +193,18 @@ async fn dispatch(State(state): State<CombinedState>, req: Request) -> Response 
             "encoded slashes are not allowed in request paths",
         )
             .into_response();
+    }
+
+    // CLOUD-28: login flow v2. Checked before any of the below -- this is
+    // the one URL space in this dispatcher that intentionally has no
+    // notion of "the already-authenticated account" at all (there isn't
+    // one yet; that is the entire point), so it needs neither
+    // `authed_user` nor a per-account `webdav_state` the way every other
+    // branch here does. `auth_gate` already let this request through
+    // without requiring `Authorization` (see its own matching exemption),
+    // so this is reached unauthenticated exactly as it should be.
+    if breadcloud_login::owns_path(&path) {
+        return breadcloud_login::dispatch(state.login.clone(), state.accounts.clone(), req).await;
     }
 
     let authed_user = match req.extensions().get::<AuthenticatedUser>() {
@@ -465,6 +486,16 @@ async fn auth_gate(State(state): State<CombinedState>, mut req: Request, next: N
     if req.method() == Method::GET && path == "/.well-known/carddav" {
         return breadcloud_carddav::handlers::discovery::well_known();
     }
+    // CLOUD-28: login flow v2's own four routes are, by design, how a
+    // client obtains credentials in the first place -- requiring
+    // `Authorization` up front would be circular, the same "first
+    // request, before the client has anything to send" reason status.php
+    // and .well-known are exempted above. `breadcloud_login::dispatch`
+    // does its own credential checking internally (via `AccountStore`,
+    // see that crate's module doc), just not through this gate.
+    if breadcloud_login::owns_path(path) {
+        return next.run(req).await;
+    }
 
     if state.accounts.is_empty() {
         // Open mode: no accounts configured at all, server runs
@@ -616,6 +647,27 @@ mod tests {
     async fn body_string(response: Response) -> String {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// A request with no `Authorization` header at all -- what every
+    /// login-flow-v2 client request looks like (see [`auth_gate`]'s own
+    /// exemption for `breadcloud_login::owns_path`), as opposed to
+    /// [`request_as`] below (real DAV/UI credentials) or `test_app`'s
+    /// open-mode server (no accounts configured at all, so every request
+    /// is implicitly authenticated as `"dev"`).
+    async fn unauthenticated_request(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        content_type: Option<&str>,
+        body: Vec<u8>,
+    ) -> Response {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(ct) = content_type {
+            builder = builder.header("Content-Type", ct);
+        }
+        let req = builder.body(Body::from(body)).unwrap();
+        app.clone().oneshot(req).await.unwrap()
     }
 
     fn basic_auth(username: &str, password: &str) -> String {
@@ -2828,6 +2880,198 @@ mod tests {
             "expected the quota bar to carry the warn class at 85% of a 100-byte quota: {html}"
         );
     }
+
+    // CLOUD-28: Login Flow v2. These drive the real HTTP request sequence
+    // the official Nextcloud Desktop/Android apps make: `POST
+    // /index.php/login/v2` (no auth) -> `POST /login/v2/poll` while
+    // pending (404) -> the browser completes `GET`/`POST
+    // /login/v2/flow/{token}` -> poll again (200, credentials, consumed)
+    // -> poll a third time (404, token already used). See
+    // `breadcloud_login`'s own crate for the pure state-machine unit tests
+    // (token randomness, expiry, single-use) that back this up at a level
+    // below full HTTP.
+
+    fn extract_login_token(login_url: &str) -> String {
+        login_url
+            .rsplit("/login/v2/flow/")
+            .next()
+            .expect("login url should carry a token")
+            .to_string()
+    }
+
+    fn extract_csrf_token(html: &str) -> String {
+        let marker = r#"name="csrf_token" value=""#;
+        let start = html.find(marker).expect("form should carry a csrf token") + marker.len();
+        let end = html[start..]
+            .find('"')
+            .expect("csrf value should be quoted");
+        html[start..start + end].to_string()
+    }
+
+    async fn form_post(app: &Router, uri: &str, form: &str) -> Response {
+        unauthenticated_request(
+            app,
+            "POST",
+            uri,
+            Some("application/x-www-form-urlencoded"),
+            form.as_bytes().to_vec(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn login_flow_v2_full_round_trip() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "s3cret", 100 * GIB)]).await;
+
+        let init =
+            unauthenticated_request(&app, "POST", "/index.php/login/v2", None, Vec::new()).await;
+        assert_eq!(init.status(), StatusCode::OK);
+        let init_json: serde_json::Value = serde_json::from_str(&body_string(init).await).unwrap();
+        let poll_token = init_json["poll"]["token"].as_str().unwrap().to_string();
+        let poll_endpoint = init_json["poll"]["endpoint"].as_str().unwrap().to_string();
+        let login_url = init_json["login"].as_str().unwrap().to_string();
+        assert!(poll_endpoint.ends_with("/login/v2/poll"));
+        assert!(login_url.contains("/login/v2/flow/"));
+        let login_token = extract_login_token(&login_url);
+
+        // Poll while pending: 404, nothing granted yet.
+        let pending = form_post(&app, "/login/v2/poll", &format!("token={poll_token}")).await;
+        assert_eq!(pending.status(), StatusCode::NOT_FOUND);
+
+        // The browser opens the login page.
+        let form_page = unauthenticated_request(
+            &app,
+            "GET",
+            &format!("/login/v2/flow/{login_token}"),
+            None,
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(form_page.status(), StatusCode::OK);
+        let form_html = body_string(form_page).await;
+        let csrf = extract_csrf_token(&form_html);
+
+        // The user submits real credentials.
+        let grant = form_post(
+            &app,
+            &format!("/login/v2/flow/{login_token}"),
+            &format!("username=alice&password=s3cret&csrf_token={csrf}"),
+        )
+        .await;
+        assert_eq!(grant.status(), StatusCode::OK);
+        let grant_html = body_string(grant).await;
+        assert!(grant_html.contains("close this window"));
+
+        // Poll again: success, exactly once.
+        let success = form_post(&app, "/login/v2/poll", &format!("token={poll_token}")).await;
+        assert_eq!(success.status(), StatusCode::OK);
+        let success_json: serde_json::Value =
+            serde_json::from_str(&body_string(success).await).unwrap();
+        assert_eq!(success_json["loginName"], "alice");
+        assert_eq!(success_json["appPassword"], "s3cret");
+        assert!(success_json["server"].as_str().unwrap().starts_with("http"));
+
+        // Poll a third time: the token was already consumed.
+        let reused = form_post(&app, "/login/v2/poll", &format!("token={poll_token}")).await;
+        assert_eq!(reused.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn login_flow_v2_wrong_password_leaves_the_flow_pending_and_retryable() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "s3cret", 100 * GIB)]).await;
+
+        let init =
+            unauthenticated_request(&app, "POST", "/index.php/login/v2", None, Vec::new()).await;
+        let init_json: serde_json::Value = serde_json::from_str(&body_string(init).await).unwrap();
+        let poll_token = init_json["poll"]["token"].as_str().unwrap().to_string();
+        let login_token = extract_login_token(init_json["login"].as_str().unwrap());
+
+        let form_page = unauthenticated_request(
+            &app,
+            "GET",
+            &format!("/login/v2/flow/{login_token}"),
+            None,
+            Vec::new(),
+        )
+        .await;
+        let csrf = extract_csrf_token(&body_string(form_page).await);
+
+        let wrong = form_post(
+            &app,
+            &format!("/login/v2/flow/{login_token}"),
+            &format!("username=alice&password=wrong&csrf_token={csrf}"),
+        )
+        .await;
+        assert_eq!(wrong.status(), StatusCode::OK);
+        let wrong_html = body_string(wrong).await;
+        assert!(wrong_html.to_lowercase().contains("incorrect"));
+
+        // Still pending: not granted by the failed attempt.
+        let still_pending = form_post(&app, "/login/v2/poll", &format!("token={poll_token}")).await;
+        assert_eq!(still_pending.status(), StatusCode::NOT_FOUND);
+
+        // The same csrf token (the form re-render carries the same one,
+        // since it is fixed per-flow) still works for a correct retry.
+        let correct = form_post(
+            &app,
+            &format!("/login/v2/flow/{login_token}"),
+            &format!("username=alice&password=s3cret&csrf_token={csrf}"),
+        )
+        .await;
+        assert_eq!(correct.status(), StatusCode::OK);
+
+        let success = form_post(&app, "/login/v2/poll", &format!("token={poll_token}")).await;
+        assert_eq!(success.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn login_flow_v2_mismatched_csrf_token_is_rejected_and_does_not_grant() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "s3cret", 100 * GIB)]).await;
+
+        let init =
+            unauthenticated_request(&app, "POST", "/index.php/login/v2", None, Vec::new()).await;
+        let init_json: serde_json::Value = serde_json::from_str(&body_string(init).await).unwrap();
+        let poll_token = init_json["poll"]["token"].as_str().unwrap().to_string();
+        let login_token = extract_login_token(init_json["login"].as_str().unwrap());
+
+        let forged = form_post(
+            &app,
+            &format!("/login/v2/flow/{login_token}"),
+            "username=alice&password=s3cret&csrf_token=not-the-real-token",
+        )
+        .await;
+        assert_eq!(forged.status(), StatusCode::FORBIDDEN);
+
+        let after = form_post(&app, "/login/v2/poll", &format!("token={poll_token}")).await;
+        assert_eq!(after.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn login_flow_v2_unknown_poll_token_is_not_found() {
+        let (_dirs, app) = multi_user_test_app(&[("alice", "s3cret", 100 * GIB)]).await;
+        let response = form_post(&app, "/login/v2/poll", "token=this-token-does-not-exist").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn login_flow_v2_requires_at_least_one_configured_account() {
+        // `test_app` is open mode: no accounts configured at all.
+        let (_dirs, app) = test_app().await;
+        let init =
+            unauthenticated_request(&app, "POST", "/index.php/login/v2", None, Vec::new()).await;
+        assert_eq!(init.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn login_flow_v2_endpoints_need_no_authorization_header() {
+        // The defining property of this whole crate: a request that would
+        // be 401'd everywhere else in this server must not be here.
+        let (_dirs, app) = multi_user_test_app(&[("alice", "s3cret", GIB)]).await;
+        let init =
+            unauthenticated_request(&app, "POST", "/index.php/login/v2", None, Vec::new()).await;
+        assert_eq!(init.status(), StatusCode::OK);
+    }
+
     struct ObservedBodyReader {
         reader: tokio::io::DuplexStream,
         started: Option<tokio::sync::oneshot::Sender<()>>,

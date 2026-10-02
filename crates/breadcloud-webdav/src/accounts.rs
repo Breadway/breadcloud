@@ -303,6 +303,45 @@ impl AccountStore {
         self.accounts.keys().map(String::as_str)
     }
 
+    /// Check a plain username/password pair against this account set,
+    /// returning the authenticated username on success. `breadcloud-login`'s
+    /// browser-facing form (CLOUD-28, login flow v2) uses this instead of
+    /// re-deriving its own check, so every authentication surface checks
+    /// credentials against the same account hashes, whether it arrives
+    /// through Basic auth ([`authenticate_request`]) or the login form
+    /// (per CLOUD-28's own scoping note: login flow v2 must integrate with
+    /// this account model, not stand up a parallel one).
+    /// Username and password are checked together (`self.accounts.get(user)`
+    /// then verified against *that* account's own hash): this is not "does
+    /// this password match any configured account", which would let one
+    /// account's credentials authenticate as a different username. An
+    /// unknown username still runs the password verifier against the dummy
+    /// account, the same equalized-timing defense [`authenticate_request`]
+    /// applies, so a login attempt's duration does not reveal whether the
+    /// account exists.
+    ///
+    /// This entry point is deliberately not rate-limited: the login-flow
+    /// form carries its own concurrency bound and expiry, while the Basic
+    /// auth path applies [`AccountStore::authenticate_request_from`]'s
+    /// per-peer budget, which needs the request's peer address.
+    ///
+    /// [`authenticate_request`]: AccountStore::authenticate_request
+    pub fn authenticate(&self, username: &str, password: &str) -> Option<String> {
+        match self.accounts.get(username) {
+            Some(account) => {
+                if account.verify(password) {
+                    Some(account.username.clone())
+                } else {
+                    None
+                }
+            }
+            None => {
+                let _ = self.dummy_account.verify(password);
+                None
+            }
+        }
+    }
+
     /// Parse HTTP Basic credentials off `headers` and check them against
     /// this account set, returning the authenticated username on success.
     ///
@@ -313,10 +352,6 @@ impl AccountStore {
     /// account authenticated -- that identity is what selects the right
     /// per-user storage roots and is what every per-user isolation check
     /// this issue adds is built on (see `breadcloud-server::combined`).
-    /// Username and password are checked together (`self.accounts.get(user)`
-    /// then verified against *that* account's own hash): this is not "does
-    /// this password match any configured account", which would let one
-    /// account's credentials authenticate as a different username.
     pub fn authenticate_request(&self, headers: &HeaderMap) -> Option<String> {
         self.authenticate_request_from(headers, IpAddr::V4(Ipv4Addr::UNSPECIFIED))
             .ok()

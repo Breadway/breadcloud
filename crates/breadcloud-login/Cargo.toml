@@ -1,0 +1,21 @@
+[package]
+name = "breadcloud-login"
+version = "0.1.0"
+edition = "2021"
+description = "Nextcloud Login Flow v2 (CLOUD-28): browser-based account setup for the official Desktop and Android clients, built on axum"
+
+[dependencies]
+breadcloud-webdav = { path = "../breadcloud-webdav" }
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+percent-encoding = "2"
+base64 = "0.22"
+rand_core = { version = "0.6", features = ["getrandom"] }
+blake3 = "1"
+subtle = "2"
+serde_json = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.4", features = ["util"] }

@@ -15,6 +15,7 @@ breadcloud-caldav = { path = "../breadcloud-caldav" }
 breadcloud-carddav = { path = "../breadcloud-carddav" }
 breadcloud-webui = { path = "../breadcloud-webui" }
 breadcloud-notes = { path = "../breadcloud-notes" }
+breadcloud-login = { path = "../breadcloud-login" }
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
@@ -25,4 +26,5 @@ tempfile = "3"
 http-body-util = "0.1"
 tower = { version = "0.4", features = ["util"] }
 base64 = "0.22"
+serde_json = "1"
 tokio-util = { version = "0.7", features = ["io"] }
