@@ -36,6 +36,22 @@ pub async fn handle(
         .map(|v| !v.eq_ignore_ascii_case("F"))
         .unwrap_or(true);
 
+    // COPY under a quota keeps the serialization PUT and chunk finalization
+    // use: hold the account's quota mutex across staging and commit so a
+    // concurrent write cannot slip past the check. The guard lives until
+    // commit_relocation returns.
+    let quota_guard = match (copy, state.quota_limit_bytes) {
+        (true, Some(limit)) => match state
+            .storage
+            .copy_quota_gate(limit, source, &destination)
+            .await
+        {
+            Ok(guard) => Some(guard),
+            Err(error) => return storage_error_response(error),
+        },
+        _ => None,
+    };
+
     let prepared = match state
         .storage
         .prepare_relocation(source, &destination, overwrite, copy)
@@ -80,6 +96,7 @@ pub async fn handle(
         }
     }
     let result = state.storage.commit_relocation(prepared).await;
+    drop(quota_guard);
     if let Some(entry) = retained {
         if result.is_err() {
             if let Err(error) = restore_retained(state, &entry, &destination).await {
