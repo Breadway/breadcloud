@@ -1937,3 +1937,125 @@ async fn trash_cap_enforcement_evicts_the_oldest_deletion_once_the_size_cap_is_e
     assert_eq!(xml.matches("<d:response>").count(), 1);
     assert!(xml.contains("<nc:trashbin-original-location>/b.txt</nc:trashbin-original-location>"));
 }
+
+#[tokio::test]
+async fn copy_overwrite_retains_destination_file_version() {
+    let (root, _uploads, version_root, _trash, app) = test_app();
+    tokio::fs::write(root.path().join("source"), b"new")
+        .await
+        .unwrap();
+    tokio::fs::write(root.path().join("destination"), b"old")
+        .await
+        .unwrap();
+    let request = Request::builder()
+        .method("COPY")
+        .uri("/source")
+        .header("Destination", "/destination")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.oneshot(request).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    let versions = VersionStore::new(version_root.path());
+    let path = breadcloud_storage::DavPath::parse("/destination").unwrap();
+    let history = versions.list(&path).await.unwrap();
+    assert_eq!(history.len(), 1);
+    let (mut file, _) = versions.read(&path, &history[0].id).await.unwrap();
+    let mut previous = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut file, &mut previous)
+        .await
+        .unwrap();
+    assert_eq!(previous, b"old");
+    assert_eq!(
+        tokio::fs::read(root.path().join("destination"))
+            .await
+            .unwrap(),
+        b"new"
+    );
+}
+
+#[tokio::test]
+async fn move_overwrite_retains_replaced_content_and_history_in_trash() {
+    let (root, _uploads, version_root, trash_root, app) = test_app();
+    tokio::fs::write(root.path().join("source"), b"new")
+        .await
+        .unwrap();
+    tokio::fs::write(root.path().join("destination"), b"old")
+        .await
+        .unwrap();
+    let path = breadcloud_storage::DavPath::parse("/destination").unwrap();
+    let versions = VersionStore::new(version_root.path());
+    versions.snapshot(&path, b"older").await.unwrap();
+    let request = Request::builder()
+        .method("MOVE")
+        .uri("/source")
+        .header("Destination", "/destination")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.oneshot(request).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    let trash = TrashStore::new(trash_root.path());
+    let entries = trash.list().await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].original_path, path);
+    assert_eq!(
+        tokio::fs::read(trash.payload_path(&entries[0].id))
+            .await
+            .unwrap(),
+        b"old"
+    );
+    assert!(trash.versions_dir(&entries[0].id).exists());
+    assert!(!root.path().join("source").exists());
+    assert_eq!(
+        tokio::fs::read(root.path().join("destination"))
+            .await
+            .unwrap(),
+        b"new"
+    );
+}
+
+#[tokio::test]
+async fn copy_collection_overwrite_retains_replaced_collection_in_trash() {
+    let (root, _uploads, _versions, trash_root, app) = test_app();
+    tokio::fs::create_dir(root.path().join("source"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir(root.path().join("destination"))
+        .await
+        .unwrap();
+    tokio::fs::write(root.path().join("source/new"), b"new")
+        .await
+        .unwrap();
+    tokio::fs::write(root.path().join("destination/old"), b"old")
+        .await
+        .unwrap();
+    let request = Request::builder()
+        .method("COPY")
+        .uri("/source")
+        .header("Destination", "/destination")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.oneshot(request).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    let trash = TrashStore::new(trash_root.path());
+    let entries = trash.list().await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        tokio::fs::read(trash.payload_path(&entries[0].id).join("old"))
+            .await
+            .unwrap(),
+        b"old"
+    );
+    assert!(!root.path().join("destination/old").exists());
+    assert_eq!(
+        tokio::fs::read(root.path().join("destination/new"))
+            .await
+            .unwrap(),
+        b"new"
+    );
+}

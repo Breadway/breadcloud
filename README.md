@@ -313,14 +313,10 @@ each one now has a comment explaining why.
 `move_path` backs every cross-storage-root move in this codebase: both
 directions of `TrashStore`'s payload move, and both directions of
 `VersionStore`'s version-history move, including the rollback move a failed
-restore uses to undo an already-succeeded version-history move. It is not
-used by `VersionStore::move_all` (the version-history carry on an ordinary
-DAV `MOVE`), which intentionally discards a destination's own prior history
-outright -- correct there, since that destination's old history genuinely
-belongs to content the move is removing, not to a partial leftover of
-anything -- nor by `Storage::relocate` (`COPY`/`MOVE` within the served
-tree), which never crosses a storage root and has no separate source to
-protect a failure's data in. The plain snapshot-on-write path in
+restore uses to undo an already-succeeded version-history move. It also backs
+`Storage::relocate` after COPY staging. `VersionStore::move_all` carries source
+history after MOVE, while the replaced destination history has already been
+retained with the displaced payload in trash. The plain snapshot-on-write path in
 `breadcloud-webdav::versioning` was checked too and needs none of this: it
 only ever creates a new, uniquely-named version file, never replaces or
 discards existing content, so it has no analogous risk to begin with.
@@ -490,23 +486,18 @@ Notable pieces:
   - **DELETE** moves the deleted resource's version history into trash
     alongside its content (see below) rather than purging it, since CLOUD-5
     added somewhere meaningful to keep it.
-  - **MOVE** carries the source's version history over to the new path
-    (`VersionStore::move_all`). If the destination already had its own
-    version history (a file there is being replaced or removed by the same
-    move), that history is discarded first: it belonged to content the move
-    is removing.
-  - **COPY** does not duplicate version history: a copy is a new,
-    independent resource with no overwrite events of its own yet.
-- `trash` coordinates soft-delete across `Storage`, `VersionStore`, and
-  `TrashStore` (CLOUD-5), the same way `versioning` coordinates `Storage` and
-  `VersionStore` for snapshot-on-overwrite. `handlers::delete` now calls
-  `trash::move_to_trash` instead of `Storage::delete`: it computes the
-  resource's size (recursively, for a directory), moves its filesystem
-  content into a new `TrashStore` entry, moves its version history into that
-  same entry, then enforces the retention caps. **MOVE never goes through
-  this**: `handlers::copy_move` never called into version or trash logic in
-  the first place (a rename is not a deletion), so there was nothing to
-  change there -- confirmed by an end-to-end test.
+  - **MOVE** carries source history to the new path. An overwritten
+    destination and its previous history are retained together in trash.
+  - **COPY** does not duplicate source history. File-over-file COPY snapshots
+    the previous destination content like PUT. Replaced collections and type
+    changes retain the displaced resource and history in trash.
+- MOVE/COPY validates the operation and fully stages COPY content before
+  retaining or replacing the destination. Replacement uses `move_path`, so
+  copy failure preserves the previous content. A failed replacement restores
+  a destination that was retained in trash; failed recovery preserves the
+  retained payload and reports an error. Retention caps run after replacement.
+- `trash` coordinates DELETE across `Storage`, `VersionStore`, and `TrashStore`:
+  the deleted resource and its history remain together until restored or purged.
 - `handlers::trashbin` is a minimal, Nextcloud-trashbin-inspired DAV surface
   at `/remote.php/dav/trashbin/<user>/...`: `PROPFIND` lists every trashed
   item (with `nc:trashbin-original-location` / `nc:trashbin-deletion-time`
