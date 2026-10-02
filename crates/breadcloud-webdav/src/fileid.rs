@@ -23,23 +23,16 @@
 //! keep it stable; nothing in this server's sync-client support depends
 //! on file ids surviving a rename today.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 use breadcloud_storage::DavPath;
 
 pub fn for_path(path: &DavPath) -> String {
-    // DefaultHasher::new() uses fixed, documented-stable keys (unlike
-    // RandomState, which HashMap normally pairs it with), so this is
-    // deterministic across requests and server restarts for the same
-    // path. Masked to 53 bits so it fits comfortably within a positive
-    // i64 (and, incidentally, within a JS-safe integer too) regardless
-    // of how the client's own numeric parsing handles the value; `max(1)`
-    // just keeps it non-zero, an all-zero hash being astronomically
-    // unlikely but free to rule out.
-    let mut hasher = DefaultHasher::new();
-    path.to_request_path().hash(&mut hasher);
-    let id = (hasher.finish() & ((1u64 << 53) - 1)).max(1);
+    // BLAKE3 has a specified digest, unlike DefaultHasher's unspecified
+    // algorithm. Interpret the first eight digest bytes as big-endian,
+    // then mask to 53 bits so the decimal id fits clients' signed 64-bit
+    // parsing and JavaScript's safe integer range. Keep zero reserved.
+    let digest = blake3::hash(path.to_request_path().as_bytes());
+    let first_eight: [u8; 8] = digest.as_bytes()[..8].try_into().unwrap();
+    let id = (u64::from_be_bytes(first_eight) & ((1u64 << 53) - 1)).max(1);
     id.to_string()
 }
 
@@ -52,6 +45,12 @@ mod tests {
         let a = DavPath::parse("/docs/report.pdf").unwrap();
         let b = DavPath::parse("/docs/report.pdf").unwrap();
         assert_eq!(for_path(&a), for_path(&b));
+    }
+
+    #[test]
+    fn path_id_uses_the_stable_blake3_mapping() {
+        let path = DavPath::parse("/docs/report.pdf").unwrap();
+        assert_eq!(for_path(&path), "8302969817475615");
     }
 
     #[test]

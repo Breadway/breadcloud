@@ -133,8 +133,7 @@ fn load_accounts() -> LoadedAccounts {
 /// unset), creating it if it does not exist and canonicalizing the
 /// result.
 fn resolve_root(env_var: &str, default: &str) -> PathBuf {
-    let root = std::env::var(env_var).unwrap_or_else(|_| default.to_string());
-    let root = PathBuf::from(root);
+    let root = root_path(std::env::var_os(env_var), default);
     if !root.exists() {
         std::fs::create_dir_all(&root).unwrap_or_else(|e| {
             panic!(
@@ -149,6 +148,12 @@ fn resolve_root(env_var: &str, default: &str) -> PathBuf {
             root.display()
         )
     })
+}
+
+fn root_path(configured: Option<std::ffi::OsString>, default: &str) -> PathBuf {
+    configured
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(default))
 }
 
 /// One account's subdirectory of `base` (CLOUD-11), or `base` itself when
@@ -179,18 +184,10 @@ async fn main() {
     // Staging area for in-progress chunked uploads (see
     // breadcloud_webdav::handlers::uploads). Kept out of BREADCLOUD_ROOT
     // entirely -- not just dot-hidden inside it -- so a PROPFIND of the
-    // real tree can never see someone's in-flight upload chunks. Falls
-    // back to the system temp dir rather than a sibling directory, unlike
-    // the roots below, since it never needs to persist across restarts.
-    let uploads_root = std::env::var("BREADCLOUD_UPLOADS_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("breadcloud-uploads"));
-    if !uploads_root.exists() {
-        std::fs::create_dir_all(&uploads_root).expect("failed to create uploads staging root");
-    }
-    let uploads_root = uploads_root
-        .canonicalize()
-        .expect("failed to resolve uploads staging root");
+    // real tree can never see someone's in-flight upload chunks. Its
+    // default is a sibling directory so chunks avoid tmpfs pressure,
+    // world-writable temporary paths, and systemd-tmpfiles cleanup.
+    let uploads_root = resolve_root("BREADCLOUD_UPLOADS_ROOT", "./breadcloud-uploads");
 
     // Per-file version history (CLOUD-4), soft-delete trash (CLOUD-5),
     // calendars (CLOUD-6), and addressbooks (CLOUD-7): all outside
@@ -338,4 +335,29 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
     axum::serve(listener, app).await.expect("server error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::root_path;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    #[test]
+    fn uploads_root_default_is_a_sibling_not_system_temp() {
+        let uploads_root = root_path(None, "./breadcloud-uploads");
+
+        assert_eq!(uploads_root, PathBuf::from("./breadcloud-uploads"));
+        assert!(!uploads_root.starts_with(std::env::temp_dir()));
+    }
+
+    #[test]
+    fn uploads_root_environment_override_is_preserved() {
+        let uploads_root = root_path(
+            Some(OsString::from("/srv/breadcloud/uploads")),
+            "./breadcloud-uploads",
+        );
+
+        assert_eq!(uploads_root, PathBuf::from("/srv/breadcloud/uploads"));
+    }
 }

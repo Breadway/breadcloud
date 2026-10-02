@@ -26,13 +26,6 @@ pub async fn handle(state: &AppState, path: &DavPath, req: Request) -> Response 
         return conflict;
     }
 
-    // Snapshot whatever is currently at `path` into version history
-    // (CLOUD-4) before the write below can replace it. A no-op if `path`
-    // does not exist yet -- first creation is not a "previous version".
-    if let Err(err) = crate::versioning::snapshot_before_overwrite(state, path).await {
-        return storage_error_response(err);
-    }
-
     let bytes = match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "could not read request body").into_response(),
@@ -58,12 +51,27 @@ pub async fn handle(state: &AppState, path: &DavPath, req: Request) -> Response 
         None => None,
     };
 
+    // Snapshot only after the request body has been read and quota has
+    // accepted the replacement, immediately before the write that can
+    // overwrite the current content. Rejected requests must not consume
+    // a version-history slot.
+    let pending_snapshot = match crate::versioning::snapshot_before_overwrite(state, path).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => return storage_error_response(err),
+    };
+
     // RFC 4918 9.7.1: PUT creates the resource if it does not exist and
     // overwrites it if it does; the parent collection must already
     // exist, which `write_bytes` enforces (409 Conflict otherwise).
     let (outcome, etag) = match state.storage.write_bytes(path, &bytes).await {
-        Ok(v) => v,
-        Err(err) => return storage_error_response(err),
+        Ok(v) => {
+            crate::versioning::finish_snapshot(state, path, pending_snapshot).await;
+            v
+        }
+        Err(err) => {
+            crate::versioning::discard_snapshot(state, path, pending_snapshot).await;
+            return storage_error_response(err);
+        }
     };
 
     // CLOUD-13: this write landed, so it counts as a sync. Best-effort,
