@@ -172,15 +172,21 @@ impl TrashStore {
     /// as `VersionStore::next_version_id`.
     async fn next_id(&self) -> Result<String, StorageError> {
         fs::create_dir_all(&self.root).await?;
-        let mut nanos = SystemTime::now()
+        let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
+        self.claim_id_at(nanos).await
+    }
+
+    async fn claim_id_at(&self, mut nanos: u128) -> Result<String, StorageError> {
         loop {
             let id = format!("{nanos:020}");
-            match fs::metadata(self.entry_dir(&id)).await {
-                Ok(_) => nanos += 1,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(id),
+            match fs::create_dir(self.entry_dir(&id)).await {
+                Ok(()) => return Ok(id),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    nanos += 1;
+                }
                 Err(error) => return Err(error.into()),
             }
         }
@@ -202,18 +208,7 @@ impl TrashStore {
         kind: EntryKind,
         size: u64,
     ) -> Result<TrashEntry, StorageError> {
-        fs::create_dir_all(&self.root).await?;
-        let id = loop {
-            let id = self.next_id().await?;
-            match fs::create_dir(self.entry_dir(&id)).await {
-                Ok(()) => break id,
-                // `next_id` is only a hint. Two concurrent trash operations
-                // can choose the same id, so the directory creation itself
-                // must claim it atomically.
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.into()),
-            }
-        };
+        let id = self.next_id().await?;
 
         // Prepare metadata before moving the live payload. Keep the size
         // unpublished until the payload is complete so concurrent listing
@@ -437,6 +432,22 @@ mod tests {
         assert_eq!(listed[0].original_path, dav_path);
         assert_eq!(listed[0].size, 5);
         assert_eq!(listed[0].kind, EntryKind::File);
+    }
+
+    #[tokio::test]
+    async fn concurrent_id_claims_retry_the_same_timestamp_without_reusing_entries() {
+        let (_live, trash_dir, store) = store(GENEROUS_AGE, GENEROUS_BYTES);
+        let timestamp = 1_800_000_000_000_000_000u128;
+
+        let (first, second) =
+            tokio::join!(store.claim_id_at(timestamp), store.claim_id_at(timestamp));
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_ne!(first, second);
+        assert!(store.entry_dir(&first).is_dir());
+        assert!(store.entry_dir(&second).is_dir());
+        assert_eq!(std::fs::read_dir(trash_dir.path()).unwrap().count(), 2);
     }
 
     #[tokio::test]
