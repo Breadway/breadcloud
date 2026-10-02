@@ -24,6 +24,9 @@ markdown files WebDAV already served, for the official Notes mobile app.
 Android setup, protocol preflight and the physical-device acceptance checklist
 are documented in [docs/android.md](docs/android.md).
 
+iPad account setup, optional password-free profiles and the document-provider
+acceptance checklist are documented in [docs/ipad.md](docs/ipad.md).
+
 ## Workspace layout
 
 A Cargo workspace, not a single binary, so later issues (the web UI) can add
