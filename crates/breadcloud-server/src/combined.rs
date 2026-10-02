@@ -150,6 +150,12 @@ fn url_scoped_user(path: &str) -> Option<&str> {
     None
 }
 
+fn contains_encoded_slash(path: &str) -> bool {
+    path.as_bytes().windows(3).any(|sequence| {
+        sequence[0] == b'%' && sequence[1] == b'2' && matches!(sequence[2], b'f' | b'F')
+    })
+}
+
 /// True only for the one request shape that means "a browser navigated to
 /// the bare server root", never for anything a WebDAV/CalDAV/CardDAV
 /// client sends there. Two conditions, both required:
@@ -186,11 +192,19 @@ fn is_browser_root_navigation(method: &Method, path: &str, headers: &HeaderMap) 
 async fn dispatch(State(state): State<CombinedState>, req: Request) -> Response {
     let path = req.uri().path().to_string();
 
-    let authed_user = req
-        .extensions()
-        .get::<AuthenticatedUser>()
-        .map(|u| u.0.clone())
-        .unwrap_or_else(|| state.default_user.clone());
+    if contains_encoded_slash(&path) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "encoded slashes are not allowed in request paths",
+        )
+            .into_response();
+    }
+
+    let authed_user = match req.extensions().get::<AuthenticatedUser>() {
+        Some(user) => user.0.clone(),
+        None if state.accounts.is_empty() => state.default_user.clone(),
+        None => return unauthorized(),
+    };
 
     // CLOUD-11: the URL's own account segment (if it has one) is
     // client-supplied and must never be trusted on its own to pick whose
@@ -324,7 +338,19 @@ async fn dispatch(State(state): State<CombinedState>, req: Request) -> Response 
     // segment of its own to validate, so this is the one place the
     // authenticated identity alone decides whose principal gets
     // advertised.
-    let want_principal = req.method().as_str() == "PROPFIND" && path == "/";
+    // The bare-root principal splice is only needed for the discovery
+    // request, which asks about this resource alone. A missing Depth
+    // header defaults to infinity, so buffering that response here can
+    // consume the whole tree and exceed add_href_prop's bounded buffer.
+    // Leave broader listings untouched so their original streaming body
+    // reaches the client intact.
+    let want_principal = req.method().as_str() == "PROPFIND"
+        && path == "/"
+        && req
+            .headers()
+            .get("Depth")
+            .and_then(|value| value.to_str().ok())
+            == Some("0");
     let principal_href =
         want_principal.then(|| breadcloud_caldav::principal_href_for(&authed_user));
     let response = breadcloud_webdav::dispatch(webdav_state, req).await;
@@ -441,17 +467,17 @@ fn xml_escape(input: &str) -> String {
 async fn auth_gate(State(state): State<CombinedState>, mut req: Request, next: Next) -> Response {
     let path = req.uri().path();
 
-    // The same "first request, before the client has credentials to
-    // send" exemptions `breadcloud_webdav::auth` (status.php) and each
-    // protocol crate's own standalone router (`.well-known/caldav`,
-    // `.well-known/carddav`) carve out individually -- applied once here,
-    // since this combined app bypasses every crate's own auth layer in
-    // favor of this single shared gate.
-    if req.method() == Method::GET && path.ends_with("/status.php") {
-        return next.run(req).await;
+    // These discovery responses are static and do not need an account
+    // identity. Answer them here so unauthenticated requests never reach
+    // dispatch, where an account would otherwise have to be selected.
+    if req.method() == Method::GET && path == "/status.php" {
+        return breadcloud_webdav::handlers::discovery::status();
     }
-    if path == "/.well-known/caldav" || path == "/.well-known/carddav" {
-        return next.run(req).await;
+    if req.method() == Method::GET && path == "/.well-known/caldav" {
+        return breadcloud_caldav::handlers::discovery::well_known();
+    }
+    if req.method() == Method::GET && path == "/.well-known/carddav" {
+        return breadcloud_carddav::handlers::discovery::well_known();
     }
 
     if state.accounts.is_empty() {
@@ -729,15 +755,31 @@ mod tests {
         );
     }
 
-    // The injection targets only the root resource's own response block,
-    // so a Depth: 1 listing (which lists children too, none here) still
-    // carries exactly one current-user-principal, not one per entry.
+    // Broader listings are left untouched so the principal splice cannot
+    // force an unbounded tree listing through its small response buffer.
     #[tokio::test]
-    async fn current_user_principal_appears_exactly_once_at_depth_one() {
+    async fn depth_one_bare_root_propfind_is_not_buffered_for_principal_splice() {
         let (_dirs, app) = test_app().await;
         let response = propfind(&app, "/", "1").await;
         let xml = body_string(response).await;
-        assert_eq!(xml.matches("<d:current-user-principal>").count(), 1);
+        assert!(xml.contains("<d:multistatus"));
+        assert!(!xml.contains("<d:current-user-principal>"));
+    }
+
+    #[tokio::test]
+    async fn bare_root_propfind_without_depth_keeps_default_infinity_response() {
+        let (_dirs, app) = test_app().await;
+        let req = Request::builder()
+            .method("PROPFIND")
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::from_u16(207).unwrap());
+
+        let xml = body_string(response).await;
+        assert!(xml.contains("<d:multistatus"));
+        assert!(!xml.contains("<d:current-user-principal>"));
     }
 
     // A PROPFIND on some other WebDAV path is untouched: no
@@ -850,6 +892,38 @@ mod tests {
             .unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn status_php_paths_do_not_bypass_auth_for_web_ui_files() {
+        let (dirs, app) = multi_user_test_app(&[("alice", "secret1", 100 * GIB)]).await;
+
+        let file = dirs._storage.path().join("alice/site/status.php");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "private site content").unwrap();
+
+        let folder = dirs._storage.path().join("alice/status.php");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("secret.txt"), "private folder content").unwrap();
+
+        for uri in ["/ui/download/site/status.php", "/ui/files/status.php"] {
+            let req = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+
+        let status = Request::builder()
+            .method("GET")
+            .uri("/status.php")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(status).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_string(response).await.contains("\"installed\":true"));
     }
 
     /// The core file-isolation regression: what user A writes must be
@@ -1178,6 +1252,67 @@ mod tests {
         assert_eq!(bobs_own.status(), multi_status());
         let xml = body_string(bobs_own).await;
         assert!(!xml.contains("alice-contact-1"));
+    }
+
+    #[tokio::test]
+    async fn encoded_slashes_cannot_escape_account_scoping() {
+        let (_dirs, app) = multi_user_test_app(&[
+            ("alice", "secret1", 100 * GIB),
+            ("bob", "secret2", 100 * GIB),
+        ])
+        .await;
+
+        let event = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:bob-event-1\r\nDTSTART:20260401T090000Z\r\nDTEND:20260401T100000Z\r\nSUMMARY:Bob only\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".to_vec();
+        let event_put = request_as(
+            &app,
+            "PUT",
+            "/remote.php/dav/calendars/bob/personal/bob-event-1.ics",
+            "bob",
+            "secret2",
+            &[],
+            event,
+        )
+        .await;
+        assert_eq!(event_put.status(), StatusCode::CREATED);
+
+        let contact =
+            b"BEGIN:VCARD\r\nVERSION:4.0\r\nUID:bob-contact-1\r\nFN:Bob's Contact\r\nEND:VCARD\r\n"
+                .to_vec();
+        let contact_put = request_as(
+            &app,
+            "PUT",
+            "/remote.php/dav/addressbooks/bob/contacts/bob-contact-1.vcf",
+            "bob",
+            "secret2",
+            &[],
+            contact,
+        )
+        .await;
+        assert_eq!(contact_put.status(), StatusCode::CREATED);
+
+        let event_read = request_as(
+            &app,
+            "GET",
+            "/remote.php/dav/calendars%2Fbob/personal/bob-event-1.ics",
+            "alice",
+            "secret1",
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(event_read.status(), StatusCode::BAD_REQUEST);
+
+        let contact_read = request_as(
+            &app,
+            "PROPFIND",
+            "/remote.php/dav/addressbooks%2fbob/contacts/",
+            "alice",
+            "secret1",
+            &[("Depth", "1")],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(contact_read.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

@@ -88,7 +88,7 @@ fn parse_year_month(query: &str) -> Option<(i64, u32)> {
     if !(1..=12).contains(&month) {
         return None;
     }
-    Some((year, month))
+    Some((year.clamp(1, 9999), month))
 }
 
 /// `month` shifted by `delta` months (positive or negative), rolling the
@@ -210,6 +210,19 @@ mod tests {
         assert_eq!(parse_year_month("year=2026&month=13"), None);
         assert_eq!(parse_year_month("year=2026&month=0"), None);
         assert_eq!(parse_year_month("year=2026&month=6"), Some((2026, 6)));
+    }
+
+    #[test]
+    fn parse_year_month_clamps_year_to_a_supported_range() {
+        assert_eq!(
+            parse_year_month("year=-9223372036854775808&month=1"),
+            Some((1, 1))
+        );
+        assert_eq!(
+            parse_year_month("year=9223372036854775807&month=12"),
+            Some((9999, 12))
+        );
+        assert_eq!(parse_year_month("year=10000&month=6"), Some((9999, 6)));
     }
 
     #[test]
