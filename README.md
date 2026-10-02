@@ -411,6 +411,9 @@ aren't in axum's built-in `MethodFilter`.
 
 Notable pieces:
 
+- `PROPFIND` supports `Depth: 0` and `Depth: 1`. An explicit or implicit
+  `Depth: infinity` is rejected with 403 and `DAV:propfind-finite-depth`.
+
 - `xml::request` parses a PROPFIND request body (`allprop` / `propname` /
   explicit `prop` list) by local element name only, ignoring XML namespace
   prefixes -- real clients bind the `DAV:` namespace to different prefixes,

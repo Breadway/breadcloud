@@ -325,6 +325,7 @@ async fn restore(state: &AppState, id: &str, headers: &HeaderMap) -> Response {
         }
         return storage_error_response(err);
     }
+    state.storage.invalidate_etag_cache(&dest_path);
 
     if let Err(err) = state.trash.finish_restore(id).await {
         tracing::warn!("failed to clean up trash entry {id} after restore: {err}");

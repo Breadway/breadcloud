@@ -246,6 +246,40 @@ async fn propfind_depth_1_lists_children() {
 }
 
 #[tokio::test]
+async fn propfind_infinity_is_rejected_with_finite_depth_error() {
+    let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app();
+
+    let propfind = Request::builder()
+        .method("PROPFIND")
+        .uri("/")
+        .header("Depth", "infinity")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(propfind).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        body_string(response).await,
+        "<d:error xmlns:d=\"DAV:\"><d:propfind-finite-depth/></d:error>"
+    );
+}
+
+#[tokio::test]
+async fn propfind_without_depth_header_is_rejected_as_infinity() {
+    let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app();
+
+    let propfind = Request::builder()
+        .method("PROPFIND")
+        .uri("/")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(propfind).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(body_string(response)
+        .await
+        .contains("propfind-finite-depth"));
+}
+
+#[tokio::test]
 async fn move_renames_resource() {
     let (_dir, _uploads_dir, _versions_dir, _trash_dir, app) = test_app();
 

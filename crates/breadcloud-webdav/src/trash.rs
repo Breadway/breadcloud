@@ -45,6 +45,7 @@ pub async fn move_to_trash(state: &AppState, path: &DavPath) -> Result<(), Stora
 
     let live_fs_path = state.storage.resolve(path);
     let entry = state.trash.trash(&live_fs_path, path, kind, size).await?;
+    state.storage.invalidate_etag_cache(path);
 
     if let Err(err) = state
         .versions

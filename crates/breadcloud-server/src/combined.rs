@@ -766,8 +766,11 @@ mod tests {
         assert!(!xml.contains("<d:current-user-principal>"));
     }
 
+    // A missing Depth header means Depth: infinity, which the WebDAV
+    // layer now rejects with 403 and DAV:propfind-finite-depth, so the
+    // splice never sees a buffered unbounded listing in that form either.
     #[tokio::test]
-    async fn bare_root_propfind_without_depth_keeps_default_infinity_response() {
+    async fn bare_root_propfind_without_depth_is_rejected_as_infinite() {
         let (_dirs, app) = test_app().await;
         let req = Request::builder()
             .method("PROPFIND")
@@ -775,11 +778,10 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::from_u16(207).unwrap());
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         let xml = body_string(response).await;
-        assert!(xml.contains("<d:multistatus"));
-        assert!(!xml.contains("<d:current-user-principal>"));
+        assert!(xml.contains("propfind-finite-depth"));
     }
 
     // A PROPFIND on some other WebDAV path is untouched: no
