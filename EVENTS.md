@@ -1,4 +1,4 @@
-# breadcloud: bread event integration
+# cloud: bread event integration
 
 breadcloud is a standalone WebDAV/CalDAV/CardDAV server: it works exactly
 the same with or without `breadd` running. When breadd *is* present,
