@@ -35,6 +35,11 @@ only publishes. If a real use case for a remote-triggered action (e.g.
 verb and any confirmation event should be added at the same time, per the
 `bread` repo's integration checklist -- not stubbed ahead of an actual need.
 
+## Not implemented
+
+- No `bread.command.cloud.*` verb exists. breadcloud is publish-only; a remote-triggered action would add its verb and confirmation event together.
+- No event reports authentication, login, per-file transfer progress, or collection enumeration. Only completed sync operations, precondition conflicts, and quota-threshold crossings are published.
+
 ## Fail-safe behavior
 
 - If breadd isn't installed or isn't running, every publish is a silent
@@ -47,14 +52,3 @@ verb and any confirmation event should be added at the same time, per the
 - Nothing in `breadcloud-events`'s public API returns a `Result`: there is
   nothing meaningful for a caller to do with a failure to notify an
   optional automation bus.
-
-## Registering `cloud` with breadd
-
-`cloud` is not yet in `bread`'s `KNOWN_APPS` registry -- registering it is a
-one-line companion change to the `bread` repo (`bread-shared/src/apps.rs`),
-per `Documentation.md`'s "Integrating a bread\* app" checklist. That change
-is open as `Breadway/bread` PR #5 (`feature/register-breadcloud-app`), not
-yet merged as of this writing. Until it merges and a `breadd` build that
-includes it is installed, `breadd` rejects a `cloud`-sourced emit locally
-(a plain error string on the IPC response) -- invisible to breadcloud either
-way, since `BreadClient::emit` never reads the reply.
