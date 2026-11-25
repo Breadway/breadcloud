@@ -22,7 +22,7 @@
 //! a download endpoint, so this does not add one. That is enough to
 //! browse what is in trash and get it back; it is not a drop-in
 //! implementation of Nextcloud's actual trashbin protocol (see the
-//! workspace README for this scope decision, the same tradeoff CLOUD-4
+//! docs/DESIGN.md for this scope decision, the same tradeoff CLOUD-4
 //! made for its own versions surface).
 //!
 //! The `<user>` path segment mirrors `handlers::uploads`/`handlers::versions`'s

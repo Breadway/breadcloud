@@ -8,7 +8,7 @@
 //!
 //! Real Nextcloud file IDs are database row identifiers that survive a
 //! rename. This server has no such database yet (that is a separate,
-//! later piece of the epic -- see the workspace README's roadmap), so
+//! later piece of the epic -- see docs/DESIGN.md's roadmap), so
 //! this derives a deterministic id from the resource's path instead: a
 //! sync client just needs *a* stable, opaque identifier. It does,
 //! however, care about the id's syntax: it parses this value into a

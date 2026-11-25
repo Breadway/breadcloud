@@ -8,8 +8,8 @@
 //! sync (`GET /notes`), a poll that finds nothing changed
 //! (`If-None-Match`), create, an `If-Match`-guarded edit and its 412
 //! conflict shape, a category-driven rename, delete-goes-to-trash, and
-//! the settings/attachment sub-resources. See this crate's own README
-//! entry for what was live-verified against the real server binary with
+//! the settings/attachment sub-resources. See this crate's own section in
+//! docs/DESIGN.md for what was live-verified against the real server binary with
 //! `curl` versus only exercised here.
 
 use axum::body::Body;

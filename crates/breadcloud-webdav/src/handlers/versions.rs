@@ -18,8 +18,8 @@
 //! It is not a drop-in implementation of Nextcloud's actual versions
 //! protocol -- nothing here makes a stock Nextcloud desktop client
 //! auto-discover or drive this surface the way it auto-discovers the
-//! main files tree and the uploads staging area. See the workspace
-//! README for that scope decision. There is deliberately no PUT/DELETE
+//! main files tree and the uploads staging area. See
+//! docs/DESIGN.md for that scope decision. There is deliberately no PUT/DELETE
 //! here: restoring a version is "GET the old content, PUT it back to the
 //! live path", which the existing PUT handler already snapshots as any
 //! other overwrite -- adding a second, redundant "restore" verb here

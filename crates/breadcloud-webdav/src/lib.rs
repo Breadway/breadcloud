@@ -107,7 +107,7 @@ pub(crate) fn split_mount_prefix(decoded: &str) -> (String, &str) {
 /// path itself, routes anything CalDAV owns to `breadcloud_caldav::dispatch`,
 /// and falls back to this function for everything else, under one shared
 /// `middleware::from_fn` auth layer built from the same credentials. See
-/// `breadcloud-server`'s combined router and the workspace README's
+/// `breadcloud-server`'s combined router and docs/DESIGN.md's
 /// "Sharing the HTTP server with CalDAV" section for the composition.
 pub async fn dispatch(state: AppState, req: Request) -> Response {
     let method = req.method().clone();

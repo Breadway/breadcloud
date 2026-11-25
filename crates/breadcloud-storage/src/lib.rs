@@ -948,7 +948,7 @@ impl Storage {
     /// include this instance's own version history or trash (those are
     /// separate `VersionStore`/`TrashStore` roots with their own,
     /// independent retention caps already bounding their size -- see the
-    /// README's "Multi-user accounts" section for why quota is scoped to
+    /// docs/DESIGN.md's "Multi-user accounts" section for why quota is scoped to
     /// the live served tree, not those too).
     ///
     /// Reuses the same recursive walk [`copy_verified`]'s size check

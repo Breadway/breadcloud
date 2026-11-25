@@ -18,7 +18,7 @@ use crate::state::{AppState, AuthenticatedUser};
 /// The real, combined `breadcloud-server` binary does not use this at
 /// all: it applies one auth gate once, ahead of dispatching to either
 /// protocol, using the same credentials -- see that binary's combined
-/// router and the workspace README's "Sharing the HTTP server with
+/// router and docs/DESIGN.md's "Sharing the HTTP server with
 /// CalDAV" section.
 pub async fn require_auth(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
     let Some(auth) = &state.auth else {

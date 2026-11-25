@@ -3,7 +3,7 @@
 //! `breadcloud-webui`'s POST actions (`/ui/mkdir`, `/ui/delete`) are
 //! plain HTML `<form>` posts with one or two fields each -- not worth a
 //! `serde`+`axum::Form` dependency (nothing else in this workspace
-//! depends on `serde` either, see the workspace README's dependency
+//! depends on `serde` either, see docs/DESIGN.md's dependency
 //! philosophy) when a form body this small is a couple of `split`s away
 //! from a `HashMap`. Reuses the `percent-encoding` crate every other
 //! `breadcloud-*` HTTP crate already depends on rather than adding a

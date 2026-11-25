@@ -8,7 +8,7 @@
 //! being purged immediately or retained independently: it moves into the
 //! same trash entry on delete ([`move_to_trash`]) and moves back out with
 //! it on restore (`handlers::trashbin::restore`). This is the CLOUD-5
-//! interaction decision documented in full in the workspace README --
+//! interaction decision documented in full in docs/DESIGN.md --
 //! the short version is that once trash exists, "keep a deleted file's
 //! history around" only makes sense paired with a way to undelete the
 //! file it belongs to, which trash now provides; keeping it reachable

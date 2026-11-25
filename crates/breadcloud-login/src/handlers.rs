@@ -39,8 +39,8 @@
 //! independently-revocable blast radius a real app password would give.
 //! This is an accepted, documented tradeoff matching breadcloud's existing
 //! "keep it simple" stance elsewhere (no roles, no sharing, no per-device
-//! session tracking -- see the workspace README's CLOUD-11 section), not
-//! an oversight; see the workspace README's own "Login flow v2" section
+//! session tracking -- see docs/DESIGN.md's CLOUD-11 section), not
+//! an oversight; see docs/DESIGN.md's own "Login flow v2" section
 //! for the same note in the user-facing docs.
 
 use axum::body::Body;

@@ -27,7 +27,7 @@
 //! (`breadcloud-caldav` and this crate), which is exactly the point at
 //! which "should these share a common generic layer" becomes a live
 //! question, not a hypothetical one. This crate does not introduce one,
-//! for the same reason `breadcloud-caldav`'s own README section declined
+//! for the same reason `breadcloud-caldav`'s own section in docs/DESIGN.md declined
 //! to build CalDAV on top of `breadcloud-webdav`'s file-oriented
 //! `ResourceEntry`/`build_multistatus`: the two formats' *content*
 //! layers are genuinely different in ways that would leak straight
@@ -72,7 +72,7 @@
 //! `card:addressbook-home-set` onto `breadcloud-caldav`'s existing
 //! principal PROPFIND response, the same additive-splice technique that
 //! crate already uses to put `current-user-principal` onto a bare-root
-//! WebDAV PROPFIND -- see that module and the workspace README's
+//! WebDAV PROPFIND -- see that module and docs/DESIGN.md's
 //! "Addressbook discovery" section for why the principal-level splice,
 //! not a second bare-root splice, is the right place: `calendar-home-set`
 //! is discovered exactly that way today, and "discover the addressbook

@@ -148,7 +148,7 @@ pub fn addressbook_home_multistatus(
 /// documents, since vdirsyncer's live-verified behavior for CalDAV
 /// (Depth 1 PROPFIND as the actual enumeration mechanism, not just
 /// REPORT) is exactly the same code path its generic vcard/icalendar sync
-/// engine uses for CardDAV too -- see the workspace README.
+/// engine uses for CardDAV too -- see docs/DESIGN.md.
 pub fn addressbook_collection_multistatus(
     book: &AddressbookEntry,
     children: Option<&[(String, String)]>,

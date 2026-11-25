@@ -1,8 +1,8 @@
 //! Wires `breadcloud-webdav`, `breadcloud-caldav`, and `breadcloud-carddav`
 //! into one axum app on one port, under one shared auth gate, instead of
 //! running three HTTP servers for what is (as far as a client's TCP
-//! connection is concerned) one breadcloud instance. See the workspace
-//! README's "Sharing the HTTP server with CalDAV/CardDAV" section for why
+//! connection is concerned) one breadcloud instance. See
+//! docs/DESIGN.md's "Sharing the HTTP server with CalDAV/CardDAV" section for why
 //! this lives here rather than as shared code inside any protocol crate:
 //! the composition itself -- "which protocol owns this path, and what
 //! credentials gate all three of them" -- is a property of *this binary's*

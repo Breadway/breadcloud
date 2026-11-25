@@ -16,7 +16,7 @@
 //! properties were named in the request's `<d:prop>` (still honoring
 //! `PropfindRequest::PropName` -- names only, no values -- since that
 //! costs nothing extra to support). This is a scope simplification,
-//! documented in the workspace README too.
+//! documented in docs/DESIGN.md too.
 
 use crate::xml::request::{PropSet, PropfindRequest};
 
@@ -212,7 +212,7 @@ pub fn calendar_home_multistatus(
 /// Some(&[(href, etag)])`) -- the same "list this collection's immediate
 /// members" idiom a plain WebDAV PROPFIND Depth 1 uses, which real
 /// clients (vdirsyncer's CalDAV storage backend, confirmed live -- see
-/// the workspace README) rely on to enumerate a calendar's objects
+/// docs/DESIGN.md) rely on to enumerate a calendar's objects
 /// alongside, or instead of, `REPORT calendar-query`/`sync-collection`.
 /// Each child response only reports `getetag` (and an empty
 /// `resourcetype`, marking it a non-collection resource) -- enough to

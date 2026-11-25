@@ -152,7 +152,7 @@ async fn calendar_multiget(
 /// RFC 4791 7.8: fetch every calendar object matching an optional
 /// component-type and time-range filter. No index -- a linear scan of
 /// the calendar's events, which is fine at this deployment's real scale
-/// (a few hundred events per calendar; see the workspace README).
+/// (a few hundred events per calendar; see docs/DESIGN.md).
 async fn calendar_query(
     state: &AppState,
     user: &str,

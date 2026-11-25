@@ -1,7 +1,7 @@
 //! `/ui` and `/ui/`: a tiny landing page linking to the two real
 //! sections (files, calendar). Nextcloud's own dashboard/activity
 //! feed/notification center is explicitly out of scope for this issue --
-//! see the workspace README's CLOUD-12 section -- so this is genuinely
+//! see docs/DESIGN.md's CLOUD-12 section -- so this is genuinely
 //! just a signpost, not a third page's worth of content.
 
 use axum::response::Response;

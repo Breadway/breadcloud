@@ -3,7 +3,7 @@
 //! no permissions, no sharing between accounts, no self-service account
 //! creation -- `breadcloud-server` reads the account list once at startup
 //! from environment variables (see that binary's `main.rs`) and never
-//! mutates it while running. See the workspace README's "Multi-user
+//! mutates it while running. See docs/DESIGN.md's "Multi-user
 //! accounts" section for the full reasoning and the env var scheme.
 //!
 //! This lives in `breadcloud-webdav` (not `breadcloud-storage`, which has

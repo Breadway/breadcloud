@@ -3,7 +3,7 @@
 //! client actually drives: PROPFIND discovery (current-user-principal ->
 //! principal -> calendar-home-set listing), REPORT calendar-query /
 //! calendar-multiget, PUT/GET/DELETE on individual events, and REPORT
-//! sync-collection for incremental sync. See the workspace README for
+//! sync-collection for incremental sync. See docs/DESIGN.md for
 //! which parts of this were also verified against a real client/tool and
 //! which were not.
 
@@ -100,7 +100,7 @@ async fn calendar_home_depth_0_omits_children() {
 }
 
 /// A real CalDAV client (vdirsyncer's CalDAV storage backend, confirmed
-/// live -- see the workspace README) uses PROPFIND Depth 1 on a calendar
+/// live -- see docs/DESIGN.md) uses PROPFIND Depth 1 on a calendar
 /// collection itself, not REPORT, to enumerate its events. Without event
 /// children in that response, vdirsyncer saw the calendar as always
 /// empty even with events present -- this pins that regression.

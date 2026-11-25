@@ -1,7 +1,7 @@
 //! breadcloud WebDAV + CalDAV + CardDAV server: wires up
 //! `breadcloud-storage`, `breadcloud-webdav`, `breadcloud-caldav`, and
 //! `breadcloud-carddav` into a runnable binary, all served on one port
-//! (see `combined`). See the workspace README for configuration and how
+//! (see `combined`). See docs/DESIGN.md for configuration and how
 //! to point it at a real file tree / calendar / addressbook set.
 
 mod combined;
@@ -71,7 +71,7 @@ fn validate_open_mode_bind(accounts_configured: bool, addr: SocketAddr) {
 }
 
 /// Load the account set from environment variables, trying three shapes
-/// in order (see the workspace README's "Multi-user accounts" section for
+/// in order (see docs/DESIGN.md's "Multi-user accounts" section for
 /// the full reasoning):
 ///
 /// 1. **Multi-account**: `BREADCLOUD_ACCOUNT_<n>_USER` /

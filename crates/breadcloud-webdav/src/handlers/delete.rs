@@ -12,7 +12,7 @@ pub async fn handle(state: &AppState, path: &DavPath) -> Response {
 
     // Soft delete (CLOUD-5): move the resource (and its version history,
     // if any) into trash instead of actually removing it. See
-    // `crate::trash::move_to_trash` and the workspace README for the
+    // `crate::trash::move_to_trash` and docs/DESIGN.md for the
     // retention-cap and version-history interaction decisions.
     match crate::trash::move_to_trash(state, path).await {
         Ok(()) => {

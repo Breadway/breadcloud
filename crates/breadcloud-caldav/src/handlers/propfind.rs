@@ -46,7 +46,7 @@ pub async fn calendar_home(state: &AppState, user: &str, req: Request) -> Respon
 /// calendar-multiget`/`calendar-query`, or via `REPORT sync-collection`
 /// (`crate::handlers::report`) -- real clients are not consistent about
 /// which they prefer (vdirsyncer's CalDAV storage backend was confirmed,
-/// live, to require this Depth 1 listing; see the workspace README), so
+/// live, to require this Depth 1 listing; see docs/DESIGN.md), so
 /// this server supports both rather than assuming REPORT alone is
 /// enough.
 pub async fn calendar_collection(

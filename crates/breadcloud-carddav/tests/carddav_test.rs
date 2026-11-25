@@ -7,7 +7,7 @@
 //! does not include principal/current-user-principal discovery (that
 //! stays `breadcloud-caldav`'s -- see this crate's `lib.rs` doc comment);
 //! `breadcloud-server`'s combined-app tests cover that hop. See the
-//! workspace README for which parts of this were also verified against a
+//! docs/DESIGN.md for which parts of this were also verified against a
 //! real client/tool and which were not.
 
 use axum::body::Body;

@@ -29,8 +29,8 @@
 /// Unfold RFC 6350 folded lines -- identical rule and identical
 /// implementation to `breadcloud_caldav::ical::unfold` (a CRLF or LF
 /// immediately followed by a single space or tab continues the previous
-/// line). Duplicated rather than shared across crates: see the workspace
-/// README's note on why `breadcloud-carddav` does not depend on
+/// line). Duplicated rather than shared across crates: see
+/// docs/DESIGN.md's note on why `breadcloud-carddav` does not depend on
 /// `breadcloud-caldav` for this kind of small, format-specific helper.
 fn unfold(vcf: &str) -> String {
     let normalized = vcf.replace("\r\n", "\n");

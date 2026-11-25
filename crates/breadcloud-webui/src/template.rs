@@ -5,7 +5,7 @@
 //! similar): the whole UI is a handful of small pages, and pulling in a
 //! templating engine's proc-macro/build-step machinery for that is more
 //! than this genuinely-minimal issue calls for -- see the CLOUD-12 issue
-//! text and the workspace README's dependency philosophy. Every value
+//! text and docs/DESIGN.md's dependency philosophy. Every value
 //! interpolated from user- or file-supplied data goes through
 //! [`html_escape`] first.
 //!

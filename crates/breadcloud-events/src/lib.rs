@@ -8,7 +8,7 @@
 //! in a companion change to the `bread` repo) and publishes under
 //! `bread.cloud.*`.
 //!
-//! This integration is explicitly optional (see the workspace README):
+//! This integration is explicitly optional (see docs/DESIGN.md):
 //! breadcloud must behave identically whether or not `breadd` is
 //! installed or running. Concretely:
 //!
@@ -21,7 +21,7 @@
 //!   an optional automation bus, and building error plumbing for it
 //!   would misrepresent how load-bearing this path is (not at all).
 //!
-//! Event vocabulary (see the workspace README's own "bread ecosystem
+//! Event vocabulary (see docs/DESIGN.md's own "bread ecosystem
 //! integration" section for the full catalogue and each field's exact
 //! meaning): `bread.cloud.file.synced` (a completed PUT, chunked-upload
 //! finalize, DELETE, or MOVE), `bread.cloud.sync.conflict` (an

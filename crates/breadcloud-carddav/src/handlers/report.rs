@@ -147,7 +147,7 @@ async fn addressbook_multiget(
 /// RFC 6352 8.6: fetch every contact matching an optional property
 /// text-match filter. No index -- a linear scan of the addressbook's
 /// contacts, fine at this deployment's real scale (76 contacts total;
-/// see the workspace README).
+/// see docs/DESIGN.md).
 async fn addressbook_query(
     state: &AppState,
     user: &str,

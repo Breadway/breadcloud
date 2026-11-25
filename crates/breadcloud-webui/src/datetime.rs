@@ -6,7 +6,7 @@
 //! for "which weekday does the 1st fall on" and "format this mtime as
 //! `YYYY-MM-DD HH:MM`" would be a lot of dependency for two small integer
 //! computations, and nothing else in this workspace depends on one either
-//! (see the workspace README). This uses Howard Hinnant's `days_from_civil`
+//! (see docs/DESIGN.md). This uses Howard Hinnant's `days_from_civil`
 //! / `civil_from_days` algorithm (public domain, proleptic Gregorian,
 //! correct for any year this server will ever see a file mtime or a
 //! calendar event in): <http://howardhinnant.github.io/date_algorithms.html>.

@@ -183,7 +183,7 @@ fn csrf_matches(stored: &str, submitted: &str) -> bool {
 /// The credentials a completed flow hands back to the polling client.
 /// `app_password` is, per CLOUD-28's own scoping note, just the account's
 /// real password: breadcloud has no per-device app-password tracking (see
-/// the workspace README and `handlers.rs`'s module doc for the full
+/// docs/DESIGN.md and `handlers.rs`'s module doc for the full
 /// security tradeoff this implies and why it was accepted).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GrantedCredentials {

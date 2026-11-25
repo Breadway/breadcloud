@@ -123,7 +123,7 @@ pub async fn put(
 /// (CLOUD-5): trash is a file-tree concept keyed to `Storage`/`DavPath`,
 /// and calendar objects are a deliberately separate, simpler resource
 /// model with no versioning or soft-delete asked for by this issue --
-/// see the workspace README.
+/// see docs/DESIGN.md.
 pub async fn delete(
     state: &AppState,
     user: &str,

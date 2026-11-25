@@ -5,7 +5,7 @@
 //! log alongside it -- because CardDAV (RFC 6352) is, like CalDAV (RFC
 //! 4791), a WebDAV extension for exactly that shape (vCard objects
 //! instead of iCalendar ones). This module is a close structural mirror
-//! of `calendar`, not a fresh design: see the workspace README's
+//! of `calendar`, not a fresh design: see docs/DESIGN.md's
 //! "Shared abstraction, or duplication?" note (in the breadcloud-carddav
 //! section) for why this crate does not go a step further and factor the
 //! two into one generic "collection-of-typed-objects" store.

@@ -26,7 +26,7 @@
 //!   [`VersionStore::prune`].
 //!
 //! Neither cap is user-configurable (no policy engine): both are fixed
-//! constants, documented here and in the workspace README, matching the
+//! constants, documented here and in docs/DESIGN.md, matching the
 //! issue's ask for "a generous but bounded" cap rather than a
 //! configurable retention system nobody asked for.
 
@@ -288,7 +288,7 @@ impl VersionStore {
     /// call too.
     ///
     /// Used when the live resource at `path` is deleted: see the
-    /// workspace README for why this server does not try to keep a
+    /// docs/DESIGN.md for why this server does not try to keep a
     /// deleted file's version history around (that would only be
     /// meaningful paired with trash/undelete, a separate later issue --
     /// CLOUD-5 -- not this one). A no-op, not an error, if `path` has no

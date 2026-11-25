@@ -8,7 +8,7 @@
 //! is this" and "does this event's time range overlap the one the client
 //! asked for".
 //!
-//! **Scope decisions, both documented in the workspace README too:**
+//! **Scope decisions, both documented in docs/DESIGN.md too:**
 //!
 //! - **Timezones are compared as wall-clock digits, not resolved against
 //!   a real tz database.** `DTSTART;TZID=Australia/Sydney:20260115T090000`

@@ -41,7 +41,7 @@
 //! fallback asks `owns_path` which protocol a request belongs to and
 //! calls the matching `dispatch`, under one shared auth middleware layer
 //! built from the same credentials. See `breadcloud-server`'s combined
-//! router and the workspace README's "Sharing the HTTP server with
+//! router and docs/DESIGN.md's "Sharing the HTTP server with
 //! CalDAV" section.
 
 pub mod auth;
@@ -67,7 +67,7 @@ pub use path::CalPath;
 /// `current_user_principal`). Exposed at the crate root, not just used
 /// internally by that handler, so a combined server can also advertise
 /// this property when answering a bare `/` WebDAV PROPFIND -- see
-/// `breadcloud-server`'s `combined` module and the workspace README's
+/// `breadcloud-server`'s `combined` module and docs/DESIGN.md's
 /// "Bare-root discovery" note (CLOUD-6 change request: a real client that
 /// only falls back to `.well-known/caldav` when the bare-root request
 /// *errors*, not when it merely succeeds without this property, needs to
